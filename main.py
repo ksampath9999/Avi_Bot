@@ -6,11 +6,10 @@ import config
 from telegram_bot import send_message
 
 # -----------------------------
-# ZERODHA INIT (CLOUD SAFE)
+# INIT ZERODHA (CLOUD SAFE)
 # -----------------------------
 kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
-
 
 # -----------------------------
 # CONFIG
@@ -20,21 +19,29 @@ RISK_PER_TRADE = config.RISK_PER_TRADE
 MAX_DAILY_LOSS = config.MAX_DAILY_LOSS
 MAX_TRADES = config.MAX_TRADES
 
+SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"  # 🔴 CHANGE if needed
+
 trades_today = 0
 daily_loss = 0
 trade_active = False
 
 
 # -----------------------------
-# GET SIGNAL FROM RENDER SERVER
+# GET SIGNAL FROM CLOUD
 # -----------------------------
-SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"   # 🔴 UPDATE THIS
-
-
 def get_signal():
     try:
         res = requests.get(SIGNAL_URL, timeout=10)
-        return res.json()
+
+        if res.status_code != 200:
+            print("Bad response:", res.text)
+            return {"signal": "HOLD"}
+
+        data = res.json()
+        print("Server Response:", data)
+
+        return data
+
     except Exception as e:
         print("Signal error:", e)
         return {"signal": "HOLD"}
@@ -53,45 +60,61 @@ def get_ltp(symbol):
 def calculate_qty(price):
     risk_amount = CAPITAL * RISK_PER_TRADE
     qty = int(risk_amount / price)
-
     return max(config.LOT_SIZE, qty)
 
 
 # -----------------------------
-# FIND OPTION (SMART)
+# SMART OPTION SELECTION (ATM BASED)
 # -----------------------------
 def find_option(signal):
 
-    instruments = kite.instruments("NFO")
+    try:
+        # Get NIFTY spot
+        nifty_price = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
 
-    for inst in instruments:
+        # Round to nearest 50
+        strike = round(nifty_price / 50) * 50
 
-        sym = inst["tradingsymbol"]
+        instruments = kite.instruments("NFO")
 
-        if "NIFTY" not in sym:
-            continue
+        best_symbol = None
+        best_price = None
 
-        # CALL / PUT filter
-        if signal == "CALL" and not sym.endswith("CE"):
-            continue
+        for inst in instruments:
 
-        if signal == "PUT" and not sym.endswith("PE"):
-            continue
+            sym = inst["tradingsymbol"]
 
-        try:
-            price = get_ltp(f"NFO:{sym}")
-        except:
-            continue
+            if "NIFTY" not in sym:
+                continue
 
-        if price is None:
-            continue
+            if str(strike) not in sym:
+                continue
 
-        # Premium filter
-        if config.MIN_PREMIUM <= price <= config.MAX_PREMIUM:
-            print(f"Selected: {sym} @ {price}")
-            return sym, price
+            # CALL / PUT filter
+            if signal == "CALL" and not sym.endswith("CE"):
+                continue
 
-    return None, None
+            if signal == "PUT" and not sym.endswith("PE"):
+                continue
+
+            try:
+                price = get_ltp(f"NFO:{sym}")
+            except:
+                continue
+
+            if price is None:
+                continue
+
+            # Premium range filter
+            if config.MIN_PREMIUM <= price <= config.MAX_PREMIUM:
+                print(f"Selected: {sym} @ {price}")
+                return sym, price
+
+        return None, None
+
+    except Exception as e:
+        print("Option error:", e)
+        return None, None
 
 
 # -----------------------------
@@ -109,6 +132,7 @@ def place_order(symbol, qty):
             order_type="MARKET",
             product="MIS"
         )
+
         return order
 
     except Exception as e:
@@ -144,7 +168,7 @@ Qty: {qty}
 
             print(f"{symbol} | LTP: {ltp} | PnL: {pnl}")
 
-            # TARGET
+            # TARGET HIT
             if ltp >= target:
                 send_message(f"🎯 TARGET HIT\n{symbol}\nPnL: ₹{round(pnl,2)}")
                 break
@@ -186,7 +210,7 @@ def run_bot():
 
     global trades_today, daily_loss, trade_active
 
-    send_message("🚀 BOT STARTED (CLOUD)")
+    send_message("🚀 BOT STARTED (LIVE CLOUD)")
 
     while True:
 
@@ -201,7 +225,7 @@ def run_bot():
             time.sleep(300)
             continue
 
-        # RISK LIMIT
+        # RISK CONTROL
         if daily_loss >= MAX_DAILY_LOSS:
             send_message("🛑 DAILY LOSS LIMIT HIT")
             break
@@ -222,7 +246,7 @@ def run_bot():
 
         print(f"Signal: {signal} | Quality: {quality} | Conf: {confidence}")
 
-        # FILTER BAD TRADES
+        # FILTER LOW QUALITY TRADES
         if signal == "HOLD" or quality not in ["A", "A+"]:
             time.sleep(300)
             continue

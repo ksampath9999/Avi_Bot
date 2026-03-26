@@ -1,13 +1,16 @@
 from flask import Flask, jsonify
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 from kiteconnect import KiteConnect
 import joblib
 import config
+import os
 
 app = Flask(__name__)
 
+# -----------------------------
+# ZERODHA CONNECTION
+# -----------------------------
 kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
@@ -19,31 +22,39 @@ try:
     print("✅ Model loaded")
 except:
     model = None
-    print("⚠️ Model not found")
+    print("⚠️ Model not found (fallback mode)")
 
 
 # -----------------------------
-# FETCH DATA (MULTI TF)
+# FETCH DATA
 # -----------------------------
-def get_data(interval):
+def get_data(interval="5minute"):
 
-    now = datetime.now()
-    start = now - timedelta(days=5)
+    try:
+        now = datetime.now()
+        start = now - timedelta(days=5)
 
-    data = kite.historical_data(
-        256265,
-        start,
-        now,
-        interval
-    )
+        data = kite.historical_data(
+            instrument_token=256265,
+            from_date=start,
+            to_date=now,
+            interval=interval
+        )
 
-    df = pd.DataFrame(data)
+        df = pd.DataFrame(data)
 
-    return df if not df.empty else None
+        if df.empty:
+            return None
+
+        return df
+
+    except Exception as e:
+        print("Data error:", e)
+        return None
 
 
 # -----------------------------
-# INDICATORS
+# ADD INDICATORS
 # -----------------------------
 def add_indicators(df):
 
@@ -65,20 +76,20 @@ def add_indicators(df):
 # SIDEWAYS FILTER
 # -----------------------------
 def is_sideways(df):
-    r = df.tail(20)
-    return (r["high"].max() - r["low"].min()) < 30
+    recent = df.tail(20)
+    return (recent["high"].max() - recent["low"].min()) < 30
 
 
 # -----------------------------
 # VOLUME SPIKE
 # -----------------------------
 def volume_spike(df):
-    avg = df["volume"].rolling(20).mean().iloc[-1]
-    return df.iloc[-1]["volume"] > 1.5 * avg
+    avg_vol = df["volume"].rolling(20).mean().iloc[-1]
+    return df.iloc[-1]["volume"] > 1.5 * avg_vol
 
 
 # -----------------------------
-# BREAKOUT
+# BREAKOUT CHECK
 # -----------------------------
 def breakout(df):
     high = df["high"].rolling(20).max().iloc[-2]
@@ -93,16 +104,20 @@ def breakout(df):
 # TREND (15 MIN)
 # -----------------------------
 def get_trend(df):
+
     last = df.iloc[-1]
+
     if last["ema20"] > last["ema50"] and last["close"] > last["vwap"]:
         return "UP"
+
     elif last["ema20"] < last["ema50"] and last["close"] < last["vwap"]:
         return "DOWN"
+
     return "SIDE"
 
 
 # -----------------------------
-# SIGNAL ENGINE
+# MAIN SIGNAL FUNCTION
 # -----------------------------
 def generate_signal():
 
@@ -119,83 +134,110 @@ def generate_signal():
         return {"signal": "HOLD", "reason": "Insufficient data"}
 
     # -----------------------------
-    # FILTERS
+    # SIDEWAYS FILTER
     # -----------------------------
     if is_sideways(df5):
         return {"signal": "HOLD", "reason": "Sideways"}
 
+    # -----------------------------
+    # TREND
+    # -----------------------------
     trend = get_trend(df15)
 
     if trend == "SIDE":
         return {"signal": "HOLD", "reason": "Weak trend"}
 
+    # -----------------------------
+    # VOLUME
+    # -----------------------------
     if not volume_spike(df5):
-        return {"signal": "HOLD", "reason": "No volume"}
+        return {"signal": "HOLD", "reason": "Low volume"}
 
+    # -----------------------------
+    # BREAKOUT
+    # -----------------------------
     breakout_up, breakout_down = breakout(df5)
 
-    # -----------------------------
-    # ML
-    # -----------------------------
+    if not breakout_up and not breakout_down:
+        return {"signal": "HOLD", "reason": "No breakout"}
+
     last = df5.iloc[-1]
 
+    # -----------------------------
+    # ML PREDICTION
+    # -----------------------------
     if model:
+
         X = [[
             last["returns"],
             last["std"],
             last["close"] - last["vwap"]
         ]]
+
         pred = model.predict(X)[0]
         prob = model.predict_proba(X)[0]
         confidence = max(prob)
+
     else:
         pred = 1 if last["close"] > last["vwap"] else 0
         confidence = 0.5
 
+    # -----------------------------
+    # CONFIDENCE FILTER
+    # -----------------------------
     if confidence < 0.65:
         return {"signal": "HOLD", "reason": "Low confidence"}
 
     # -----------------------------
-    # FINAL DECISION
+    # QUALITY SCORE
     # -----------------------------
     score = 0
 
-    if trend == "UP": score += 1
-    if trend == "DOWN": score += 1
+    if trend != "SIDE": score += 1
     if breakout_up or breakout_down: score += 1
     if volume_spike(df5): score += 1
     if confidence > 0.7: score += 1
 
-    trade_quality = "A+" if score >= 4 else "A" if score >= 3 else "B"
+    quality = "A+" if score >= 4 else "A" if score >= 3 else "B"
 
+    # -----------------------------
+    # FINAL SIGNAL
+    # -----------------------------
     if breakout_up and trend == "UP" and pred == 1:
         return {
             "signal": "CALL",
             "confidence": round(confidence, 2),
-            "quality": trade_quality
+            "quality": quality
         }
 
-    if breakout_down and trend == "DOWN" and pred == 0:
+    elif breakout_down and trend == "DOWN" and pred == 0:
         return {
             "signal": "PUT",
             "confidence": round(confidence, 2),
-            "quality": trade_quality
+            "quality": quality
         }
 
-    return {"signal": "HOLD", "reason": "Mismatch"}
-    
+    else:
+        return {"signal": "HOLD", "reason": "Mismatch"}
+
 
 # -----------------------------
 # API
 # -----------------------------
-@app.route("/signal", methods=["GET"])
+@app.route("/")
+def home():
+    return "ML Server Running"
+
+
+@app.route("/signal")
 def signal():
     return jsonify(generate_signal())
 
 
 # -----------------------------
-# RUN
+# RUN (RENDER FIX)
 # -----------------------------
 if __name__ == "__main__":
-    print("🚀 PRO ML SERVER RUNNING")
-    app.run(port=5001)
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🚀 Server running on port {port}")
+    app.run(host="0.0.0.0", port=port)

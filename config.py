@@ -1,20 +1,46 @@
-API_KEY = "your_api_key"
-API_SECRET = "your_api_secret"
+import os
 
-USER_ID = "your_user_id"
-PASSWORD = "your_password"
-PIN = "your_pin"
+# -----------------------------
+# 🔐 ZERODHA API
+# -----------------------------
+API_KEY = os.getenv("API_KEY")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")   # used in cloud OR local
 
-LOT_SIZE = 65
+# -----------------------------
+# 🔐 TELEGRAM
+# -----------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# -----------------------------
+# 🔐 AUTO LOGIN (LOCAL ONLY)
+# ⚠️ DO NOT USE IN CLOUD
+# -----------------------------
+USER_ID = os.getenv("USER_ID")
+PASSWORD = os.getenv("PASSWORD")
+PIN = os.getenv("PIN")
+API_SECRET = os.getenv("API_SECRET")
+
+# -----------------------------
+# 📊 TRADING CONFIG
+# -----------------------------
+LOT_SIZE = 50   # NIFTY lot size (keep updated)
+
 MAX_TRADES = 3
 
-STOP_LOSS = 0.20
-TARGET = 0.40
+RISK_PER_TRADE = 0.02   # 2%
+MAX_DAILY_LOSS = 3000
 
+STOP_LOSS = 0.30   # 30%
+TARGET = 0.50      # 50%
+
+# -----------------------------
+# 📈 INSTRUMENT
+# -----------------------------
 NIFTY_TOKEN = 256265
 
-MIN_PREMIUM = 30
-MAX_PREMIUM = 150
-
-TELEGRAM_TOKEN = "8564848356:AAGlyEsBslrSSSiK2_P0FxFQc3xcqP0wUX0"
-TELEGRAM_CHAT_ID = "1795092745"
+# -----------------------------
+# 💰 OPTION SELECTION
+# -----------------------------
+MIN_PREMIUM = 50
+MAX_PREMIUM = 120

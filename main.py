@@ -5,15 +5,23 @@ from kiteconnect import KiteConnect
 import config
 from telegram_bot import send_message
 
+# -----------------------------
+# LOAD ACCESS TOKEN (AUTO LOGIN)
+# -----------------------------
+def get_access_token():
+    with open("access_token.txt", "r") as f:
+        return f.read().strip()
+
+
 kite = KiteConnect(api_key=config.API_KEY)
-kite.set_access_token(config.ACCESS_TOKEN)
+kite.set_access_token(get_access_token())
 
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 CAPITAL = 100000
-RISK_PER_TRADE = 0.02   # 2%
+RISK_PER_TRADE = 0.02     # 2%
 MAX_DAILY_LOSS = 3000
 MAX_TRADES = 5
 
@@ -23,13 +31,14 @@ trade_active = False
 
 
 # -----------------------------
-# GET SIGNAL
+# GET SIGNAL FROM SERVER
 # -----------------------------
 def get_signal():
     try:
         res = requests.get("http://127.0.0.1:5001/signal")
         return res.json()
-    except:
+    except Exception as e:
+        print("Signal error:", e)
         return {"signal": "HOLD"}
 
 
@@ -46,61 +55,88 @@ def get_ltp(symbol):
 def calculate_qty(price):
     risk_amount = CAPITAL * RISK_PER_TRADE
     qty = int(risk_amount / price)
-    return max(qty, 50)  # minimum lot
+
+    # Ensure minimum lot size (50)
+    return max(50, qty)
 
 
 # -----------------------------
-# FIND OPTION
+# FIND OPTION (SMART SELECTION)
 # -----------------------------
 def find_option(signal):
+
     instruments = kite.instruments("NFO")
 
+    best_symbol = None
+    best_price = None
+
     for inst in instruments:
+
         sym = inst["tradingsymbol"]
 
-        if "NIFTY" in sym:
+        if "NIFTY" not in sym:
+            continue
 
-            if signal == "CALL" and sym.endswith("CE"):
-                price = get_ltp(f"NFO:{sym}")
-                if 50 <= price <= 120:
-                    return sym, price
+        try:
+            price = get_ltp(f"NFO:{sym}")
+        except:
+            continue
 
-            elif signal == "PUT" and sym.endswith("PE"):
-                price = get_ltp(f"NFO:{sym}")
-                if 50 <= price <= 120:
-                    return sym, price
+        if price is None or price <= 0:
+            continue
 
-    return None, None
+        # Filter by signal
+        if signal == "CALL" and not sym.endswith("CE"):
+            continue
+
+        if signal == "PUT" and not sym.endswith("PE"):
+            continue
+
+        # Premium range
+        if 50 <= price <= 120:
+            best_symbol = sym
+            best_price = price
+            break
+
+    return best_symbol, best_price
 
 
 # -----------------------------
 # PLACE ORDER
 # -----------------------------
 def place_order(symbol, qty):
-    return kite.place_order(
-        variety=kite.VARIETY_REGULAR,
-        exchange="NFO",
-        tradingsymbol=symbol,
-        transaction_type="BUY",
-        quantity=qty,
-        order_type="MARKET",
-        product="MIS"
-    )
+
+    try:
+        order = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange="NFO",
+            tradingsymbol=symbol,
+            transaction_type="BUY",
+            quantity=qty,
+            order_type="MARKET",
+            product="MIS"
+        )
+
+        return order
+
+    except Exception as e:
+        print("Order error:", e)
+        return None
 
 
 # -----------------------------
-# MANAGE TRADE
+# TRADE MANAGEMENT
 # -----------------------------
 def manage_trade(symbol, entry, qty):
 
     global daily_loss, trade_active
 
-    sl = entry * 0.7
-    target = entry * 1.5
-    trail = sl
+    sl = entry * 0.7          # 30% SL
+    target = entry * 1.5      # 50% Target
+    trail_sl = sl
 
     send_message(f"""
-📊 TRADE START
+📊 TRADE STARTED
 {symbol}
 Entry: {entry}
 SL: {round(sl,2)}
@@ -109,28 +145,32 @@ Qty: {qty}
 """)
 
     while True:
+        try:
+            ltp = get_ltp(f"NFO:{symbol}")
+            pnl = (ltp - entry) * qty
 
-        ltp = get_ltp(f"NFO:{symbol}")
-        pnl = (ltp - entry) * qty
+            print(f"{symbol} | LTP: {ltp} | PnL: {pnl}")
 
-        print(f"LTP: {ltp} | PnL: {pnl}")
+            # TARGET
+            if ltp >= target:
+                send_message(f"🎯 TARGET HIT\n{symbol}\nPnL: ₹{round(pnl,2)}")
+                break
 
-        # TARGET
-        if ltp >= target:
-            send_message(f"🎯 TARGET HIT: ₹{round(pnl,2)}")
+            # STOP LOSS
+            if ltp <= trail_sl:
+                send_message(f"🛑 SL HIT\n{symbol}\nPnL: ₹{round(pnl,2)}")
+                daily_loss += abs(pnl)
+                break
+
+            # TRAILING SL
+            if ltp > entry * 1.2:
+                trail_sl = max(trail_sl, ltp - 10)
+
+            time.sleep(5)
+
+        except Exception as e:
+            print("Trade error:", e)
             break
-
-        # STOP LOSS
-        if ltp <= trail:
-            send_message(f"🛑 SL HIT: ₹{round(pnl,2)}")
-            daily_loss += abs(pnl)
-            break
-
-        # TRAILING
-        if ltp > entry * 1.2:
-            trail = max(trail, ltp - 10)
-
-        time.sleep(5)
 
     trade_active = False
 
@@ -140,7 +180,7 @@ Qty: {qty}
 # -----------------------------
 def daily_report():
     send_message(f"""
-📊 DAY SUMMARY
+📊 DAILY REPORT
 Trades: {trades_today}
 Loss: ₹{daily_loss}
 """)
@@ -153,18 +193,22 @@ def run_bot():
 
     global trades_today, daily_loss, trade_active
 
-    send_message("🚀 BOT STARTED")
+    send_message("🚀 MONEY BOT STARTED")
 
     while True:
 
         now = datetime.datetime.now()
 
+        market_start = now.replace(hour=9, minute=15)
+        market_end = now.replace(hour=15, minute=30)
+
         # MARKET TIME
-        if now.hour < 9 or now.hour > 15:
+        if now < market_start or now > market_end:
+            print("Market closed")
             time.sleep(300)
             continue
 
-        # STOP IF LOSS LIMIT HIT
+        # DAILY LOSS STOP
         if daily_loss >= MAX_DAILY_LOSS:
             send_message("🛑 DAILY LOSS LIMIT HIT")
             break
@@ -183,10 +227,11 @@ def run_bot():
 
         signal = signal_data.get("signal", "HOLD")
         quality = signal_data.get("quality", "B")
+        confidence = signal_data.get("confidence", 0)
 
-        print("Signal:", signal, "| Quality:", quality)
+        print(f"Signal: {signal} | Quality: {quality} | Conf: {confidence}")
 
-        # ONLY TAKE GOOD TRADES
+        # FILTER BAD TRADES
         if signal == "HOLD" or quality not in ["A", "A+"]:
             time.sleep(300)
             continue
@@ -194,20 +239,28 @@ def run_bot():
         symbol, price = find_option(signal)
 
         if not symbol:
-            send_message("❌ No option found")
+            send_message("❌ No valid option found")
             time.sleep(300)
             continue
 
         qty = calculate_qty(price)
 
-        send_message(f"🎯 {quality} TRADE\n{symbol} @ {price}")
+        send_message(f"""
+🎯 {quality} TRADE
+Symbol: {symbol}
+Price: {price}
+Qty: {qty}
+Confidence: {confidence}
+""")
 
-        place_order(symbol, qty)
+        order = place_order(symbol, qty)
 
-        trade_active = True
-        trades_today += 1
+        if order:
+            trade_active = True
+            trades_today += 1
+            manage_trade(symbol, price, qty)
 
-        manage_trade(symbol, price, qty)
+        time.sleep(300)
 
     daily_report()
 

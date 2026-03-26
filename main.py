@@ -1,15 +1,18 @@
 import requests
 import time
 import datetime
+import pytz
 from kiteconnect import KiteConnect
 import config
 from telegram_bot import send_message
 
 # -----------------------------
-# INIT ZERODHA (CLOUD SAFE)
+# INIT
 # -----------------------------
 kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
+
+IST = pytz.timezone("Asia/Kolkata")
 
 # -----------------------------
 # CONFIG
@@ -19,7 +22,7 @@ RISK_PER_TRADE = config.RISK_PER_TRADE
 MAX_DAILY_LOSS = config.MAX_DAILY_LOSS
 MAX_TRADES = config.MAX_TRADES
 
-SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"  # 🔴 CHANGE if needed
+SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"  # 🔴 your live server
 
 trades_today = 0
 daily_loss = 0
@@ -27,7 +30,7 @@ trade_active = False
 
 
 # -----------------------------
-# GET SIGNAL FROM CLOUD
+# GET SIGNAL
 # -----------------------------
 def get_signal():
     try:
@@ -39,7 +42,6 @@ def get_signal():
 
         data = res.json()
         print("Server Response:", data)
-
         return data
 
     except Exception as e:
@@ -48,7 +50,7 @@ def get_signal():
 
 
 # -----------------------------
-# GET LTP
+# GET PRICE
 # -----------------------------
 def get_ltp(symbol):
     return kite.ltp(symbol)[symbol]["last_price"]
@@ -64,21 +66,16 @@ def calculate_qty(price):
 
 
 # -----------------------------
-# SMART OPTION SELECTION (ATM BASED)
+# FIND ATM OPTION
 # -----------------------------
 def find_option(signal):
 
     try:
-        # Get NIFTY spot
         nifty_price = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
 
-        # Round to nearest 50
         strike = round(nifty_price / 50) * 50
 
         instruments = kite.instruments("NFO")
-
-        best_symbol = None
-        best_price = None
 
         for inst in instruments:
 
@@ -90,7 +87,6 @@ def find_option(signal):
             if str(strike) not in sym:
                 continue
 
-            # CALL / PUT filter
             if signal == "CALL" and not sym.endswith("CE"):
                 continue
 
@@ -105,7 +101,6 @@ def find_option(signal):
             if price is None:
                 continue
 
-            # Premium range filter
             if config.MIN_PREMIUM <= price <= config.MAX_PREMIUM:
                 print(f"Selected: {sym} @ {price}")
                 return sym, price
@@ -132,7 +127,6 @@ def place_order(symbol, qty):
             order_type="MARKET",
             product="MIS"
         )
-
         return order
 
     except Exception as e:
@@ -168,18 +162,15 @@ Qty: {qty}
 
             print(f"{symbol} | LTP: {ltp} | PnL: {pnl}")
 
-            # TARGET HIT
             if ltp >= target:
                 send_message(f"🎯 TARGET HIT\n{symbol}\nPnL: ₹{round(pnl,2)}")
                 break
 
-            # STOP LOSS
             if ltp <= trail_sl:
                 send_message(f"🛑 SL HIT\n{symbol}\nPnL: ₹{round(pnl,2)}")
                 daily_loss += abs(pnl)
                 break
 
-            # TRAILING SL
             if ltp > entry * 1.2:
                 trail_sl = max(trail_sl, ltp - 10)
 
@@ -204,35 +195,52 @@ Loss: ₹{daily_loss}
 
 
 # -----------------------------
-# MAIN LOOP
+# MAIN LOOP (AUTO MODE)
 # -----------------------------
 def run_bot():
 
     global trades_today, daily_loss, trade_active
 
-    send_message("🚀 BOT STARTED (LIVE CLOUD)")
+    send_message("🚀 BOT SERVICE STARTED (AUTO MODE)")
 
     while True:
 
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(IST)
 
-        market_start = now.replace(hour=9, minute=15)
-        market_end = now.replace(hour=15, minute=30)
+        start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-        # MARKET HOURS
-        if now < market_start or now > market_end:
-            print("Market closed")
+        # BEFORE MARKET
+        if now < start:
+            print("⏳ Waiting for market open...")
             time.sleep(300)
             continue
+
+        # AFTER MARKET
+        if now > end:
+            print("🌙 Market closed. Resetting...")
+
+            trades_today = 0
+            daily_loss = 0
+            trade_active = False
+
+            time.sleep(600)
+            continue
+
+        # MARKET OPEN MESSAGE
+        if now.hour == 9 and now.minute < 5:
+            send_message("🟢 Market Open - Bot Active")
 
         # RISK CONTROL
         if daily_loss >= MAX_DAILY_LOSS:
             send_message("🛑 DAILY LOSS LIMIT HIT")
-            break
+            time.sleep(600)
+            continue
 
         if trades_today >= MAX_TRADES:
             send_message("📉 MAX TRADES DONE")
-            break
+            time.sleep(600)
+            continue
 
         if trade_active:
             time.sleep(60)
@@ -246,7 +254,6 @@ def run_bot():
 
         print(f"Signal: {signal} | Quality: {quality} | Conf: {confidence}")
 
-        # FILTER LOW QUALITY TRADES
         if signal == "HOLD" or quality not in ["A", "A+"]:
             time.sleep(300)
             continue
@@ -276,8 +283,6 @@ Confidence: {confidence}
             manage_trade(symbol, price, qty)
 
         time.sleep(300)
-
-    daily_report()
 
 
 # -----------------------------

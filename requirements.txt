@@ -1,4 +1,7 @@
-kiteconnect
+flask
 pandas
 numpy
+kiteconnect
+scikit-learn
+joblib
 requests

@@ -6,24 +6,19 @@ import config
 from telegram_bot import send_message
 
 # -----------------------------
-# LOAD ACCESS TOKEN (AUTO LOGIN)
+# ZERODHA INIT (CLOUD SAFE)
 # -----------------------------
-def get_access_token():
-    with open("access_token.txt", "r") as f:
-        return f.read().strip()
-
-
 kite = KiteConnect(api_key=config.API_KEY)
-kite.set_access_token(get_access_token())
+kite.set_access_token(config.ACCESS_TOKEN)
 
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 CAPITAL = 100000
-RISK_PER_TRADE = 0.02     # 2%
-MAX_DAILY_LOSS = 3000
-MAX_TRADES = 5
+RISK_PER_TRADE = config.RISK_PER_TRADE
+MAX_DAILY_LOSS = config.MAX_DAILY_LOSS
+MAX_TRADES = config.MAX_TRADES
 
 trades_today = 0
 daily_loss = 0
@@ -31,11 +26,14 @@ trade_active = False
 
 
 # -----------------------------
-# GET SIGNAL FROM SERVER
+# GET SIGNAL FROM RENDER SERVER
 # -----------------------------
+SIGNAL_URL = "https://your-app-name.onrender.com/signal"   # 🔴 UPDATE THIS
+
+
 def get_signal():
     try:
-        res = requests.get("http://127.0.0.1:5001/signal")
+        res = requests.get(SIGNAL_URL, timeout=10)
         return res.json()
     except Exception as e:
         print("Signal error:", e)
@@ -43,7 +41,7 @@ def get_signal():
 
 
 # -----------------------------
-# GET PRICE
+# GET LTP
 # -----------------------------
 def get_ltp(symbol):
     return kite.ltp(symbol)[symbol]["last_price"]
@@ -56,19 +54,15 @@ def calculate_qty(price):
     risk_amount = CAPITAL * RISK_PER_TRADE
     qty = int(risk_amount / price)
 
-    # Ensure minimum lot size (50)
-    return max(50, qty)
+    return max(config.LOT_SIZE, qty)
 
 
 # -----------------------------
-# FIND OPTION (SMART SELECTION)
+# FIND OPTION (SMART)
 # -----------------------------
 def find_option(signal):
 
     instruments = kite.instruments("NFO")
-
-    best_symbol = None
-    best_price = None
 
     for inst in instruments:
 
@@ -77,28 +71,27 @@ def find_option(signal):
         if "NIFTY" not in sym:
             continue
 
-        try:
-            price = get_ltp(f"NFO:{sym}")
-        except:
-            continue
-
-        if price is None or price <= 0:
-            continue
-
-        # Filter by signal
+        # CALL / PUT filter
         if signal == "CALL" and not sym.endswith("CE"):
             continue
 
         if signal == "PUT" and not sym.endswith("PE"):
             continue
 
-        # Premium range
-        if 50 <= price <= 120:
-            best_symbol = sym
-            best_price = price
-            break
+        try:
+            price = get_ltp(f"NFO:{sym}")
+        except:
+            continue
 
-    return best_symbol, best_price
+        if price is None:
+            continue
+
+        # Premium filter
+        if config.MIN_PREMIUM <= price <= config.MAX_PREMIUM:
+            print(f"Selected: {sym} @ {price}")
+            return sym, price
+
+    return None, None
 
 
 # -----------------------------
@@ -116,11 +109,11 @@ def place_order(symbol, qty):
             order_type="MARKET",
             product="MIS"
         )
-
         return order
 
     except Exception as e:
         print("Order error:", e)
+        send_message(f"❌ Order error: {e}")
         return None
 
 
@@ -131,8 +124,8 @@ def manage_trade(symbol, entry, qty):
 
     global daily_loss, trade_active
 
-    sl = entry * 0.7          # 30% SL
-    target = entry * 1.5      # 50% Target
+    sl = entry * (1 - config.STOP_LOSS)
+    target = entry * (1 + config.TARGET)
     trail_sl = sl
 
     send_message(f"""
@@ -193,7 +186,7 @@ def run_bot():
 
     global trades_today, daily_loss, trade_active
 
-    send_message("🚀 MONEY BOT STARTED")
+    send_message("🚀 BOT STARTED (CLOUD)")
 
     while True:
 
@@ -202,23 +195,21 @@ def run_bot():
         market_start = now.replace(hour=9, minute=15)
         market_end = now.replace(hour=15, minute=30)
 
-        # MARKET TIME
+        # MARKET HOURS
         if now < market_start or now > market_end:
             print("Market closed")
             time.sleep(300)
             continue
 
-        # DAILY LOSS STOP
+        # RISK LIMIT
         if daily_loss >= MAX_DAILY_LOSS:
             send_message("🛑 DAILY LOSS LIMIT HIT")
             break
 
-        # MAX TRADES
         if trades_today >= MAX_TRADES:
             send_message("📉 MAX TRADES DONE")
             break
 
-        # SKIP IF TRADE RUNNING
         if trade_active:
             time.sleep(60)
             continue

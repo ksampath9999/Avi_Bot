@@ -1,5 +1,9 @@
-API_KEY = "YOUR_API_KEY"
-ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+API_KEY = "your_api_key"
+API_SECRET = "your_api_secret"
+
+USER_ID = "your_user_id"
+PASSWORD = "your_password"
+PIN = "your_pin"
 
 LOT_SIZE = 65
 MAX_TRADES = 3

@@ -28,7 +28,7 @@ trade_active = False
 # -----------------------------
 # GET SIGNAL FROM RENDER SERVER
 # -----------------------------
-SIGNAL_URL = "https://your-app-name.onrender.com/signal"   # 🔴 UPDATE THIS
+SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"   # 🔴 UPDATE THIS
 
 
 def get_signal():

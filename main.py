@@ -28,16 +28,64 @@ losses = 0
 
 
 # -----------------------------
-# SIGNAL
+# GET SIGNAL (ML + FALLBACK)
 # -----------------------------
 def get_signal():
+
     try:
         data = requests.get(SIGNAL_URL, timeout=5).json()
-        print("Signal:", data)
-        return data
+        print("ML Signal:", data)
+
+        signal = data.get("signal", "HOLD")
+        quality = data.get("quality", "B")
+
     except:
-        print("Signal API failed → fallback CALL")
-        return {"signal": "CALL", "quality": "B"}
+        print("ML server error → fallback")
+        signal = "HOLD"
+        quality = "B"
+
+    # -----------------------------
+    # FALLBACK LOGIC
+    # -----------------------------
+    if signal == "HOLD":
+
+        print("⚠️ Using fallback strategy")
+
+        try:
+            candles = kite.historical_data(
+                config.NIFTY_TOKEN,
+                datetime.datetime.now() - datetime.timedelta(minutes=20),
+                datetime.datetime.now(),
+                "5minute"
+            )
+
+            df = pd.DataFrame(candles)
+
+            if len(df) >= 2:
+
+                last = df.iloc[-1]
+                prev = df.iloc[-2]
+
+                # Breakout strategy
+                if last["close"] > prev["high"]:
+                    print("Fallback → CALL")
+                    return "CALL", "B"
+
+                elif last["close"] < prev["low"]:
+                    print("Fallback → PUT")
+                    return "PUT", "B"
+
+                else:
+                    return "HOLD", "B"
+
+            else:
+                return "HOLD", "B"
+
+        except Exception as e:
+            print("Fallback error:", e)
+            return "HOLD", "B"
+
+    return signal, quality
 
 
 # -----------------------------
@@ -51,45 +99,14 @@ def get_ltp(symbol):
 # SINGLE LOT
 # -----------------------------
 def calculate_qty(price):
-    return config.LOT_SIZE  # 65
-
-
-# -----------------------------
-# SOFT SCALPING FILTER
-# -----------------------------
-def soft_scalp_filter(signal):
-    try:
-        now = datetime.datetime.now()
-
-        data = kite.historical_data(
-            config.NIFTY_TOKEN,
-            now - datetime.timedelta(minutes=20),
-            now,
-            "5minute"
-        )
-
-        df = pd.DataFrame(data)
-
-        if len(df) < 3:
-            return True
-
-        last = df.iloc[-1]
-
-        candle_size = last["high"] - last["low"]
-
-        if candle_size < 10:
-            return False
-
-        return True
-
-    except:
-        return True
+    return config.LOT_SIZE
 
 
 # -----------------------------
 # LIGHT TREND FILTER
 # -----------------------------
 def is_trending():
+
     try:
         now = datetime.datetime.now()
 
@@ -118,6 +135,7 @@ def is_trending():
 # OPTION SELECTION
 # -----------------------------
 def find_option(signal):
+
     try:
         nifty = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
         atm = round(nifty / 50) * 50
@@ -169,6 +187,7 @@ def find_option(signal):
 # ORDER
 # -----------------------------
 def place_order(symbol, qty):
+
     try:
         order = kite.place_order(
             variety="regular",
@@ -207,7 +226,7 @@ def manage_trade(symbol, entry, qty):
             ltp = get_ltp(f"NFO:{symbol}")
             pnl = (ltp - entry) * qty
 
-            print(f"{symbol} | {ltp} | PnL: {pnl}")
+            print(f"{symbol} → {ltp} PnL: {pnl}")
 
             if ltp >= target:
                 daily_pnl += pnl
@@ -233,6 +252,7 @@ def manage_trade(symbol, entry, qty):
 # REPORT
 # -----------------------------
 def send_report():
+
     win_rate = (wins / total_trades * 100) if total_trades else 0
 
     msg = f"""
@@ -255,7 +275,7 @@ def run_bot():
 
     global trade_active
 
-    send_message("🚀 BOT STARTED (PRO STABLE MODE)")
+    send_message("🚀 BOT STARTED (ML + FALLBACK MODE)")
 
     while True:
 
@@ -274,34 +294,24 @@ def run_bot():
             time.sleep(10)
             continue
 
-        # LIGHT TREND FILTER
+        # Trend filter (light)
         if not is_trending():
-            print("Weak trend → skip")
+            print("Weak trend")
             time.sleep(30)
             continue
 
+        # -----------------------------
         # SIGNAL
-        data = get_signal()
-
-        signal = data.get("signal", "CALL")
-        quality = data.get("quality", "B")
-
-        # QUALITY FILTER
-        if quality not in ["A", "A+", "B"]:
-            time.sleep(30)
-            continue
+        # -----------------------------
+        signal, quality = get_signal()
 
         if signal == "HOLD":
             time.sleep(30)
             continue
 
-        # SOFT SCALP FILTER
-        if not soft_scalp_filter(signal):
-            print("Weak momentum → skip")
-            time.sleep(30)
-            continue
-
+        # -----------------------------
         # OPTION
+        # -----------------------------
         symbol, price = find_option(signal)
 
         if not symbol:
@@ -311,13 +321,16 @@ def run_bot():
 
         qty = calculate_qty(price)
 
+        # -----------------------------
+        # ORDER
+        # -----------------------------
         order = place_order(symbol, qty)
 
         if order:
             trade_active = True
             manage_trade(symbol, price, qty)
 
-        time.sleep(60)  # cooldown
+        time.sleep(60)
 
 
 # -----------------------------

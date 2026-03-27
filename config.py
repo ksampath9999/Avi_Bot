@@ -24,7 +24,8 @@ API_SECRET = os.getenv("API_SECRET")
 # -----------------------------
 # 📊 TRADING CONFIG
 # -----------------------------
-LOT_SIZE = 50   # NIFTY lot size (keep updated)
+NIFTY_LOT = 65
+CRUDE_LOT = 100   
 
 MAX_TRADES = 3
 
@@ -38,7 +39,7 @@ TARGET = 0.50      # 50%
 # 📈 INSTRUMENT
 # -----------------------------
 NIFTY_TOKEN = 256265
-
+CRUDE_TOKEN = 124544519 
 # -----------------------------
 # 💰 OPTION SELECTION
 # -----------------------------

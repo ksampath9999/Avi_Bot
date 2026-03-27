@@ -3,25 +3,30 @@ import time
 import datetime
 import pytz
 import pandas as pd
+import threading
 from kiteconnect import KiteConnect
 import config
 from telegram_bot import send_message
 
-# -----------------------------
-# INIT
-# -----------------------------
 kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
 IST = pytz.timezone("Asia/Kolkata")
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
-trade_active = False
-last_trade_time = None
+# -----------------------------
+# SEPARATE STATES
+# -----------------------------
+nifty_active = False
+crude_active = False
+
+nifty_last_trade = None
+crude_last_trade = None
+
 report_sent = False
 
 # -----------------------------
-# PNL TRACKING
+# PNL TRACKING (SHARED)
 # -----------------------------
 daily_pnl = 0
 total_trades = 0
@@ -34,9 +39,6 @@ losses = 0
 # -----------------------------
 def get_ltp(symbol):
     return kite.ltp(symbol)[symbol]["last_price"]
-
-def calculate_qty(price):
-    return config.LOT_SIZE
 
 
 # -----------------------------
@@ -54,7 +56,7 @@ def ml_signal():
 
 
 # -----------------------------
-# BREAKOUT
+# NIFTY STRATEGIES (UNCHANGED)
 # -----------------------------
 def breakout_signal():
     try:
@@ -79,9 +81,6 @@ def breakout_signal():
         return "HOLD"
 
 
-# -----------------------------
-# VWAP
-# -----------------------------
 def vwap_signal():
     try:
         now = datetime.datetime.now()
@@ -97,18 +96,12 @@ def vwap_signal():
 
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
-        if df.iloc[-1]["close"] > df.iloc[-1]["vwap"]:
-            return "CALL"
-        else:
-            return "PUT"
+        return "CALL" if df.iloc[-1]["close"] > df.iloc[-1]["vwap"] else "PUT"
 
     except:
         return "HOLD"
 
 
-# -----------------------------
-# PIVOT
-# -----------------------------
 def pivot_signal():
     try:
         now = datetime.datetime.now()
@@ -122,26 +115,14 @@ def pivot_signal():
         prev = df.iloc[-2]
 
         pivot = (prev["high"] + prev["low"] + prev["close"]) / 3
-        r1 = 2 * pivot - prev["low"]
-        s1 = 2 * pivot - prev["high"]
-
         ltp = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
 
-        if ltp > r1:
-            return "CALL"
-        if ltp < s1:
-            return "PUT"
-        if ltp > pivot:
-            return "CALL"
-        return "PUT"
+        return "CALL" if ltp > pivot else "PUT"
 
     except:
         return "HOLD"
 
 
-# -----------------------------
-# MOMENTUM
-# -----------------------------
 def momentum_signal():
     try:
         now = datetime.datetime.now()
@@ -165,67 +146,103 @@ def momentum_signal():
         return "HOLD"
 
 
-# -----------------------------
-# FINAL SIGNAL
-# -----------------------------
 def get_final_signal():
-
     for fn in [ml_signal, breakout_signal, vwap_signal, pivot_signal, momentum_signal]:
         sig = fn()
         if sig != "HOLD":
-            print("Signal from", fn.__name__, ":", sig)
             return sig
-
     return "HOLD"
 
 
 # -----------------------------
-# OPTION SELECT
+# CRUDE SIGNAL
 # -----------------------------
-def find_option(signal):
+def get_crude_signal():
+    try:
+        now = datetime.datetime.now()
 
-    nifty = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
-    atm = round(nifty / 50) * 50
+        df = pd.DataFrame(kite.historical_data(
+            config.CRUDE_TOKEN,
+            now - datetime.timedelta(minutes=20),
+            now,
+            "5minute"
+        ))
 
-    instruments = kite.instruments("NFO")
+        if len(df) < 2:
+            return "HOLD"
 
-    opts = [i for i in instruments if i["name"] == "NIFTY"]
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
 
-    expiry = sorted(set(i["expiry"] for i in opts if i["expiry"] >= datetime.datetime.now().date()))[0]
+        if last["close"] > prev["high"]:
+            return "CALL"
+        elif last["close"] < prev["low"]:
+            return "PUT"
+
+        return "HOLD"
+
+    except:
+        return "HOLD"
+
+
+# -----------------------------
+# OPTION SELECTOR
+# -----------------------------
+def find_option(signal, instrument):
+
+    if instrument == "NIFTY":
+        exchange = "NFO"
+        name = "NIFTY"
+        lot = config.NIFTY_LOT
+        pmin, pmax = config.MIN_PREMIUM, config.MAX_PREMIUM
+    else:
+        exchange = "MCX"
+        name = "CRUDEOIL"
+        lot = config.CRUDE_LOT
+        pmin, pmax = 50, 300
+
+    instruments = kite.instruments(exchange)
+
+    opts = [
+        i for i in instruments
+        if name in i["name"] and i["instrument_type"] in ["CE", "PE"]
+    ]
+
+    today = datetime.datetime.now().date()
+    expiry = sorted(set(i["expiry"] for i in opts if i["expiry"] >= today))[0]
 
     opt_type = "CE" if signal == "CALL" else "PE"
 
-    best = None
-    best_price = None
+    best, best_price = None, None
 
     for i in opts:
 
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue
 
-        symbol = f"NFO:{i['tradingsymbol']}"
+        symbol = f"{exchange}:{i['tradingsymbol']}"
 
         try:
             price = kite.ltp(symbol)[symbol]["last_price"]
         except:
             continue
 
-        if 30 <= price <= 150:
-            if best_price is None or abs(price - 80) < abs(best_price - 80):
+        if pmin <= price <= pmax:
+            if best_price is None or abs(price - 100) < abs(best_price - 100):
                 best = i["tradingsymbol"]
                 best_price = price
 
-    return best, best_price
+    return best, best_price, lot, exchange
 
 
 # -----------------------------
 # ORDER
 # -----------------------------
-def place_order(symbol, qty):
+def place_order(symbol, qty, exchange):
     try:
         kite.place_order(
             variety="regular",
-            exchange="NFO",
+            exchange=exchange,
             tradingsymbol=symbol,
             transaction_type="BUY",
             quantity=qty,
@@ -242,32 +259,28 @@ def place_order(symbol, qty):
 # -----------------------------
 # TRADE MGMT
 # -----------------------------
-def manage_trade(symbol, entry, qty):
+def manage_trade(symbol, entry, qty, exchange, instrument):
 
-    global trade_active, daily_pnl, total_trades, wins, losses
+    global daily_pnl, total_trades, wins, losses
 
-    sl = entry * 0.90
-    target = entry * 1.18
+    sl = entry * (0.80 if instrument == "CRUDE" else 0.90)
+    target = entry * (1.30 if instrument == "CRUDE" else 1.18)
 
     total_trades += 1
-
-    send_message(f"🚀 TRADE\n{symbol} @ {entry}")
+    send_message(f"🚀 {instrument} TRADE\n{symbol} @ {entry}")
 
     while True:
         try:
-            ltp = get_ltp(f"NFO:{symbol}")
-            pnl = (ltp - entry) * qty
+            ltp = kite.ltp(f"{exchange}:{symbol}")[f"{exchange}:{symbol}"]["last_price"]
 
             if ltp >= target:
-                daily_pnl += pnl
                 wins += 1
-                send_message(f"🎯 TARGET ₹{round(pnl,2)}")
+                send_message(f"🎯 {instrument} TARGET")
                 break
 
             if ltp <= sl:
-                daily_pnl -= abs(pnl)
                 losses += 1
-                send_message(f"🛑 SL ₹{round(pnl,2)}")
+                send_message(f"🛑 {instrument} SL")
                 break
 
             time.sleep(5)
@@ -275,84 +288,72 @@ def manage_trade(symbol, entry, qty):
         except:
             break
 
-    trade_active = False
-
 
 # -----------------------------
-# REPORT (ONLY ONCE)
+# THREADS
 # -----------------------------
-def send_report():
-    win_rate = (wins / total_trades * 100) if total_trades else 0
-
-    msg = f"""
-📊 DAILY REPORT
-
-Trades: {total_trades}
-Wins: {wins}
-Losses: {losses}
-
-Win Rate: {round(win_rate,2)}%
-PnL: ₹{round(daily_pnl,2)}
-"""
-    send_message(msg)
-
-
-# -----------------------------
-# MAIN LOOP
-# -----------------------------
-def run_bot():
-
-    global trade_active, last_trade_time, report_sent
-
-    send_message("🚀 BOT STARTED (ULTIMATE PRO MODE)")
+def nifty_loop():
+    global nifty_active, nifty_last_trade
 
     while True:
-
         now = datetime.datetime.now(IST)
 
-        # ONLY ONE REPORT AFTER 3:30
-        if now.hour >= 15 and not report_sent:
-            send_report()
-            report_sent = True
-
-        if now.hour < 9:
+        if not (9 <= now.hour < 15):
             time.sleep(60)
             continue
 
-        if now.hour >= 15:
-            time.sleep(300)
+        if nifty_active:
+            time.sleep(5)
             continue
-
-        if trade_active:
-            time.sleep(10)
-            continue
-
-        if last_trade_time:
-            if (datetime.datetime.now() - last_trade_time).seconds < 120:
-                time.sleep(20)
-                continue
 
         signal = get_final_signal()
 
         if signal == "HOLD":
-            time.sleep(30)
+            time.sleep(10)
             continue
 
-        symbol, price = find_option(signal)
+        symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
-        if not symbol:
-            time.sleep(30)
+        if symbol and place_order(symbol, lot, exchange):
+            nifty_active = True
+            manage_trade(symbol, price, lot, exchange, "NIFTY")
+            nifty_active = False
+
+
+def crude_loop():
+    global crude_active, crude_last_trade
+
+    while True:
+        now = datetime.datetime.now(IST)
+
+        if not (9 <= now.hour < 23):
+            time.sleep(60)
             continue
 
-        qty = calculate_qty(price)
+        if crude_active:
+            time.sleep(5)
+            continue
 
-        if place_order(symbol, qty):
-            trade_active = True
-            last_trade_time = datetime.datetime.now()
-            manage_trade(symbol, price, qty)
+        signal = get_crude_signal()
 
-        time.sleep(30)
+        if signal == "HOLD":
+            time.sleep(10)
+            continue
+
+        symbol, price, lot, exchange = find_option(signal, "CRUDE")
+
+        if symbol and place_order(symbol, lot, exchange):
+            crude_active = True
+            manage_trade(symbol, price, lot, exchange, "CRUDE")
+            crude_active = False
 
 
+# -----------------------------
+# MAIN
+# -----------------------------
 if __name__ == "__main__":
-    run_bot()
+
+    send_message("🚀 BOT STARTED (PARALLEL MODE FINAL)")
+
+    threading.Thread(target=nifty_loop).start()
+    threading.Thread(target=crude_loop).start()

@@ -555,15 +555,15 @@ def nifty_loop():
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
         if symbol and price:
-        success = place_order(symbol, lot, exchange)
+            success = place_order(symbol, lot, exchange)
 
         if success:
             nifty_active = True  # or crude_active
             manage_trade(symbol, price, lot, exchange, "CRUDE")
             crude_active = False
-                nifty_active = True
-                manage_trade(symbol, price, lot, exchange, "NIFTY")
-                nifty_active = False
+            nifty_active = True
+            manage_trade(symbol, price, lot, exchange, "NIFTY")
+            nifty_active = False
         print("CRUDE SIGNAL:", signal)
 
 def crude_loop():
@@ -601,15 +601,15 @@ def crude_loop():
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
         if symbol and price:
-        success = place_order(symbol, lot, exchange)
+            success = place_order(symbol, lot, exchange)
 
         if success:
             nifty_active = True  # or crude_active
             manage_trade(symbol, price, lot, exchange, "CRUDE")
             crude_active = False
-                crude_active = True
-                manage_trade(symbol, price, lot, exchange, "CRUDE")
-                crude_active = False
+            crude_active = True
+            manage_trade(symbol, price, lot, exchange, "CRUDE")
+            crude_active = False
         print("CRUDE SIGNAL:", signal)
 
 # -----------------------------

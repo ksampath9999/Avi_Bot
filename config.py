@@ -25,12 +25,7 @@ API_SECRET = os.getenv("API_SECRET")
 # 📊 TRADING CONFIG
 # -----------------------------
 NIFTY_LOT = 65
-CRUDE_LOT = 100   
-
-MAX_TRADES = 3
-
-RISK_PER_TRADE = 0.02   # 2%
-MAX_DAILY_LOSS = 3000
+CRUDE_LOT = 1  
 
 STOP_LOSS = 0.30   # 30%
 TARGET = 0.50      # 50%
@@ -39,7 +34,7 @@ TARGET = 0.50      # 50%
 # 📈 INSTRUMENT
 # -----------------------------
 NIFTY_TOKEN = 256265
-CRUDE_TOKEN = 124544519 
+CRUDE_TOKEN = 145398279 
 # -----------------------------
 # 💰 OPTION SELECTION
 # -----------------------------
@@ -51,9 +46,12 @@ MAX_PREMIUM = 120
 # -----------------------------
 MAX_DAILY_LOSS = -3000      # stop after loss
 DAILY_TARGET = 5000         # stop after profit
-MAX_TRADES = 5             # max trades per day
+MAX_TRADES = 8             # max trades per day
 COOLDOWN_AFTER_LOSS = 300  # seconds (5 min)
 
 USE_DYNAMIC_LOT = False
 CAPITAL = 100000
 RISK_PER_TRADE = 0.02   # 2%
+
+# Strike Mode
+STRIKE_MODE = "ATM"   # ATM / ITM / OTM

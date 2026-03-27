@@ -7,12 +7,15 @@ import threading
 from kiteconnect import KiteConnect
 import config
 from telegram_bot import send_message
+import csv
+import os
 
 kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
 IST = pytz.timezone("Asia/Kolkata")
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
+last_analysis_time = 0
 
 # -----------------------------
 # STATES
@@ -281,60 +284,88 @@ def find_option(signal, instrument):
         exchange = "NFO"
         name = "NIFTY"
         lot = config.NIFTY_LOT
-        pmin, pmax = config.MIN_PREMIUM, config.MAX_PREMIUM
+        step = 50
+        token_symbol = "NSE:NIFTY 50"
     else:
         exchange = "MCX"
         name = "CRUDEOIL"
         lot = config.CRUDE_LOT
-        pmin, pmax = 10, 1000   # wider safe range
+        step = 100
+        token_symbol = f"{exchange}:CRUDEOIL"
+
+    try:
+        ltp = kite.ltp(token_symbol)[token_symbol]["last_price"]
+    except:
+        print("❌ LTP fetch failed")
+        return None, None, None, None
+
+    atm = round(ltp / step) * step
+
+    # -----------------------------
+    # STRIKE MODE LOGIC
+    # -----------------------------
+    if instrument == "NIFTY":
+        mode = get_strike_mode(config.NIFTY_TOKEN)
+    else:
+        mode = get_strike_mode(config.CRUDE_TOKEN)
+
+    if signal == "CALL":
+        if mode == "ATM":
+            strike = atm
+        elif mode == "ITM":
+            strike = atm - step
+        elif mode == "OTM":
+            strike = atm + step
+
+    elif signal == "PUT":
+        if mode == "ATM":
+            strike = atm
+        elif mode == "ITM":
+            strike = atm + step
+        elif mode == "OTM":
+            strike = atm - step
+
+    print(f"{instrument} LTP: {ltp} | Mode: {mode} | Strike: {strike}")
 
     instruments = kite.instruments(exchange)
 
-    opts = []
-
-    for i in instruments:
-        if instrument == "CRUDE":
-            if "CRUDEOIL" in i["tradingsymbol"] and i["instrument_type"] in ["CE", "PE"]:
-                opts.append(i)
-        else:
-            if name in i["name"] and i["instrument_type"] in ["CE", "PE"]:
-                opts.append(i)
-
-    if not opts:
-        print("❌ No options found")
-        return None, None, None, None
-
     today = datetime.datetime.now().date()
 
-    expiries = sorted(set(i["expiry"] for i in opts if i["expiry"] >= today))
-    if not expiries:
-        print("❌ No valid expiry")
+    opts = [
+        i for i in instruments
+        if (
+            (instrument == "CRUDE" and "CRUDEOIL" in i["tradingsymbol"]) or
+            (instrument == "NIFTY" and name in i["name"])
+        )
+        and i["instrument_type"] in ["CE", "PE"]
+        and i["expiry"] >= today
+    ]
+
+    if not opts:
         return None, None, None, None
 
-    expiry = expiries[0]
+    expiry = sorted(set(i["expiry"] for i in opts))[0]
 
     opt_type = "CE" if signal == "CALL" else "PE"
 
+    # -----------------------------
+    # FIND TARGET STRIKE
+    # -----------------------------
     best = None
     best_price = None
 
     for i in opts:
 
-        # -----------------------------
-        # FILTER EXPIRY + TYPE
-        # -----------------------------
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue
 
-        # -----------------------------
-        # ✅ CRUDE STRIKE FILTER (100 ONLY)
-        # -----------------------------
-        if instrument == "CRUDE":
-            try:
-                if int(i["strike"]) % 100 != 0:
-                    continue
-            except:
-                continue
+        try:
+            s = int(i["strike"])
+        except:
+            continue
+
+        if s != strike:
+            continue
 
         symbol = f"{exchange}:{i['tradingsymbol']}"
 
@@ -343,20 +374,45 @@ def find_option(signal, instrument):
         except:
             continue
 
-        print(f"Checking {i['tradingsymbol']} → {price}")
+        best = i["tradingsymbol"]
+        best_price = price
+        break
 
-        if pmin <= price <= pmax:
+    # -----------------------------
+    # FALLBACK → NEAREST STRIKE
+    # -----------------------------
+    if not best:
 
-            # choose premium near ₹100 (best liquidity)
-            if best_price is None or abs(price - 100) < abs(best_price - 100):
+        min_diff = float("inf")
+
+        for i in opts:
+
+            if i["expiry"] != expiry or i["instrument_type"] != opt_type:
+                continue
+
+            try:
+                s = int(i["strike"])
+            except:
+                continue
+
+            diff = abs(s - strike)
+
+            if diff < min_diff:
+                symbol = f"{exchange}:{i['tradingsymbol']}"
+                try:
+                    price = kite.ltp(symbol)[symbol]["last_price"]
+                except:
+                    continue
+
+                min_diff = diff
                 best = i["tradingsymbol"]
                 best_price = price
 
-    if best and best_price:
+    if best:
         print(f"✅ Selected: {best} @ {best_price}")
         return best, best_price, lot, exchange
 
-    print("❌ No valid option in range")
+    print("❌ No strike found")
     return None, None, None, None
 # -----------------------------
 # ORDER
@@ -521,6 +577,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
                     last_loss_time = time.time()
 
                 send_message(f"🛑 EXIT (TRAIL SL)\nPnL: ₹{round(pnl,2)}")
+                log_trade(symbol, entry, ltp, pnl, instrument)
                 break
 
             # Optional hard target
@@ -528,6 +585,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
                 pnl = (ltp - entry) * qty
                 daily_pnl += pnl
                 send_message(f"🎯 TARGET HIT ₹{round(pnl,2)}")
+                log_trade(symbol, entry, ltp, pnl, instrument)
                 break
 
             time.sleep(5)
@@ -544,6 +602,11 @@ def nifty_loop():
 
     while True:
         now = datetime.datetime.now(IST)
+        
+        global last_analysis_time
+        if time.time() - last_analysis_time > 1800:
+            analyze_performance()
+            last_analysis_time = time.time()
 
         if not (9 <= now.hour < 15):
             time.sleep(60)
@@ -590,6 +653,11 @@ def crude_loop():
 
     while True:
         now = datetime.datetime.now(IST)
+        
+        global last_analysis_time
+        if time.time() - last_analysis_time > 1800:
+            analyze_performance()
+            last_analysis_time = time.time()
 
         if not (9 <= now.hour < 23):
             time.sleep(60)
@@ -630,6 +698,110 @@ def crude_loop():
             manage_trade(symbol, price, lot, exchange, "CRUDE")
             crude_active = False
         print("CRUDE SIGNAL:", signal)
+        
+def get_strike_mode(token):
+
+    try:
+        now = datetime.datetime.now()
+
+        df = pd.DataFrame(kite.historical_data(
+            token,
+            now - datetime.timedelta(hours=2),
+            now,
+            "5minute"
+        ))
+
+        if len(df) < 20:
+            return "ATM"
+
+        # -----------------------------
+        # VWAP
+        # -----------------------------
+        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
+        last = df.iloc[-1]
+
+        vwap_distance = abs(last["close"] - last["vwap"])
+
+        # -----------------------------
+        # MOMENTUM
+        # -----------------------------
+        body = abs(last["close"] - last["open"])
+        rng = last["high"] - last["low"]
+
+        strong_candle = body > rng * 0.6
+
+        # -----------------------------
+        # VOLATILITY
+        # -----------------------------
+        day_range = df["high"].max() - df["low"].min()
+
+        # -----------------------------
+        # DECISION LOGIC
+        # -----------------------------
+        if vwap_distance > 20 and strong_candle:
+            return "OTM"   # strong trend
+
+        if vwap_distance > 10:
+            return "ATM"   # normal
+
+        return "ITM"       # weak / sideways
+
+    except:
+        return "ATM"
+
+def log_trade(symbol, entry, exit_price, pnl, instrument):
+
+    file = "trade_log.csv"
+
+    file_exists = os.path.isfile(file)
+
+    with open(file, "a", newline="") as f:
+        writer = csv.writer(f)
+
+        if not file_exists:
+            writer.writerow([
+                "time", "instrument", "symbol",
+                "entry", "exit", "pnl"
+            ])
+
+        writer.writerow([
+            datetime.datetime.now(),
+            instrument,
+            symbol,
+            entry,
+            exit_price,
+            pnl
+        ])
+        
+def analyze_performance():
+
+    try:
+        df = pd.read_csv("trade_log.csv")
+
+        if len(df) < 10:
+            return
+
+        win_rate = len(df[df["pnl"] > 0]) / len(df)
+
+        avg_pnl = df["pnl"].mean()
+
+        print(f"Win Rate: {win_rate}, Avg PnL: {avg_pnl}")
+
+        # -----------------------------
+        # AUTO LEARNING RULES
+        # -----------------------------
+        if win_rate < 0.4:
+            config.STRIKE_MODE = "ITM"
+
+        elif win_rate > 0.6:
+            config.STRIKE_MODE = "OTM"
+
+        else:
+            config.STRIKE_MODE = "ATM"
+
+    except:
+        pass
 
 # -----------------------------
 # MAIN

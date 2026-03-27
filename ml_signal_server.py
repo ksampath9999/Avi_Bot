@@ -16,15 +16,18 @@ kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
 # -----------------------------
-# GOOGLE DRIVE MODEL DOWNLOAD
+# MODEL CONFIG
 # -----------------------------
 MODEL_PATH = "ml_model.pkl"
-MODEL_URL = "https://drive.google.com/uc?export=download&id=1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc"
+MODEL_URL = "https://drive.google.com/uc?export=download&id=1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc"   # <-- paste your Google Drive direct link
 
 
+# -----------------------------
+# DOWNLOAD MODEL
+# -----------------------------
 def download_model():
     if not os.path.exists(MODEL_PATH):
-        print("⬇️ Downloading model...")
+        print("⬇️ Downloading model from Google Drive...")
 
         try:
             response = requests.get(MODEL_URL)
@@ -62,10 +65,10 @@ def get_signal():
     try:
         now = datetime.datetime.now()
 
-        # Fetch recent data (robust)
+        # ✅ FIXED: 2 DAYS DATA (VERY IMPORTANT)
         data = kite.historical_data(
             config.NIFTY_TOKEN,
-            now - datetime.timedelta(hours=2),
+            now - datetime.timedelta(days=2),
             now,
             "5minute"
         )
@@ -74,14 +77,21 @@ def get_signal():
 
         print("Data length:", len(df))
 
-        if len(df) < 20:
-            return jsonify({
-                "signal": "HOLD",
-                "reason": "Insufficient data"
-            })
+        # -----------------------------
+        # FALLBACK IF VERY LOW DATA
+        # -----------------------------
+        if len(df) < 10:
+            print("⚠️ Low data → fallback")
+
+            last = df.iloc[-1]
+
+            if last["close"] > last["open"]:
+                return jsonify({"signal": "CALL", "reason": "Fallback low data"})
+            else:
+                return jsonify({"signal": "PUT", "reason": "Fallback low data"})
 
         # -----------------------------
-        # SIMPLE FEATURES (ROBUST)
+        # FEATURES (SIMPLE & ROBUST)
         # -----------------------------
         df["returns"] = df["close"].pct_change()
         df["ema"] = df["close"].ewm(span=10).mean()
@@ -89,59 +99,59 @@ def get_signal():
         df = df.dropna()
 
         if len(df) < 10:
-            return jsonify({
-                "signal": "HOLD",
-                "reason": "Feature drop empty"
-            })
+            print("⚠️ After dropna → fallback")
+
+            last = df.iloc[-1]
+
+            if last["close"] > last["open"]:
+                return jsonify({"signal": "CALL", "reason": "Fallback dropna"})
+            else:
+                return jsonify({"signal": "PUT", "reason": "Fallback dropna"})
 
         last = df.iloc[-1]
+        prev = df.iloc[-2]
 
         # -----------------------------
         # ML PREDICTION
         # -----------------------------
         if MODEL_LOADED:
 
-            features = [[
-                last["close"],
-                last["ema"],
-                last["returns"]
-            ]]
+            try:
+                features = [[
+                    last["close"],
+                    last["ema"],
+                    last["returns"]
+                ]]
 
-            prediction = model.predict(features)[0]
+                prediction = model.predict(features)[0]
 
-            signal = "CALL" if prediction == 1 else "PUT"
+                signal = "CALL" if prediction == 1 else "PUT"
 
-            return jsonify({
-                "signal": signal,
-                "reason": "ML prediction"
-            })
+                return jsonify({
+                    "signal": signal,
+                    "reason": "ML prediction"
+                })
+
+            except Exception as e:
+                print("ML prediction error:", e)
 
         # -----------------------------
-        # FALLBACK (IMPORTANT)
+        # FINAL FALLBACK (BREAKOUT)
         # -----------------------------
+        print("⚠️ Using breakout fallback")
+
+        if last["close"] > prev["high"]:
+            return jsonify({"signal": "CALL", "reason": "Breakout fallback"})
+
+        elif last["close"] < prev["low"]:
+            return jsonify({"signal": "PUT", "reason": "Breakout fallback"})
+
         else:
-
-            print("⚠️ Using fallback (no model)")
-
-            prev = df.iloc[-2]
-
-            if last["close"] > prev["high"]:
-                return jsonify({
-                    "signal": "CALL",
-                    "reason": "Fallback breakout"
-                })
-
-            elif last["close"] < prev["low"]:
-                return jsonify({
-                    "signal": "PUT",
-                    "reason": "Fallback breakout"
-                })
-
+            # LAST SAFETY (NEVER STAY HOLD TOO LONG)
+            if last["close"] > last["open"]:
+                return jsonify({"signal": "CALL", "reason": "Candle fallback"})
             else:
-                return jsonify({
-                    "signal": "HOLD",
-                    "reason": "No clear move"
-                })
+                return jsonify({"signal": "PUT", "reason": "Candle fallback"})
 
     except Exception as e:
         print("❌ ERROR:", e)
@@ -153,7 +163,7 @@ def get_signal():
 
 
 # -----------------------------
-# RUN SERVER
+# RUN SERVER (RENDER READY)
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))

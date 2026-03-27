@@ -45,3 +45,15 @@ CRUDE_TOKEN = 124544519
 # -----------------------------
 MIN_PREMIUM = 50
 MAX_PREMIUM = 120
+
+# -----------------------------
+# RISK MANAGEMENT
+# -----------------------------
+MAX_DAILY_LOSS = -3000      # stop after loss
+DAILY_TARGET = 5000         # stop after profit
+MAX_TRADES = 5             # max trades per day
+COOLDOWN_AFTER_LOSS = 300  # seconds (5 min)
+
+USE_DYNAMIC_LOT = False
+CAPITAL = 100000
+RISK_PER_TRADE = 0.02   # 2%

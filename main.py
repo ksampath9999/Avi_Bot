@@ -14,23 +14,30 @@ kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
 IST = pytz.timezone("Asia/Kolkata")
-
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
 trade_active = False
 daily_loss = 0
 extra_risk_cut = False
 
+# -----------------------------
+# PNL TRACKING
+# -----------------------------
+daily_pnl = 0
+total_trades = 0
+wins = 0
+losses = 0
+
 
 # -----------------------------
-# EXPIRY CHECK (Tuesday)
+# EXPIRY CHECK
 # -----------------------------
 def is_expiry_day():
     return datetime.datetime.now(IST).weekday() == 1
 
 
 # -----------------------------
-# TREND FILTER (VWAP > 15)
+# TREND FILTER
 # -----------------------------
 def is_trending_day():
     try:
@@ -85,14 +92,14 @@ def get_ltp(symbol):
 
 
 # -----------------------------
-# FIXED SINGLE LOT
+# SINGLE LOT
 # -----------------------------
 def calculate_qty(price):
-    return config.LOT_SIZE   # ALWAYS 1 LOT
+    return config.LOT_SIZE  # 65
 
 
 # -----------------------------
-# SMART SCALPING FILTER
+# SCALPING FILTER
 # -----------------------------
 def smart_scalping_filter(signal):
     try:
@@ -134,8 +141,7 @@ def smart_scalping_filter(signal):
 
         return True
 
-    except Exception as e:
-        print("Scalp error:", e)
+    except:
         return False
 
 
@@ -152,7 +158,7 @@ def get_weekly_expiry(instruments):
 
 
 # -----------------------------
-# OPTION SELECTION (FIXED)
+# OPTION SELECTION
 # -----------------------------
 def find_option(signal):
     try:
@@ -207,8 +213,7 @@ def find_option(signal):
 
         return best_symbol, best_price
 
-    except Exception as e:
-        print("Option error:", e)
+    except:
         return None, None
 
 
@@ -237,6 +242,7 @@ def place_order(symbol, qty):
 def manage_trade(symbol, entry, qty, mode):
 
     global trade_active, daily_loss
+    global daily_pnl, total_trades, wins, losses
 
     if mode == "SCALP":
         sl = entry * 0.85
@@ -249,6 +255,8 @@ def manage_trade(symbol, entry, qty, mode):
 
     send_message(f"🚀 {mode} TRADE\n{symbol} @ {entry}")
 
+    total_trades += 1
+
     while True:
         try:
             ltp = get_ltp(f"NFO:{symbol}")
@@ -256,10 +264,14 @@ def manage_trade(symbol, entry, qty, mode):
 
             if ltp >= target:
                 send_message(f"🎯 TARGET HIT ₹{round(pnl,2)}")
+                daily_pnl += pnl
+                wins += 1
                 break
 
             if ltp <= sl:
                 send_message(f"🛑 SL HIT ₹{round(pnl,2)}")
+                daily_pnl -= abs(pnl)
+                losses += 1
                 daily_loss += abs(pnl)
                 break
 
@@ -272,24 +284,56 @@ def manage_trade(symbol, entry, qty, mode):
 
 
 # -----------------------------
+# DAILY REPORT
+# -----------------------------
+def send_daily_report():
+
+    try:
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+
+        msg = f"""
+📊 DAILY REPORT
+
+Trades: {total_trades}
+Wins: {wins}
+Losses: {losses}
+
+Win Rate: {round(win_rate,2)}%
+
+PnL: ₹{round(daily_pnl,2)}
+"""
+
+        send_message(msg)
+
+    except Exception as e:
+        print("Report error:", e)
+
+
+# -----------------------------
 # MAIN LOOP
 # -----------------------------
 def run_bot():
 
     global trade_active, extra_risk_cut
 
-    send_message("🚀 BOT STARTED (1 LOT MODE)")
+    send_message("🚀 BOT STARTED (WITH PNL TRACKING)")
 
     while True:
 
         now = datetime.datetime.now(IST)
 
-        if now.hour < 9 or now.hour > 15:
+        # SEND REPORT AFTER MARKET
+        if now.hour >= 15:
+            send_daily_report()
+            time.sleep(600)
+            continue
+
+        if now.hour < 9:
             time.sleep(300)
             continue
 
+        # TREND FILTER
         if not is_trending_day():
-            print("❌ Not trending")
             time.sleep(300)
             continue
 
@@ -304,6 +348,7 @@ def run_bot():
             if (now.hour == 13 and now.minute >= 30) or now.hour == 14:
                 extra_risk_cut = True
 
+        # MODE
         if (now.hour == 9 and now.minute >= 15) or (now.hour == 10 and now.minute < 30):
             mode = "SCALP"
         else:

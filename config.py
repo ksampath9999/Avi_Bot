@@ -24,7 +24,7 @@ API_SECRET = os.getenv("API_SECRET")
 # -----------------------------
 # 📊 TRADING CONFIG
 # -----------------------------
-NIFTY_LOT = 65
+NIFTY_LOT = 1
 CRUDE_LOT = 1  
 
 STOP_LOSS = 0.30   # 30%
@@ -49,9 +49,9 @@ DAILY_TARGET = 5000         # stop after profit
 MAX_TRADES = 8             # max trades per day
 COOLDOWN_AFTER_LOSS = 300  # seconds (5 min)
 
-USE_DYNAMIC_LOT = False
-CAPITAL = 100000
+
 RISK_PER_TRADE = 0.02   # 2%
+MAX_LOTS = 3
 
 # Strike Mode
 STRIKE_MODE = "ATM"   # ATM / ITM / OTM

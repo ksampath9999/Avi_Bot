@@ -21,10 +21,98 @@ nifty_active = False
 crude_active = False
 
 # -----------------------------
-# BASIC
+# RISK VARIABLES
 # -----------------------------
-def get_ltp(symbol):
-    return kite.ltp(symbol)[symbol]["last_price"]
+daily_pnl = 0
+trade_count = 0
+last_loss_time = None
+
+# -----------------------------
+# MARKET FILTERS
+# -----------------------------
+def is_market_trending(token):
+    try:
+        now = datetime.datetime.now()
+        df = pd.DataFrame(kite.historical_data(
+            token,
+            now - datetime.timedelta(hours=2),
+            now,
+            "5minute"
+        ))
+
+        if len(df) < 20:
+            return False
+
+        df["tr"] = df["high"] - df["low"]
+        df["atr"] = df["tr"].rolling(14).mean()
+
+        recent_range = df["high"].max() - df["low"].min()
+        atr = df["atr"].iloc[-1]
+
+        if atr < 5:
+            return False
+        if recent_range < atr * 3:
+            return False
+
+        return True
+    except:
+        return False
+
+
+def is_strong_trend_day(token):
+    try:
+        now = datetime.datetime.now()
+        df = pd.DataFrame(kite.historical_data(
+            token,
+            now - datetime.timedelta(hours=3),
+            now,
+            "5minute"
+        ))
+
+        if len(df) < 20:
+            return False
+
+        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        last = df.iloc[-1]
+
+        vwap_distance = abs(last["close"] - last["vwap"])
+        day_range = df["high"].max() - df["low"].min()
+
+        df["tr"] = df["high"] - df["low"]
+        df["atr"] = df["tr"].rolling(14).mean()
+        atr = df["atr"].iloc[-1]
+
+        if vwap_distance > 15 and day_range > atr * 4:
+            return True
+
+        return False
+    except:
+        return False
+
+# -----------------------------
+# RISK CONTROL
+# -----------------------------
+def can_trade():
+    global daily_pnl, trade_count, last_loss_time
+
+    if trade_count >= config.MAX_TRADES:
+        print("Max trades reached")
+        return False
+
+    if daily_pnl <= config.MAX_DAILY_LOSS:
+        print("Max loss hit")
+        return False
+
+    if daily_pnl >= config.DAILY_TARGET:
+        print("Target achieved")
+        return False
+
+    if last_loss_time:
+        if time.time() - last_loss_time < config.COOLDOWN_AFTER_LOSS:
+            print("Cooldown active")
+            return False
+
+    return True
 
 # -----------------------------
 # ML SIGNAL
@@ -51,6 +139,7 @@ def breakout_signal():
             now,
             "5minute"
         ))
+
         if len(df) < 3:
             return "HOLD"
 
@@ -63,6 +152,7 @@ def breakout_signal():
     except:
         return "HOLD"
 
+
 def vwap_signal():
     try:
         now = datetime.datetime.now()
@@ -72,13 +162,16 @@ def vwap_signal():
             now,
             "5minute"
         ))
+
         if len(df) < 10:
             return "HOLD"
 
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
         return "CALL" if df.iloc[-1]["close"] > df.iloc[-1]["vwap"] else "PUT"
+
     except:
         return "HOLD"
+
 
 def pivot_signal():
     try:
@@ -89,12 +182,15 @@ def pivot_signal():
             now,
             "day"
         ))
+
         prev = df.iloc[-2]
         pivot = (prev["high"] + prev["low"] + prev["close"]) / 3
         ltp = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
+
         return "CALL" if ltp > pivot else "PUT"
     except:
         return "HOLD"
+
 
 def momentum_signal():
     try:
@@ -105,6 +201,7 @@ def momentum_signal():
             now,
             "5minute"
         ))
+
         last = df.iloc[-1]
         body = abs(last["close"] - last["open"])
         rng = last["high"] - last["low"]
@@ -115,6 +212,7 @@ def momentum_signal():
         return "HOLD"
     except:
         return "HOLD"
+
 
 def get_final_signal():
     for fn in [ml_signal, breakout_signal, vwap_signal, pivot_signal, momentum_signal]:
@@ -127,7 +225,6 @@ def get_final_signal():
 # PRO CRUDE STRATEGY
 # -----------------------------
 def get_crude_signal():
-
     try:
         now = datetime.datetime.now()
 
@@ -153,6 +250,9 @@ def get_crude_signal():
         strong = body > rng * 0.5
         small = body < rng * 0.3
 
+        if small:
+            return "HOLD"
+
         vol_spike = last["volume"] > last["vol_ma"]
 
         above_vwap = last["close"] > last["vwap"]
@@ -161,21 +261,15 @@ def get_crude_signal():
         breakout_up = last["close"] > prev["high"]
         breakout_down = last["close"] < prev["low"]
 
-        if small:
-            return "HOLD"
-
         if breakout_up and above_vwap and vol_spike and strong:
-            print("CRUDE CALL")
             return "CALL"
 
         if breakout_down and below_vwap and vol_spike and strong:
-            print("CRUDE PUT")
             return "PUT"
 
         return "HOLD"
 
-    except Exception as e:
-        print("Crude error:", e)
+    except:
         return "HOLD"
 
 # -----------------------------
@@ -252,8 +346,12 @@ def place_order(symbol, qty, exchange):
 # -----------------------------
 def manage_trade(symbol, entry, qty, exchange, instrument):
 
+    global daily_pnl, trade_count, last_loss_time
+
     sl = entry * (0.80 if instrument == "CRUDE" else 0.90)
     target = entry * (1.30 if instrument == "CRUDE" else 1.18)
+
+    trade_count += 1
 
     send_message(f"🚀 {instrument} TRADE\n{symbol} @ {entry}")
 
@@ -261,12 +359,17 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
         try:
             ltp = kite.ltp(f"{exchange}:{symbol}")[f"{exchange}:{symbol}"]["last_price"]
 
+            pnl = (ltp - entry) * qty
+
             if ltp >= target:
-                send_message(f"🎯 {instrument} TARGET")
+                daily_pnl += pnl
+                send_message(f"🎯 TARGET ₹{round(pnl,2)}")
                 break
 
             if ltp <= sl:
-                send_message(f"🛑 {instrument} SL")
+                daily_pnl -= abs(pnl)
+                last_loss_time = time.time()
+                send_message(f"🛑 SL ₹{round(pnl,2)}")
                 break
 
             time.sleep(5)
@@ -289,6 +392,18 @@ def nifty_loop():
 
         if nifty_active:
             time.sleep(5)
+            continue
+
+        if not can_trade():
+            time.sleep(30)
+            continue
+
+        if not is_market_trending(config.NIFTY_TOKEN):
+            time.sleep(20)
+            continue
+
+        if not is_strong_trend_day(config.NIFTY_TOKEN):
+            time.sleep(20)
             continue
 
         signal = get_final_signal()
@@ -319,6 +434,18 @@ def crude_loop():
             time.sleep(5)
             continue
 
+        if not can_trade():
+            time.sleep(30)
+            continue
+
+        if not is_market_trending(config.CRUDE_TOKEN):
+            time.sleep(20)
+            continue
+
+        if not is_strong_trend_day(config.CRUDE_TOKEN):
+            time.sleep(20)
+            continue
+
         signal = get_crude_signal()
 
         if signal == "HOLD":
@@ -337,7 +464,7 @@ def crude_loop():
 # -----------------------------
 if __name__ == "__main__":
 
-    send_message("🚀 BOT STARTED (FINAL PRO MODE)")
+    send_message("🚀 BOT STARTED (ELITE + RISK MODE)")
 
     threading.Thread(target=nifty_loop).start()
     threading.Thread(target=crude_loop).start()

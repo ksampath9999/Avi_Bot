@@ -17,6 +17,7 @@ IST = pytz.timezone("Asia/Kolkata")
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
 trade_active = False
+last_trade_time = None
 
 # -----------------------------
 # PNL TRACKING
@@ -28,67 +29,6 @@ losses = 0
 
 
 # -----------------------------
-# GET SIGNAL (ML + FALLBACK)
-# -----------------------------
-def get_signal():
-
-    try:
-        data = requests.get(SIGNAL_URL, timeout=5).json()
-        print("ML Signal:", data)
-
-        signal = data.get("signal", "HOLD")
-        quality = data.get("quality", "B")
-
-    except:
-        print("ML server error → fallback")
-        signal = "HOLD"
-        quality = "B"
-
-    # -----------------------------
-    # FALLBACK LOGIC
-    # -----------------------------
-    if signal == "HOLD":
-
-        print("⚠️ Using fallback strategy")
-
-        try:
-            candles = kite.historical_data(
-                config.NIFTY_TOKEN,
-                datetime.datetime.now() - datetime.timedelta(minutes=20),
-                datetime.datetime.now(),
-                "5minute"
-            )
-
-            df = pd.DataFrame(candles)
-
-            if len(df) >= 2:
-
-                last = df.iloc[-1]
-                prev = df.iloc[-2]
-
-                # Breakout strategy
-                if last["close"] > prev["high"]:
-                    print("Fallback → CALL")
-                    return "CALL", "B"
-
-                elif last["close"] < prev["low"]:
-                    print("Fallback → PUT")
-                    return "PUT", "B"
-
-                else:
-                    return "HOLD", "B"
-
-            else:
-                return "HOLD", "B"
-
-        except Exception as e:
-            print("Fallback error:", e)
-            return "HOLD", "B"
-
-    return signal, quality
-
-
-# -----------------------------
 # LTP
 # -----------------------------
 def get_ltp(symbol):
@@ -96,39 +36,120 @@ def get_ltp(symbol):
 
 
 # -----------------------------
-# SINGLE LOT
+# FIXED LOT
 # -----------------------------
 def calculate_qty(price):
-    return config.LOT_SIZE
+    return config.LOT_SIZE   # 65
 
 
 # -----------------------------
-# LIGHT TREND FILTER
+# STRATEGY 1: ML SIGNAL
 # -----------------------------
-def is_trending():
-
+def ml_signal():
     try:
-        now = datetime.datetime.now()
+        data = requests.get(SIGNAL_URL, timeout=5).json()
+        signal = data.get("signal", "HOLD")
 
-        data = kite.historical_data(
+        if signal in ["CALL", "PUT"]:
+            print("ML Signal:", signal)
+            return signal
+
+    except:
+        pass
+
+    return "HOLD"
+
+
+# -----------------------------
+# STRATEGY 2: BREAKOUT
+# -----------------------------
+def breakout_signal():
+    try:
+        candles = kite.historical_data(
             config.NIFTY_TOKEN,
-            now - datetime.timedelta(minutes=60),
-            now,
+            datetime.datetime.now() - datetime.timedelta(minutes=30),
+            datetime.datetime.now(),
             "5minute"
         )
 
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(candles)
 
-        if len(df) < 10:
-            return True
+        if len(df) < 3:
+            return "HOLD"
 
-        vwap = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
         last = df.iloc[-1]
+        prev = df.iloc[-2]
 
-        return abs(last["close"] - vwap.iloc[-1]) > 10
+        if last["close"] > prev["high"]:
+            print("Breakout → CALL")
+            return "CALL"
+
+        elif last["close"] < prev["low"]:
+            print("Breakout → PUT")
+            return "PUT"
+
+        return "HOLD"
 
     except:
-        return True
+        return "HOLD"
+
+
+# -----------------------------
+# STRATEGY 3: MOMENTUM
+# -----------------------------
+def momentum_signal():
+    try:
+        candles = kite.historical_data(
+            config.NIFTY_TOKEN,
+            datetime.datetime.now() - datetime.timedelta(minutes=15),
+            datetime.datetime.now(),
+            "5minute"
+        )
+
+        df = pd.DataFrame(candles)
+
+        if len(df) < 2:
+            return "HOLD"
+
+        last = df.iloc[-1]
+
+        body = abs(last["close"] - last["open"])
+        range_candle = last["high"] - last["low"]
+
+        # strong candle condition
+        if body > (range_candle * 0.6):
+
+            if last["close"] > last["open"]:
+                print("Momentum → CALL")
+                return "CALL"
+            else:
+                print("Momentum → PUT")
+                return "PUT"
+
+        return "HOLD"
+
+    except:
+        return "HOLD"
+
+
+# -----------------------------
+# FINAL SIGNAL DECISION
+# -----------------------------
+def get_final_signal():
+
+    # Priority 1: ML
+    signal = ml_signal()
+    if signal != "HOLD":
+        return signal
+
+    # Priority 2: Breakout
+    signal = breakout_signal()
+    if signal != "HOLD":
+        return signal
+
+    # Priority 3: Momentum
+    signal = momentum_signal()
+    return signal
 
 
 # -----------------------------
@@ -171,15 +192,13 @@ def find_option(signal):
                 continue
 
             if 30 <= price <= 150:
-
                 if best_price is None or abs(price - 80) < abs(best_price - 80):
                     best_symbol = inst["tradingsymbol"]
                     best_price = price
 
         return best_symbol, best_price
 
-    except Exception as e:
-        print("Option error:", e)
+    except:
         return None, None
 
 
@@ -214,8 +233,8 @@ def manage_trade(symbol, entry, qty):
 
     global trade_active, daily_pnl, total_trades, wins, losses
 
-    sl = entry * 0.88
-    target = entry * 1.20
+    sl = entry * 0.90
+    target = entry * 1.18
 
     total_trades += 1
 
@@ -225,8 +244,6 @@ def manage_trade(symbol, entry, qty):
         try:
             ltp = get_ltp(f"NFO:{symbol}")
             pnl = (ltp - entry) * qty
-
-            print(f"{symbol} → {ltp} PnL: {pnl}")
 
             if ltp >= target:
                 daily_pnl += pnl
@@ -273,9 +290,9 @@ PnL: ₹{round(daily_pnl,2)}
 # -----------------------------
 def run_bot():
 
-    global trade_active
+    global trade_active, last_trade_time
 
-    send_message("🚀 BOT STARTED (ML + FALLBACK MODE)")
+    send_message("🚀 BOT STARTED (MULTI-STRATEGY MODE)")
 
     while True:
 
@@ -294,18 +311,21 @@ def run_bot():
             time.sleep(10)
             continue
 
-        # Trend filter (light)
-        if not is_trending():
-            print("Weak trend")
-            time.sleep(30)
-            continue
+        # COOLDOWN (2 min)
+        if last_trade_time:
+            diff = (datetime.datetime.now() - last_trade_time).seconds
+            if diff < 120:
+                print("Cooldown active")
+                time.sleep(30)
+                continue
 
         # -----------------------------
-        # SIGNAL
+        # GET FINAL SIGNAL
         # -----------------------------
-        signal, quality = get_signal()
+        signal = get_final_signal()
 
         if signal == "HOLD":
+            print("No signal")
             time.sleep(30)
             continue
 
@@ -328,6 +348,7 @@ def run_bot():
 
         if order:
             trade_active = True
+            last_trade_time = datetime.datetime.now()
             manage_trade(symbol, price, qty)
 
         time.sleep(60)

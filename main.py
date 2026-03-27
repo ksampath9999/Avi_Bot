@@ -286,21 +286,31 @@ def find_option(signal, instrument):
         exchange = "MCX"
         name = "CRUDEOIL"
         lot = config.CRUDE_LOT
-        pmin, pmax = 50, 300
+        pmin, pmax = 10, 1000   # ✅ FIXED RANGE
 
     instruments = kite.instruments(exchange)
 
-    opts = [
-        i for i in instruments
-        if name in i["name"] and i["instrument_type"] in ["CE", "PE"]
-    ]
+    opts = []
+
+    for i in instruments:
+        if instrument == "CRUDE":
+            if "CRUDEOIL" in i["tradingsymbol"] and i["instrument_type"] in ["CE", "PE"]:
+                opts.append(i)
+        else:
+            if name in i["name"] and i["instrument_type"] in ["CE", "PE"]:
+                opts.append(i)
+
+    if not opts:
+        print("❌ No options found")
+        return None, None, None, None
 
     today = datetime.datetime.now().date()
     expiry = sorted(set(i["expiry"] for i in opts if i["expiry"] >= today))[0]
 
     opt_type = "CE" if signal == "CALL" else "PE"
 
-    best, best_price = None, None
+    best = None
+    best_price = None
 
     for i in opts:
 
@@ -314,12 +324,20 @@ def find_option(signal, instrument):
         except:
             continue
 
+        print(f"Checking {i['tradingsymbol']} → {price}")
+
         if pmin <= price <= pmax:
+
             if best_price is None or abs(price - 100) < abs(best_price - 100):
                 best = i["tradingsymbol"]
                 best_price = price
 
-    return best, best_price, lot, exchange
+    if best:
+        print(f"✅ Selected: {best} @ {best_price}")
+        return best, best_price, lot, exchange
+
+    print("❌ No valid option in range")
+    return None, None, None, None
 
 # -----------------------------
 # ORDER
@@ -432,33 +450,71 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
 
     global daily_pnl, trade_count, last_loss_time
 
-    sl = entry * (0.80 if instrument == "CRUDE" else 0.90)
-    target = entry * (1.30 if instrument == "CRUDE" else 1.18)
-
     trade_count += 1
+
+    full_symbol = f"{exchange}:{symbol}"
+
+    # -----------------------------
+    # INITIAL LEVELS
+    # -----------------------------
+    sl = entry * 0.90
+    target = entry * 1.20
+
+    trailing_sl = sl
+    highest_price = entry
 
     send_message(f"🚀 {instrument} TRADE\n{symbol} @ {entry}")
 
     while True:
         try:
-            ltp = kite.ltp(f"{exchange}:{symbol}")[f"{exchange}:{symbol}"]["last_price"]
+            ltp = kite.ltp(full_symbol)[full_symbol]["last_price"]
 
-            pnl = (ltp - entry) * qty
+            # -----------------------------
+            # TRACK HIGHEST PRICE
+            # -----------------------------
+            if ltp > highest_price:
+                highest_price = ltp
 
-            if ltp >= target:
+            # -----------------------------
+            # TRAILING LOGIC
+            # -----------------------------
+            profit = ltp - entry
+
+            # Move to break-even
+            if profit > entry * 0.05:
+                trailing_sl = max(trailing_sl, entry)
+
+            # Lock profits
+            if profit > entry * 0.10:
+                trailing_sl = max(trailing_sl, highest_price * 0.92)
+
+            if profit > entry * 0.15:
+                trailing_sl = max(trailing_sl, highest_price * 0.95)
+
+            # -----------------------------
+            # EXIT CONDITIONS
+            # -----------------------------
+            if ltp <= trailing_sl:
+                pnl = (ltp - entry) * qty
                 daily_pnl += pnl
-                send_message(f"🎯 TARGET ₹{round(pnl,2)}")
+
+                if pnl < 0:
+                    last_loss_time = time.time()
+
+                send_message(f"🛑 EXIT (TRAIL SL)\nPnL: ₹{round(pnl,2)}")
                 break
 
-            if ltp <= sl:
-                daily_pnl -= abs(pnl)
-                last_loss_time = time.time()
-                send_message(f"🛑 SL ₹{round(pnl,2)}")
+            # Optional hard target
+            if ltp >= target:
+                pnl = (ltp - entry) * qty
+                daily_pnl += pnl
+                send_message(f"🎯 TARGET HIT ₹{round(pnl,2)}")
                 break
 
             time.sleep(5)
 
-        except:
+        except Exception as e:
+            print("Trade error:", e)
             break
 
 # -----------------------------
@@ -498,11 +554,17 @@ def nifty_loop():
 
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
-        if symbol and place_order(symbol, lot, exchange):
-            nifty_active = True
-            manage_trade(symbol, price, lot, exchange, "NIFTY")
-            nifty_active = False
+        if symbol and price:
+        success = place_order(symbol, lot, exchange)
 
+        if success:
+            nifty_active = True  # or crude_active
+            manage_trade(symbol, price, lot, exchange, "CRUDE")
+            crude_active = False
+                nifty_active = True
+                manage_trade(symbol, price, lot, exchange, "NIFTY")
+                nifty_active = False
+        print("CRUDE SIGNAL:", signal)
 
 def crude_loop():
     global crude_active
@@ -538,10 +600,17 @@ def crude_loop():
 
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
-        if symbol and place_order(symbol, lot, exchange):
-            crude_active = True
+        if symbol and price:
+        success = place_order(symbol, lot, exchange)
+
+        if success:
+            nifty_active = True  # or crude_active
             manage_trade(symbol, price, lot, exchange, "CRUDE")
             crude_active = False
+                crude_active = True
+                manage_trade(symbol, price, lot, exchange, "CRUDE")
+                crude_active = False
+        print("CRUDE SIGNAL:", signal)
 
 # -----------------------------
 # MAIN

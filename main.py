@@ -2,6 +2,7 @@ import requests
 import time
 import datetime
 import pytz
+import pandas as pd
 from kiteconnect import KiteConnect
 import config
 from telegram_bot import send_message
@@ -14,43 +15,79 @@ kite.set_access_token(config.ACCESS_TOKEN)
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# -----------------------------
-# CONFIG
-# -----------------------------
+SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
+
 CAPITAL = 100000
-RISK_PER_TRADE = config.RISK_PER_TRADE
-MAX_DAILY_LOSS = config.MAX_DAILY_LOSS
-MAX_TRADES = config.MAX_TRADES
-
-SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"  # 🔴 your live server
-
-trades_today = 0
-daily_loss = 0
 trade_active = False
+daily_loss = 0
 
 
 # -----------------------------
-# GET SIGNAL
+# EXPIRY CHECK
+# -----------------------------
+def is_expiry_day():
+    return datetime.datetime.now(IST).weekday() == 1  # Tuesday
+
+
+# -----------------------------
+# TREND DAY DETECTION (UPDATED)
+# -----------------------------
+def is_trending_day():
+
+    try:
+        now = datetime.datetime.now()
+
+        data = kite.historical_data(
+            config.NIFTY_TOKEN,
+            now - datetime.timedelta(hours=3),
+            now,
+            "5minute"
+        )
+
+        df = pd.DataFrame(data)
+
+        if len(df) < 20:
+            return False
+
+        # VWAP
+        vwap = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
+        last = df.iloc[-1]
+
+        # EMA
+        df["ema20"] = df["close"].ewm(span=20).mean()
+        df["ema50"] = df["close"].ewm(span=50).mean()
+
+        # RANGE
+        recent_range = df["high"].iloc[-1] - df["low"].iloc[-1]
+        avg_range = (df["high"] - df["low"]).rolling(10).mean().iloc[-1]
+
+        # CONDITIONS
+        vwap_distance = abs(last["close"] - vwap.iloc[-1])
+        trend_strength = abs(df["ema20"].iloc[-1] - df["ema50"].iloc[-1])
+
+        if vwap_distance > 15 and recent_range > avg_range and trend_strength > 5:
+            return True
+
+        return False
+
+    except Exception as e:
+        print("Trend error:", e)
+        return False
+
+
+# -----------------------------
+# SIGNAL
 # -----------------------------
 def get_signal():
     try:
-        res = requests.get(SIGNAL_URL, timeout=10)
-
-        if res.status_code != 200:
-            print("Bad response:", res.text)
-            return {"signal": "HOLD"}
-
-        data = res.json()
-        print("Server Response:", data)
-        return data
-
-    except Exception as e:
-        print("Signal error:", e)
+        return requests.get(SIGNAL_URL, timeout=10).json()
+    except:
         return {"signal": "HOLD"}
 
 
 # -----------------------------
-# GET PRICE
+# LTP
 # -----------------------------
 def get_ltp(symbol):
     return kite.ltp(symbol)[symbol]["last_price"]
@@ -60,52 +97,137 @@ def get_ltp(symbol):
 # POSITION SIZE
 # -----------------------------
 def calculate_qty(price):
-    risk_amount = CAPITAL * RISK_PER_TRADE
-    qty = int(risk_amount / price)
+
+    qty = int((CAPITAL * config.RISK_PER_TRADE) / price)
+
+    if is_expiry_day():
+        qty = int(qty * 0.5)
+
     return max(config.LOT_SIZE, qty)
 
 
 # -----------------------------
-# FIND ATM OPTION
+# SMART SCALPING FILTER
+# -----------------------------
+def smart_scalping_filter(signal):
+
+    try:
+        now = datetime.datetime.now()
+
+        data = kite.historical_data(
+            config.NIFTY_TOKEN,
+            now - datetime.timedelta(minutes=30),
+            now,
+            "5minute"
+        )
+
+        df = pd.DataFrame(data)
+
+        if len(df) < 5:
+            return False
+
+        last = df.iloc[-1]
+
+        vwap = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
+        orb_high = df["high"].iloc[:3].max()
+        orb_low = df["low"].iloc[:3].min()
+
+        if (df["high"].max() - df["low"].min()) < 20:
+            return False
+
+        if signal == "CALL" and last["close"] < vwap.iloc[-1]:
+            return False
+
+        if signal == "PUT" and last["close"] > vwap.iloc[-1]:
+            return False
+
+        if signal == "CALL" and last["close"] <= orb_high:
+            return False
+
+        if signal == "PUT" and last["close"] >= orb_low:
+            return False
+
+        return True
+
+    except Exception as e:
+        print("Scalp filter error:", e)
+        return False
+
+
+# -----------------------------
+# GET WEEKLY EXPIRY
+# -----------------------------
+def get_weekly_expiry(instruments):
+
+    today = datetime.datetime.now().date()
+
+    expiries = sorted(set(i["expiry"] for i in instruments))
+
+    for exp in expiries:
+        if exp >= today:
+            return exp
+
+    return None
+
+
+# -----------------------------
+# OPTION SELECTION
 # -----------------------------
 def find_option(signal):
 
     try:
-        nifty_price = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
-
-        strike = round(nifty_price / 50) * 50
+        nifty = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
+        atm = round(nifty / 50) * 50
 
         instruments = kite.instruments("NFO")
 
-        for inst in instruments:
+        nifty_opts = [
+            i for i in instruments
+            if i["name"] == "NIFTY" and i["instrument_type"] in ["CE", "PE"]
+        ]
 
-            sym = inst["tradingsymbol"]
+        expiry = get_weekly_expiry(nifty_opts)
 
-            if "NIFTY" not in sym:
+        options = [i for i in nifty_opts if i["expiry"] == expiry]
+
+        if signal == "CALL":
+            strikes = [atm, atm + 50, atm + 100]
+            opt_type = "CE"
+        else:
+            strikes = [atm, atm - 50, atm - 100]
+            opt_type = "PE"
+
+        best_symbol = None
+        best_price = None
+
+        for inst in options:
+
+            if inst["instrument_type"] != opt_type:
                 continue
 
-            if str(strike) not in sym:
+            if inst["strike"] not in strikes:
                 continue
 
-            if signal == "CALL" and not sym.endswith("CE"):
-                continue
-
-            if signal == "PUT" and not sym.endswith("PE"):
-                continue
+            symbol = f"NFO:{inst['tradingsymbol']}"
 
             try:
-                price = get_ltp(f"NFO:{sym}")
+                price = kite.ltp(symbol)[symbol]["last_price"]
             except:
                 continue
 
-            if price is None:
-                continue
+            if is_expiry_day():
+                if price < 60 or price > 100:
+                    continue
+            else:
+                if price < config.MIN_PREMIUM or price > config.MAX_PREMIUM:
+                    continue
 
-            if config.MIN_PREMIUM <= price <= config.MAX_PREMIUM:
-                print(f"Selected: {sym} @ {price}")
-                return sym, price
+            if best_price is None or abs(price - 80) < abs(best_price - 80):
+                best_symbol = inst["tradingsymbol"]
+                best_price = price
 
-        return None, None
+        return best_symbol, best_price
 
     except Exception as e:
         print("Option error:", e)
@@ -113,13 +235,12 @@ def find_option(signal):
 
 
 # -----------------------------
-# PLACE ORDER
+# ORDER
 # -----------------------------
 def place_order(symbol, qty):
-
     try:
-        order = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
+        return kite.place_order(
+            variety="regular",
             exchange="NFO",
             tradingsymbol=symbol,
             transaction_type="BUY",
@@ -127,10 +248,7 @@ def place_order(symbol, qty):
             order_type="MARKET",
             product="MIS"
         )
-        return order
-
     except Exception as e:
-        print("Order error:", e)
         send_message(f"❌ Order error: {e}")
         return None
 
@@ -138,151 +256,115 @@ def place_order(symbol, qty):
 # -----------------------------
 # TRADE MANAGEMENT
 # -----------------------------
-def manage_trade(symbol, entry, qty):
+def manage_trade(symbol, entry, qty, mode):
 
-    global daily_loss, trade_active
+    global trade_active, daily_loss
 
-    sl = entry * (1 - config.STOP_LOSS)
-    target = entry * (1 + config.TARGET)
-    trail_sl = sl
+    if mode == "SCALP":
+        sl = entry * 0.85
+        target = entry * 1.25
+        sleep = 3
+    else:
+        sl = entry * (1 - config.STOP_LOSS)
+        target = entry * (1 + config.TARGET)
+        sleep = 5
 
-    send_message(f"""
-📊 TRADE STARTED
-{symbol}
-Entry: {entry}
-SL: {round(sl,2)}
-Target: {round(target,2)}
-Qty: {qty}
-""")
+    send_message(f"🚀 {mode} TRADE\n{symbol} @ {entry}")
 
     while True:
         try:
             ltp = get_ltp(f"NFO:{symbol}")
             pnl = (ltp - entry) * qty
 
-            print(f"{symbol} | LTP: {ltp} | PnL: {pnl}")
-
             if ltp >= target:
-                send_message(f"🎯 TARGET HIT\n{symbol}\nPnL: ₹{round(pnl,2)}")
+                send_message(f"🎯 TARGET HIT ₹{round(pnl,2)}")
                 break
 
-            if ltp <= trail_sl:
-                send_message(f"🛑 SL HIT\n{symbol}\nPnL: ₹{round(pnl,2)}")
+            if ltp <= sl:
+                send_message(f"🛑 SL HIT ₹{round(pnl,2)}")
                 daily_loss += abs(pnl)
                 break
 
-            if ltp > entry * 1.2:
-                trail_sl = max(trail_sl, ltp - 10)
+            time.sleep(sleep)
 
-            time.sleep(5)
-
-        except Exception as e:
-            print("Trade error:", e)
+        except:
             break
 
     trade_active = False
 
 
 # -----------------------------
-# DAILY REPORT
-# -----------------------------
-def daily_report():
-    send_message(f"""
-📊 DAILY REPORT
-Trades: {trades_today}
-Loss: ₹{daily_loss}
-""")
-
-
-# -----------------------------
-# MAIN LOOP (AUTO MODE)
+# MAIN LOOP
 # -----------------------------
 def run_bot():
 
-    global trades_today, daily_loss, trade_active
+    global trade_active
 
-    send_message("🚀 BOT SERVICE STARTED (AUTO MODE)")
+    send_message("🚀 BOT STARTED (TREND FILTER ENABLED)")
 
     while True:
 
         now = datetime.datetime.now(IST)
 
-        start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-
-        # BEFORE MARKET
-        if now < start:
-            print("⏳ Waiting for market open...")
+        if now.hour < 9 or now.hour > 15:
             time.sleep(300)
             continue
 
-        # AFTER MARKET
-        if now > end:
-            print("🌙 Market closed. Resetting...")
-
-            trades_today = 0
-            daily_loss = 0
-            trade_active = False
-
-            time.sleep(600)
+        # TREND FILTER
+        if not is_trending_day():
+            print("❌ Not trending → skip")
+            time.sleep(300)
             continue
 
-        # MARKET OPEN MESSAGE
-        if now.hour == 9 and now.minute < 5:
-            send_message("🟢 Market Open - Bot Active")
-
-        # RISK CONTROL
-        if daily_loss >= MAX_DAILY_LOSS:
-            send_message("🛑 DAILY LOSS LIMIT HIT")
-            time.sleep(600)
+        if is_expiry_day() and now.hour >= 13:
+            print("⚠️ Expiry afternoon skip")
+            time.sleep(300)
             continue
 
-        if trades_today >= MAX_TRADES:
-            send_message("📉 MAX TRADES DONE")
-            time.sleep(600)
-            continue
+        # MODE
+        if (now.hour == 9 and now.minute >= 15) or (now.hour == 10 and now.minute < 30):
+            mode = "SCALP"
+        else:
+            mode = "NORMAL"
 
         if trade_active:
-            time.sleep(60)
+            time.sleep(30)
             continue
 
         signal_data = get_signal()
 
         signal = signal_data.get("signal", "HOLD")
         quality = signal_data.get("quality", "B")
-        confidence = signal_data.get("confidence", 0)
 
-        print(f"Signal: {signal} | Quality: {quality} | Conf: {confidence}")
+        if mode == "SCALP":
+            allowed = ["A", "A+"] if is_expiry_day() else ["A", "A+", "B"]
 
-        if signal == "HOLD" or quality not in ["A", "A+"]:
-            time.sleep(300)
+            if not smart_scalping_filter(signal):
+                time.sleep(120)
+                continue
+        else:
+            allowed = ["A", "A+"]
+
+        if signal == "HOLD" or quality not in allowed:
+            time.sleep(120)
             continue
 
         symbol, price = find_option(signal)
 
         if not symbol:
             send_message("❌ No valid option found")
-            time.sleep(300)
+            time.sleep(120)
             continue
 
         qty = calculate_qty(price)
-
-        send_message(f"""
-🎯 {quality} TRADE
-Symbol: {symbol}
-Price: {price}
-Qty: {qty}
-Confidence: {confidence}
-""")
 
         order = place_order(symbol, qty)
 
         if order:
             trade_active = True
-            trades_today += 1
-            manage_trade(symbol, price, qty)
+            manage_trade(symbol, price, qty, mode)
 
-        time.sleep(300)
+        time.sleep(120)
 
 
 # -----------------------------

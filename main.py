@@ -326,17 +326,28 @@ def find_option(signal, instrument):
 # -----------------------------
 def place_order(symbol, qty, exchange):
     try:
+        full_symbol = f"{exchange}:{symbol}"
+        ltp = kite.ltp(full_symbol)[full_symbol]["last_price"]
+
+        # -----------------------------
+        # MARKET PROTECTION (IMPORTANT)
+        # -----------------------------
+        price = round(ltp * 1.03, 1)  # 2% buffer
+
         kite.place_order(
             variety="regular",
             exchange=exchange,
             tradingsymbol=symbol,
             transaction_type="BUY",
             quantity=qty,
-            order_type="MARKET",
+            order_type="LIMIT",   # ✅ FIX
+            price=price,          # ✅ REQUIRED
             product="MIS"
         )
-        send_message(f"✅ Order: {symbol}")
+
+        send_message(f"✅ Order Placed: {symbol} @ {price}")
         return True
+
     except Exception as e:
         send_message(f"❌ Order error: {e}")
         return False

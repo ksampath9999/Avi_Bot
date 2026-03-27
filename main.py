@@ -17,23 +17,22 @@ IST = pytz.timezone("Asia/Kolkata")
 
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
-CAPITAL = 100000
 trade_active = False
 daily_loss = 0
+extra_risk_cut = False
 
 
 # -----------------------------
-# EXPIRY CHECK
+# EXPIRY CHECK (Tuesday)
 # -----------------------------
 def is_expiry_day():
-    return datetime.datetime.now(IST).weekday() == 1  # Tuesday
+    return datetime.datetime.now(IST).weekday() == 1
 
 
 # -----------------------------
-# TREND DAY DETECTION (UPDATED)
+# TREND FILTER (VWAP > 15)
 # -----------------------------
 def is_trending_day():
-
     try:
         now = datetime.datetime.now()
 
@@ -49,27 +48,19 @@ def is_trending_day():
         if len(df) < 20:
             return False
 
-        # VWAP
         vwap = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
-
         last = df.iloc[-1]
 
-        # EMA
         df["ema20"] = df["close"].ewm(span=20).mean()
         df["ema50"] = df["close"].ewm(span=50).mean()
 
-        # RANGE
         recent_range = df["high"].iloc[-1] - df["low"].iloc[-1]
         avg_range = (df["high"] - df["low"]).rolling(10).mean().iloc[-1]
 
-        # CONDITIONS
         vwap_distance = abs(last["close"] - vwap.iloc[-1])
         trend_strength = abs(df["ema20"].iloc[-1] - df["ema50"].iloc[-1])
 
-        if vwap_distance > 15 and recent_range > avg_range and trend_strength > 5:
-            return True
-
-        return False
+        return vwap_distance > 15 and recent_range > avg_range and trend_strength > 5
 
     except Exception as e:
         print("Trend error:", e)
@@ -94,23 +85,16 @@ def get_ltp(symbol):
 
 
 # -----------------------------
-# POSITION SIZE
+# FIXED SINGLE LOT
 # -----------------------------
 def calculate_qty(price):
-
-    qty = int((CAPITAL * config.RISK_PER_TRADE) / price)
-
-    if is_expiry_day():
-        qty = int(qty * 0.5)
-
-    return max(config.LOT_SIZE, qty)
+    return config.LOT_SIZE   # ALWAYS 1 LOT
 
 
 # -----------------------------
 # SMART SCALPING FILTER
 # -----------------------------
 def smart_scalping_filter(signal):
-
     try:
         now = datetime.datetime.now()
 
@@ -151,45 +135,39 @@ def smart_scalping_filter(signal):
         return True
 
     except Exception as e:
-        print("Scalp filter error:", e)
+        print("Scalp error:", e)
         return False
 
 
 # -----------------------------
-# GET WEEKLY EXPIRY
+# EXPIRY FETCH
 # -----------------------------
 def get_weekly_expiry(instruments):
-
     today = datetime.datetime.now().date()
-
     expiries = sorted(set(i["expiry"] for i in instruments))
-
     for exp in expiries:
         if exp >= today:
             return exp
-
     return None
 
 
 # -----------------------------
-# OPTION SELECTION
+# OPTION SELECTION (FIXED)
 # -----------------------------
 def find_option(signal):
-
     try:
         nifty = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
         atm = round(nifty / 50) * 50
 
         instruments = kite.instruments("NFO")
 
-        nifty_opts = [
+        opts = [
             i for i in instruments
             if i["name"] == "NIFTY" and i["instrument_type"] in ["CE", "PE"]
         ]
 
-        expiry = get_weekly_expiry(nifty_opts)
-
-        options = [i for i in nifty_opts if i["expiry"] == expiry]
+        expiry = get_weekly_expiry(opts)
+        options = [i for i in opts if i["expiry"] == expiry]
 
         if signal == "CALL":
             strikes = [atm, atm + 50, atm + 100]
@@ -298,9 +276,9 @@ def manage_trade(symbol, entry, qty, mode):
 # -----------------------------
 def run_bot():
 
-    global trade_active
+    global trade_active, extra_risk_cut
 
-    send_message("🚀 BOT STARTED (TREND FILTER ENABLED)")
+    send_message("🚀 BOT STARTED (1 LOT MODE)")
 
     while True:
 
@@ -310,18 +288,22 @@ def run_bot():
             time.sleep(300)
             continue
 
-        # TREND FILTER
         if not is_trending_day():
-            print("❌ Not trending → skip")
+            print("❌ Not trending")
             time.sleep(300)
             continue
 
-        if is_expiry_day() and now.hour >= 13:
-            print("⚠️ Expiry afternoon skip")
-            time.sleep(300)
-            continue
+        extra_risk_cut = False
 
-        # MODE
+        if is_expiry_day():
+
+            if now.hour >= 15:
+                time.sleep(300)
+                continue
+
+            if (now.hour == 13 and now.minute >= 30) or now.hour == 14:
+                extra_risk_cut = True
+
         if (now.hour == 9 and now.minute >= 15) or (now.hour == 10 and now.minute < 30):
             mode = "SCALP"
         else:

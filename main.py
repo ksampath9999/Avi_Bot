@@ -17,8 +17,6 @@ IST = pytz.timezone("Asia/Kolkata")
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
 trade_active = False
-daily_loss = 0
-extra_risk_cut = False
 
 # -----------------------------
 # PNL TRACKING
@@ -30,58 +28,16 @@ losses = 0
 
 
 # -----------------------------
-# EXPIRY CHECK
-# -----------------------------
-def is_expiry_day():
-    return datetime.datetime.now(IST).weekday() == 1
-
-
-# -----------------------------
-# TREND FILTER
-# -----------------------------
-def is_trending_day():
-    try:
-        now = datetime.datetime.now()
-
-        data = kite.historical_data(
-            config.NIFTY_TOKEN,
-            now - datetime.timedelta(hours=3),
-            now,
-            "5minute"
-        )
-
-        df = pd.DataFrame(data)
-
-        if len(df) < 20:
-            return False
-
-        vwap = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
-        last = df.iloc[-1]
-
-        df["ema20"] = df["close"].ewm(span=20).mean()
-        df["ema50"] = df["close"].ewm(span=50).mean()
-
-        recent_range = df["high"].iloc[-1] - df["low"].iloc[-1]
-        avg_range = (df["high"] - df["low"]).rolling(10).mean().iloc[-1]
-
-        vwap_distance = abs(last["close"] - vwap.iloc[-1])
-        trend_strength = abs(df["ema20"].iloc[-1] - df["ema50"].iloc[-1])
-
-        return vwap_distance > 15 and recent_range > avg_range and trend_strength > 5
-
-    except Exception as e:
-        print("Trend error:", e)
-        return False
-
-
-# -----------------------------
 # SIGNAL
 # -----------------------------
 def get_signal():
     try:
-        return requests.get(SIGNAL_URL, timeout=10).json()
+        data = requests.get(SIGNAL_URL, timeout=5).json()
+        print("Signal:", data)
+        return data
     except:
-        return {"signal": "HOLD"}
+        print("Signal API failed → fallback CALL")
+        return {"signal": "CALL", "quality": "B"}
 
 
 # -----------------------------
@@ -99,62 +55,63 @@ def calculate_qty(price):
 
 
 # -----------------------------
-# SCALPING FILTER
+# SOFT SCALPING FILTER
 # -----------------------------
-def smart_scalping_filter(signal):
+def soft_scalp_filter(signal):
     try:
         now = datetime.datetime.now()
 
         data = kite.historical_data(
             config.NIFTY_TOKEN,
-            now - datetime.timedelta(minutes=30),
+            now - datetime.timedelta(minutes=20),
             now,
             "5minute"
         )
 
         df = pd.DataFrame(data)
 
-        if len(df) < 5:
-            return False
+        if len(df) < 3:
+            return True
 
         last = df.iloc[-1]
 
-        vwap = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        candle_size = last["high"] - last["low"]
 
-        orb_high = df["high"].iloc[:3].max()
-        orb_low = df["low"].iloc[:3].min()
-
-        if (df["high"].max() - df["low"].min()) < 20:
-            return False
-
-        if signal == "CALL" and last["close"] < vwap.iloc[-1]:
-            return False
-
-        if signal == "PUT" and last["close"] > vwap.iloc[-1]:
-            return False
-
-        if signal == "CALL" and last["close"] <= orb_high:
-            return False
-
-        if signal == "PUT" and last["close"] >= orb_low:
+        if candle_size < 10:
             return False
 
         return True
 
     except:
-        return False
+        return True
 
 
 # -----------------------------
-# EXPIRY FETCH
+# LIGHT TREND FILTER
 # -----------------------------
-def get_weekly_expiry(instruments):
-    today = datetime.datetime.now().date()
-    expiries = sorted(set(i["expiry"] for i in instruments))
-    for exp in expiries:
-        if exp >= today:
-            return exp
-    return None
+def is_trending():
+    try:
+        now = datetime.datetime.now()
+
+        data = kite.historical_data(
+            config.NIFTY_TOKEN,
+            now - datetime.timedelta(minutes=60),
+            now,
+            "5minute"
+        )
+
+        df = pd.DataFrame(data)
+
+        if len(df) < 10:
+            return True
+
+        vwap = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        last = df.iloc[-1]
+
+        return abs(last["close"] - vwap.iloc[-1]) > 10
+
+    except:
+        return True
 
 
 # -----------------------------
@@ -172,15 +129,13 @@ def find_option(signal):
             if i["name"] == "NIFTY" and i["instrument_type"] in ["CE", "PE"]
         ]
 
-        expiry = get_weekly_expiry(opts)
+        today = datetime.datetime.now().date()
+        expiries = sorted(set(i["expiry"] for i in opts))
+        expiry = next((e for e in expiries if e >= today), None)
+
         options = [i for i in opts if i["expiry"] == expiry]
 
-        if signal == "CALL":
-            strikes = [atm, atm + 50, atm + 100]
-            opt_type = "CE"
-        else:
-            strikes = [atm, atm - 50, atm - 100]
-            opt_type = "PE"
+        opt_type = "CE" if signal == "CALL" else "PE"
 
         best_symbol = None
         best_price = None
@@ -190,9 +145,6 @@ def find_option(signal):
             if inst["instrument_type"] != opt_type:
                 continue
 
-            if inst["strike"] not in strikes:
-                continue
-
             symbol = f"NFO:{inst['tradingsymbol']}"
 
             try:
@@ -200,20 +152,16 @@ def find_option(signal):
             except:
                 continue
 
-            if is_expiry_day():
-                if price < 60 or price > 100:
-                    continue
-            else:
-                if price < config.MIN_PREMIUM or price > config.MAX_PREMIUM:
-                    continue
+            if 30 <= price <= 150:
 
-            if best_price is None or abs(price - 80) < abs(best_price - 80):
-                best_symbol = inst["tradingsymbol"]
-                best_price = price
+                if best_price is None or abs(price - 80) < abs(best_price - 80):
+                    best_symbol = inst["tradingsymbol"]
+                    best_price = price
 
         return best_symbol, best_price
 
-    except:
+    except Exception as e:
+        print("Option error:", e)
         return None, None
 
 
@@ -222,7 +170,7 @@ def find_option(signal):
 # -----------------------------
 def place_order(symbol, qty):
     try:
-        return kite.place_order(
+        order = kite.place_order(
             variety="regular",
             exchange="NFO",
             tradingsymbol=symbol,
@@ -231,6 +179,10 @@ def place_order(symbol, qty):
             order_type="MARKET",
             product="MIS"
         )
+
+        send_message(f"✅ Order: {symbol}")
+        return order
+
     except Exception as e:
         send_message(f"❌ Order error: {e}")
         return None
@@ -239,43 +191,37 @@ def place_order(symbol, qty):
 # -----------------------------
 # TRADE MANAGEMENT
 # -----------------------------
-def manage_trade(symbol, entry, qty, mode):
+def manage_trade(symbol, entry, qty):
 
-    global trade_active, daily_loss
-    global daily_pnl, total_trades, wins, losses
+    global trade_active, daily_pnl, total_trades, wins, losses
 
-    if mode == "SCALP":
-        sl = entry * 0.85
-        target = entry * 1.25
-        sleep = 3
-    else:
-        sl = entry * (1 - config.STOP_LOSS)
-        target = entry * (1 + config.TARGET)
-        sleep = 5
-
-    send_message(f"🚀 {mode} TRADE\n{symbol} @ {entry}")
+    sl = entry * 0.88
+    target = entry * 1.20
 
     total_trades += 1
+
+    send_message(f"🚀 TRADE\n{symbol} @ {entry}")
 
     while True:
         try:
             ltp = get_ltp(f"NFO:{symbol}")
             pnl = (ltp - entry) * qty
 
+            print(f"{symbol} | {ltp} | PnL: {pnl}")
+
             if ltp >= target:
-                send_message(f"🎯 TARGET HIT ₹{round(pnl,2)}")
                 daily_pnl += pnl
                 wins += 1
+                send_message(f"🎯 TARGET ₹{round(pnl,2)}")
                 break
 
             if ltp <= sl:
-                send_message(f"🛑 SL HIT ₹{round(pnl,2)}")
                 daily_pnl -= abs(pnl)
                 losses += 1
-                daily_loss += abs(pnl)
+                send_message(f"🛑 SL ₹{round(pnl,2)}")
                 break
 
-            time.sleep(sleep)
+            time.sleep(5)
 
         except:
             break
@@ -284,14 +230,12 @@ def manage_trade(symbol, entry, qty, mode):
 
 
 # -----------------------------
-# DAILY REPORT
+# REPORT
 # -----------------------------
-def send_daily_report():
+def send_report():
+    win_rate = (wins / total_trades * 100) if total_trades else 0
 
-    try:
-        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-
-        msg = f"""
+    msg = f"""
 📊 DAILY REPORT
 
 Trades: {total_trades}
@@ -299,14 +243,9 @@ Wins: {wins}
 Losses: {losses}
 
 Win Rate: {round(win_rate,2)}%
-
 PnL: ₹{round(daily_pnl,2)}
 """
-
-        send_message(msg)
-
-    except Exception as e:
-        print("Report error:", e)
+    send_message(msg)
 
 
 # -----------------------------
@@ -314,73 +253,60 @@ PnL: ₹{round(daily_pnl,2)}
 # -----------------------------
 def run_bot():
 
-    global trade_active, extra_risk_cut
+    global trade_active
 
-    send_message("🚀 BOT STARTED (WITH PNL TRACKING)")
+    send_message("🚀 BOT STARTED (PRO STABLE MODE)")
 
     while True:
 
         now = datetime.datetime.now(IST)
 
-        # SEND REPORT AFTER MARKET
+        if now.hour < 9:
+            time.sleep(60)
+            continue
+
         if now.hour >= 15:
-            send_daily_report()
+            send_report()
             time.sleep(600)
             continue
 
-        if now.hour < 9:
-            time.sleep(300)
-            continue
-
-        # TREND FILTER
-        if not is_trending_day():
-            time.sleep(300)
-            continue
-
-        extra_risk_cut = False
-
-        if is_expiry_day():
-
-            if now.hour >= 15:
-                time.sleep(300)
-                continue
-
-            if (now.hour == 13 and now.minute >= 30) or now.hour == 14:
-                extra_risk_cut = True
-
-        # MODE
-        if (now.hour == 9 and now.minute >= 15) or (now.hour == 10 and now.minute < 30):
-            mode = "SCALP"
-        else:
-            mode = "NORMAL"
-
         if trade_active:
+            time.sleep(10)
+            continue
+
+        # LIGHT TREND FILTER
+        if not is_trending():
+            print("Weak trend → skip")
             time.sleep(30)
             continue
 
-        signal_data = get_signal()
+        # SIGNAL
+        data = get_signal()
 
-        signal = signal_data.get("signal", "HOLD")
-        quality = signal_data.get("quality", "B")
+        signal = data.get("signal", "CALL")
+        quality = data.get("quality", "B")
 
-        if mode == "SCALP":
-            allowed = ["A", "A+"] if is_expiry_day() else ["A", "A+", "B"]
-
-            if not smart_scalping_filter(signal):
-                time.sleep(120)
-                continue
-        else:
-            allowed = ["A", "A+"]
-
-        if signal == "HOLD" or quality not in allowed:
-            time.sleep(120)
+        # QUALITY FILTER
+        if quality not in ["A", "A+", "B"]:
+            time.sleep(30)
             continue
 
+        if signal == "HOLD":
+            time.sleep(30)
+            continue
+
+        # SOFT SCALP FILTER
+        if not soft_scalp_filter(signal):
+            print("Weak momentum → skip")
+            time.sleep(30)
+            continue
+
+        # OPTION
         symbol, price = find_option(signal)
 
         if not symbol:
-            send_message("❌ No valid option found")
-            time.sleep(120)
+            print("No option found")
+            time.sleep(30)
             continue
 
         qty = calculate_qty(price)
@@ -389,9 +315,9 @@ def run_bot():
 
         if order:
             trade_active = True
-            manage_trade(symbol, price, qty, mode)
+            manage_trade(symbol, price, qty)
 
-        time.sleep(120)
+        time.sleep(60)  # cooldown
 
 
 # -----------------------------

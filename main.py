@@ -286,7 +286,7 @@ def find_option(signal, instrument):
         exchange = "MCX"
         name = "CRUDEOIL"
         lot = config.CRUDE_LOT
-        pmin, pmax = 10, 1000   # ✅ FIXED RANGE
+        pmin, pmax = 10, 1000   # wider safe range
 
     instruments = kite.instruments(exchange)
 
@@ -305,7 +305,13 @@ def find_option(signal, instrument):
         return None, None, None, None
 
     today = datetime.datetime.now().date()
-    expiry = sorted(set(i["expiry"] for i in opts if i["expiry"] >= today))[0]
+
+    expiries = sorted(set(i["expiry"] for i in opts if i["expiry"] >= today))
+    if not expiries:
+        print("❌ No valid expiry")
+        return None, None, None, None
+
+    expiry = expiries[0]
 
     opt_type = "CE" if signal == "CALL" else "PE"
 
@@ -314,8 +320,21 @@ def find_option(signal, instrument):
 
     for i in opts:
 
+        # -----------------------------
+        # FILTER EXPIRY + TYPE
+        # -----------------------------
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue
+
+        # -----------------------------
+        # ✅ CRUDE STRIKE FILTER (100 ONLY)
+        # -----------------------------
+        if instrument == "CRUDE":
+            try:
+                if int(i["strike"]) % 100 != 0:
+                    continue
+            except:
+                continue
 
         symbol = f"{exchange}:{i['tradingsymbol']}"
 
@@ -328,17 +347,17 @@ def find_option(signal, instrument):
 
         if pmin <= price <= pmax:
 
+            # choose premium near ₹100 (best liquidity)
             if best_price is None or abs(price - 100) < abs(best_price - 100):
                 best = i["tradingsymbol"]
                 best_price = price
 
-    if best:
+    if best and best_price:
         print(f"✅ Selected: {best} @ {best_price}")
         return best, best_price, lot, exchange
 
     print("❌ No valid option in range")
     return None, None, None, None
-
 # -----------------------------
 # ORDER
 # -----------------------------

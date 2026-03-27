@@ -325,27 +325,100 @@ def find_option(signal, instrument):
 # ORDER
 # -----------------------------
 def place_order(symbol, qty, exchange):
+
     try:
         full_symbol = f"{exchange}:{symbol}"
+
+        # -----------------------------
+        # GET LTP
+        # -----------------------------
         ltp = kite.ltp(full_symbol)[full_symbol]["last_price"]
 
-        # -----------------------------
-        # MARKET PROTECTION (IMPORTANT)
-        # -----------------------------
-        price = round(ltp * 1.03, 1)  # 2% buffer
+        expected_price = ltp
 
-        kite.place_order(
+        # Initial price (tight entry)
+        price = round(ltp * 1.01, 1)
+
+        order_id = kite.place_order(
             variety="regular",
             exchange=exchange,
             tradingsymbol=symbol,
             transaction_type="BUY",
             quantity=qty,
-            order_type="LIMIT",   # ✅ FIX
-            price=price,          # ✅ REQUIRED
+            order_type="LIMIT",
+            price=price,
             product="MIS"
         )
 
-        send_message(f"✅ Order Placed: {symbol} @ {price}")
+        send_message(f"📥 Order placed: {symbol} @ {price}")
+
+        # -----------------------------
+        # EXECUTION LOOP
+        # -----------------------------
+        retries = 3
+        filled_price = None
+
+        for i in range(retries):
+
+            time.sleep(3)
+
+            orders = kite.orders()
+
+            for o in orders:
+                if o["order_id"] == order_id:
+
+                    # -----------------------------
+                    # FILLED
+                    # -----------------------------
+                    if o["status"] == "COMPLETE":
+                        filled_price = o["average_price"]
+                        break
+
+            if filled_price:
+                break
+
+            # -----------------------------
+            # MODIFY PRICE (STEP UP)
+            # -----------------------------
+            price = round(price * 1.01, 1)
+
+            kite.modify_order(
+                variety="regular",
+                order_id=order_id,
+                price=price
+            )
+
+            send_message(f"🔁 Retry {i+1} → {price}")
+
+        # -----------------------------
+        # FINAL CHECK
+        # -----------------------------
+        if not filled_price:
+
+            # Cancel order
+            kite.cancel_order(
+                variety="regular",
+                order_id=order_id
+            )
+
+            send_message(f"❌ Order cancelled (not filled): {symbol}")
+            return False
+
+        # -----------------------------
+        # SLIPPAGE CALCULATION
+        # -----------------------------
+        slippage = round(filled_price - expected_price, 2)
+
+        send_message(
+            f"""✅ ORDER FILLED
+
+            {symbol}
+            Expected: ₹{expected_price}
+            Filled: ₹{filled_price}
+            Slippage: ₹{slippage}
+            """
+        )
+
         return True
 
     except Exception as e:

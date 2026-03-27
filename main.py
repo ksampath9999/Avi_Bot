@@ -15,31 +15,16 @@ IST = pytz.timezone("Asia/Kolkata")
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
 # -----------------------------
-# SEPARATE STATES
+# STATES
 # -----------------------------
 nifty_active = False
 crude_active = False
-
-nifty_last_trade = None
-crude_last_trade = None
-
-report_sent = False
-
-# -----------------------------
-# PNL TRACKING (SHARED)
-# -----------------------------
-daily_pnl = 0
-total_trades = 0
-wins = 0
-losses = 0
-
 
 # -----------------------------
 # BASIC
 # -----------------------------
 def get_ltp(symbol):
     return kite.ltp(symbol)[symbol]["last_price"]
-
 
 # -----------------------------
 # ML SIGNAL
@@ -54,9 +39,8 @@ def ml_signal():
         pass
     return "HOLD"
 
-
 # -----------------------------
-# NIFTY STRATEGIES (UNCHANGED)
+# NIFTY STRATEGIES
 # -----------------------------
 def breakout_signal():
     try:
@@ -67,7 +51,6 @@ def breakout_signal():
             now,
             "5minute"
         ))
-
         if len(df) < 3:
             return "HOLD"
 
@@ -80,7 +63,6 @@ def breakout_signal():
     except:
         return "HOLD"
 
-
 def vwap_signal():
     try:
         now = datetime.datetime.now()
@@ -90,17 +72,13 @@ def vwap_signal():
             now,
             "5minute"
         ))
-
         if len(df) < 10:
             return "HOLD"
 
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
-
         return "CALL" if df.iloc[-1]["close"] > df.iloc[-1]["vwap"] else "PUT"
-
     except:
         return "HOLD"
-
 
 def pivot_signal():
     try:
@@ -111,17 +89,12 @@ def pivot_signal():
             now,
             "day"
         ))
-
         prev = df.iloc[-2]
-
         pivot = (prev["high"] + prev["low"] + prev["close"]) / 3
         ltp = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
-
         return "CALL" if ltp > pivot else "PUT"
-
     except:
         return "HOLD"
-
 
 def momentum_signal():
     try:
@@ -132,7 +105,6 @@ def momentum_signal():
             now,
             "5minute"
         ))
-
         last = df.iloc[-1]
         body = abs(last["close"] - last["open"])
         rng = last["high"] - last["low"]
@@ -141,10 +113,8 @@ def momentum_signal():
             return "CALL" if last["close"] > last["open"] else "PUT"
 
         return "HOLD"
-
     except:
         return "HOLD"
-
 
 def get_final_signal():
     for fn in [ml_signal, breakout_signal, vwap_signal, pivot_signal, momentum_signal]:
@@ -153,37 +123,60 @@ def get_final_signal():
             return sig
     return "HOLD"
 
-
 # -----------------------------
-# CRUDE SIGNAL
+# PRO CRUDE STRATEGY
 # -----------------------------
 def get_crude_signal():
+
     try:
         now = datetime.datetime.now()
 
         df = pd.DataFrame(kite.historical_data(
             config.CRUDE_TOKEN,
-            now - datetime.timedelta(minutes=20),
+            now - datetime.timedelta(hours=2),
             now,
             "5minute"
         ))
 
-        if len(df) < 2:
+        if len(df) < 20:
             return "HOLD"
+
+        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        df["vol_ma"] = df["volume"].rolling(10).mean()
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        if last["close"] > prev["high"]:
+        body = abs(last["close"] - last["open"])
+        rng = last["high"] - last["low"]
+
+        strong = body > rng * 0.5
+        small = body < rng * 0.3
+
+        vol_spike = last["volume"] > last["vol_ma"]
+
+        above_vwap = last["close"] > last["vwap"]
+        below_vwap = last["close"] < last["vwap"]
+
+        breakout_up = last["close"] > prev["high"]
+        breakout_down = last["close"] < prev["low"]
+
+        if small:
+            return "HOLD"
+
+        if breakout_up and above_vwap and vol_spike and strong:
+            print("CRUDE CALL")
             return "CALL"
-        elif last["close"] < prev["low"]:
+
+        if breakout_down and below_vwap and vol_spike and strong:
+            print("CRUDE PUT")
             return "PUT"
 
         return "HOLD"
 
-    except:
+    except Exception as e:
+        print("Crude error:", e)
         return "HOLD"
-
 
 # -----------------------------
 # OPTION SELECTOR
@@ -234,7 +227,6 @@ def find_option(signal, instrument):
 
     return best, best_price, lot, exchange
 
-
 # -----------------------------
 # ORDER
 # -----------------------------
@@ -255,18 +247,14 @@ def place_order(symbol, qty, exchange):
         send_message(f"❌ Order error: {e}")
         return False
 
-
 # -----------------------------
 # TRADE MGMT
 # -----------------------------
 def manage_trade(symbol, entry, qty, exchange, instrument):
 
-    global daily_pnl, total_trades, wins, losses
-
     sl = entry * (0.80 if instrument == "CRUDE" else 0.90)
     target = entry * (1.30 if instrument == "CRUDE" else 1.18)
 
-    total_trades += 1
     send_message(f"🚀 {instrument} TRADE\n{symbol} @ {entry}")
 
     while True:
@@ -274,12 +262,10 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
             ltp = kite.ltp(f"{exchange}:{symbol}")[f"{exchange}:{symbol}"]["last_price"]
 
             if ltp >= target:
-                wins += 1
                 send_message(f"🎯 {instrument} TARGET")
                 break
 
             if ltp <= sl:
-                losses += 1
                 send_message(f"🛑 {instrument} SL")
                 break
 
@@ -288,12 +274,11 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
         except:
             break
 
-
 # -----------------------------
 # THREADS
 # -----------------------------
 def nifty_loop():
-    global nifty_active, nifty_last_trade
+    global nifty_active
 
     while True:
         now = datetime.datetime.now(IST)
@@ -321,7 +306,7 @@ def nifty_loop():
 
 
 def crude_loop():
-    global crude_active, crude_last_trade
+    global crude_active
 
     while True:
         now = datetime.datetime.now(IST)
@@ -347,13 +332,12 @@ def crude_loop():
             manage_trade(symbol, price, lot, exchange, "CRUDE")
             crude_active = False
 
-
 # -----------------------------
 # MAIN
 # -----------------------------
 if __name__ == "__main__":
 
-    send_message("🚀 BOT STARTED (PARALLEL MODE FINAL)")
+    send_message("🚀 BOT STARTED (FINAL PRO MODE)")
 
     threading.Thread(target=nifty_loop).start()
     threading.Thread(target=crude_loop).start()

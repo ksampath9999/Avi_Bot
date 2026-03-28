@@ -55,3 +55,4 @@ MAX_LOTS = 3
 
 # Strike Mode
 STRIKE_MODE = "ATM"   # ATM / ITM / OTM
+MIN_CONFIDENCE = 60

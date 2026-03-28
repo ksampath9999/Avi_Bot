@@ -51,8 +51,15 @@ COOLDOWN_AFTER_LOSS = 300  # seconds (5 min)
 
 
 RISK_PER_TRADE = 0.02   # 2%
-MAX_LOTS = 3
+MAX_LOTS = 1
 
 # Strike Mode
 STRIKE_MODE = "ATM"   # ATM / ITM / OTM
 MIN_CONFIDENCE = 60
+
+# -----------------------------
+# PORTFOLIO RISK
+# -----------------------------
+MAX_PORTFOLIO_LOSS = -5000
+MAX_DRAWDOWN = -3000
+RISK_OFF_AFTER_LOSS = True

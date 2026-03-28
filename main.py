@@ -45,14 +45,56 @@ last_signal_crude = None
 last_trade_time_nifty = 0
 last_trade_time_crude = 0
 
-SIGNAL_COOLDOWN = 300  # 5 minutes
+SIGNAL_COOLDOWN = 120  
 alert_sent = False
+last_analysis_time = 0
+
+portfolio_pnl = 0
+peak_portfolio = 0
+risk_off = False
+
+report_sent_today = False
+max_drawdown = 0
 
 trade_alert_sent = {
     "max_trades": False,
     "max_loss": False,
     "target_hit": False
 }
+
+
+
+def get_session_config(instrument):
+
+    session = get_market_session(instrument)
+
+    if instrument == "NIFTY":
+
+        if session == "MORNING":
+            return {"min_conf": 50, "lot_mult": 1.2}
+
+        elif session == "MIDDAY":
+            return {"min_conf": 70, "lot_mult": 0.5}
+
+        elif session == "AFTERNOON":
+            return {"min_conf": 60, "lot_mult": 1}
+
+    else:  # CRUDE
+
+        if session == "MORNING":
+            return {"min_conf": 55, "lot_mult": 1}
+
+        elif session == "MIDDAY":
+            return {"min_conf": 75, "lot_mult": 0.5}
+
+        elif session == "EVENING_TREND":
+            return {"min_conf": 50, "lot_mult": 1.5}
+
+        elif session == "VOLATILE_SESSION":
+            return {"min_conf": 65, "lot_mult": 1}
+
+    return None
+
 
 def safe_ltp(symbol):
     for _ in range(3):
@@ -238,12 +280,7 @@ def momentum_signal():
         return "HOLD"
 
 
-def get_final_signal():
-    for fn in [ml_signal, breakout_signal, vwap_signal, pivot_signal, momentum_signal]:
-        sig = fn()
-        if sig != "HOLD":
-            return sig
-    return "HOLD"
+
 
 # -----------------------------
 # PRO CRUDE STRATEGY
@@ -573,7 +610,7 @@ def find_option(signal, instrument):
             trade_value = price * lot_size
 
             # 💰 CAPITAL CHECK
-            if trade_value > max_trade_value:
+            if trade_value > max_trade_value * 1.2:
                 continue
 
             # 📊 SCORE (closer to ₹100 premium preferred)
@@ -589,17 +626,16 @@ def find_option(signal, instrument):
     # BEST SELECTION
     # -----------------------------
     if candidates:
+        best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
 
-    best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
+        symbol = best["symbol"]
+        price = best["price"]
 
-    symbol = best["symbol"]
-    price = best["price"]
+        print(f"🏆 Selected: {symbol} @ {price}")
 
-    print(f"🏆 Selected: {symbol} @ {price}")
+        lot = calculate_lots(price, exchange, instrument)
 
-    lot = calculate_lots(price, exchange, instrument)
-
-    return symbol, price, lot, exchange
+        return symbol, price, lot, exchange
 
     # -----------------------------
     # FALLBACK (NEAREST STRIKE)
@@ -671,7 +707,7 @@ def place_order(symbol, qty, exchange):
 
         ltp = safe_ltp(full_symbol)
         if ltp is None:
-            return None
+           return None
         expected_price = ltp
         price = round(ltp * 1.01, 1)
 
@@ -735,7 +771,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
 
     global daily_pnl, trade_count, last_loss_time
     global win_streak, loss_streak, peak_pnl
-
+    global portfolio_pnl, peak_portfolio, risk_off
+    global max_drawdown
+    
     with lock:
         trade_count += 1
 
@@ -760,6 +798,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
 
             profit = ltp - entry
 
+            # -----------------------------
+            # TRAILING LOGIC
+            # -----------------------------
             if profit > entry * 0.05:
                 trailing_sl = max(trailing_sl, entry)
 
@@ -779,7 +820,13 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
                 with lock:
                     pnl = (ltp - entry) * actual_qty
                     daily_pnl += pnl
+                    portfolio_pnl += pnl   # 🔥 NEW
 
+                    # Portfolio peak tracking
+                    if portfolio_pnl > peak_portfolio:
+                        peak_portfolio = portfolio_pnl
+
+                # Win/loss tracking
                 with lock:
                     if pnl > 0:
                         win_streak += 1
@@ -789,15 +836,26 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
                         win_streak = 0
                         last_loss_time = time.time()
 
-                slippage = abs(entry - ltp)
-
-                if daily_pnl > peak_pnl:
-                    peak_pnl = daily_pnl
+                # Daily drawdown
+                with lock:
+                    if daily_pnl > peak_pnl:
+                        peak_pnl = daily_pnl
 
                 drawdown = daily_pnl - peak_pnl
 
+                # Portfolio drawdown
+                with lock:
+                    portfolio_dd = portfolio_pnl - peak_portfolio
+
+                print(f"📉 Portfolio DD: {portfolio_dd}")
+
+                # 🔥 RISK-OFF TRIGGER
+                if portfolio_dd <= config.MAX_DRAWDOWN:
+                    print("🚫 Portfolio drawdown hit — activating risk off")
+                    risk_off = True
+
                 send_message(
-                    f"🛑 EXIT\n{symbol}\nPnL: ₹{round(pnl,2)}\nDrawdown: ₹{round(drawdown,2)}"
+                    f"🛑 EXIT\n{symbol}\nPnL: ₹{round(pnl,2)}\nDD: ₹{round(drawdown,2)}\nPortfolio DD: ₹{round(portfolio_dd,2)}"
                 )
 
                 log_trade(symbol, entry, ltp, pnl, instrument)
@@ -811,16 +869,39 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
                 with lock:
                     pnl = (ltp - entry) * actual_qty
                     daily_pnl += pnl
+                    portfolio_pnl += pnl   # 🔥 NEW
 
-                win_streak += 1
-                loss_streak = 0
+                    # Portfolio peak tracking
+                    if portfolio_pnl > peak_portfolio:
+                        peak_portfolio = portfolio_pnl
 
-                send_message(f"🎯 TARGET HIT ₹{round(pnl,2)}")
+                with lock:
+                    win_streak += 1
+                    loss_streak = 0
+                    
+                with lock:
+                    portfolio_dd = portfolio_pnl - peak_portfolio
+
+                print(f"📈 Portfolio PnL: {portfolio_pnl}")
+
+                send_message(
+                    f"🎯 TARGET HIT ₹{round(pnl,2)}\nPortfolio: ₹{round(portfolio_pnl,2)}"
+                )
 
                 log_trade(symbol, entry, ltp, pnl, instrument)
+                
+                dd = portfolio_pnl - peak_portfolio
+                if dd < max_drawdown:
+                    max_drawdown = dd
+                
                 break
+                
 
             time.sleep(5)
+            
+            
+
+            
 
         except Exception as e:
             print("Trade error:", e)
@@ -830,10 +911,26 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
 # -----------------------------
 def nifty_loop():
     global nifty_active, last_signal_nifty, last_trade_time_nifty
+    global last_analysis_time
+    global report_sent_today
+
+    
+
+    if time.time() - last_analysis_time > 1800:  # every 30 mins
+        adjust_strategy()
+        last_analysis_time = time.time()
+        
+    if last_reset_date != datetime.date.today():
+        reset_daily_pnl()
 
     while True:
-        reset_daily_pnl()
+        
         now = datetime.datetime.now(IST)
+        
+        # Send report after 3:30 PM
+        if now.hour == 15 and now.minute >= 30 and not report_sent_today:
+            send_daily_report()
+            report_sent_today = True
 
         # -----------------------------
         # MARKET TIME
@@ -855,6 +952,15 @@ def nifty_loop():
         if not can_trade():
             time.sleep(30)
             continue
+        if risk_off:
+            print("🛑 Risk OFF active")
+            time.sleep(60)
+            continue
+            
+        if not portfolio_safe():
+            print("🛑 Portfolio risk active — no trades")
+            time.sleep(60)
+            continue
 
         # -----------------------------
         # MARKET FILTERS
@@ -863,29 +969,46 @@ def nifty_loop():
             time.sleep(20)
             continue
 
-        if is_sideways_market(config.NIFTY_TOKEN):
+        if is_sideways_market(config.NIFTY_TOKEN) and not is_strong_trend_day(config.NIFTY_TOKEN) :
             print("⚠️ Sideways market — skipping")
             time.sleep(20)
             continue
 
         strong_trend = is_strong_trend_day(config.NIFTY_TOKEN)
 
-        signal = get_final_signal()
+        signal = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
         print("📊 NIFTY SIGNAL:", signal)
 
         if signal == "HOLD":
             time.sleep(10)
             continue
+            
+        # -----------------------------
+        # SESSION LOGIC
+        # -----------------------------
+        session_cfg = get_session_config("NIFTY")
+
+        if not session_cfg:
+            time.sleep(60)
+            continue
+
+        print(f"🕒 NIFTY Session: {get_market_session('NIFTY')}")
 
         # -----------------------------
         # HIGH PROBABILITY FILTER
         # -----------------------------
         confidence = get_trade_confidence(config.NIFTY_TOKEN, signal)
 
-        if confidence < config.MIN_CONFIDENCE:
-            print("❌ Low confidence — skipping")
+        if confidence < session_cfg["min_conf"] - 20:
+            print("❌ Low confidence (session)")
             time.sleep(10)
             continue
+            
+        if get_market_session("NIFTY") == "MIDDAY":
+            if is_sideways_market(config.NIFTY_TOKEN):
+                print("⚠️ Midday sideways — skipping")
+                time.sleep(20)
+                continue
 
         # -----------------------------
         # FAST FILTERS
@@ -935,6 +1058,9 @@ def nifty_loop():
         # High confidence boost
         if confidence > 80:
             lot *= 2
+            
+        lot = int(lot * session_cfg["lot_mult"])
+        lot = max(1, lot)
 
         # -----------------------------
         # PLACE ORDER
@@ -951,10 +1077,25 @@ def nifty_loop():
 
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
+    global last_analysis_time
+    global report_sent_today
+
+    if time.time() - last_analysis_time > 1800:  # every 30 mins
+        adjust_strategy()
+        last_analysis_time = time.time()
+        
+    if last_reset_date != datetime.date.today():
+        reset_daily_pnl()
 
     while True:
-        reset_daily_pnl()
+        
         now = datetime.datetime.now(IST)
+
+        
+        # Send report at 11 PM
+        if now.hour == 23 and not report_sent_today:
+            send_daily_report()
+            report_sent_today = True
 
         # -----------------------------
         # MARKET TIME (MCX)
@@ -970,6 +1111,16 @@ def crude_loop():
         if not can_trade():
             time.sleep(30)
             continue
+            
+        if risk_off:
+            print("🛑 Risk OFF active")
+            time.sleep(60)
+            continue
+            
+        if not portfolio_safe():
+            print("🛑 Portfolio risk active — no trades")
+            time.sleep(60)
+            continue
 
         # -----------------------------
         # MARKET FILTERS
@@ -978,29 +1129,46 @@ def crude_loop():
             time.sleep(20)
             continue
 
-        if is_sideways_market(config.CRUDE_TOKEN):
+        if is_sideways_market(config.CRUDE_TOKEN) and not is_strong_trend_day(config.CRUDE_TOKEN):
             print("⚠️ CRUDE sideways — skipping")
             time.sleep(20)
             continue
 
         strong_trend = is_strong_trend_day(config.CRUDE_TOKEN)
 
-        signal = get_crude_signal()
+        signal = multi_strategy_signal(config.CRUDE_TOKEN, "CRUDE")
         print("🛢️ CRUDE SIGNAL:", signal)
 
         if signal == "HOLD":
             time.sleep(10)
             continue
+            
+        # -----------------------------
+        # SESSION LOGIC
+        # -----------------------------
+        session_cfg = get_session_config("CRUDE")
+
+        if not session_cfg:
+            time.sleep(60)
+            continue
+
+        print(f"🕒 CRUDE Session: {get_market_session('CRUDE')}")
 
         # -----------------------------
         # HIGH PROBABILITY FILTER
         # -----------------------------
         confidence = get_trade_confidence(config.CRUDE_TOKEN, signal)
 
-        if confidence < config.MIN_CONFIDENCE:
-            print("❌ Low confidence — skipping")
+        if confidence < session_cfg["min_conf"] - 20:
+            print("❌ Low confidence (session)")
             time.sleep(10)
             continue
+            
+        if get_market_session("CRUDE") == "MIDDAY":
+            if is_sideways_market(config.CRUDE_TOKEN):
+                print("⚠️ CRUDE midday sideways — skipping")
+                time.sleep(20)
+                continue
 
         # -----------------------------
         # FAST FILTERS
@@ -1052,6 +1220,9 @@ def crude_loop():
         # High confidence boost
         if confidence > 80:
             lot *= 2
+            
+        lot = int(lot * session_cfg["lot_mult"])
+        lot = max(1, lot)
 
         # -----------------------------
         # PLACE ORDER
@@ -1119,81 +1290,30 @@ def get_strike_mode(token):
 
 def log_trade(symbol, entry, exit_price, pnl, instrument):
 
-    file = "nifty_trade_log.csv" if instrument == "NIFTY" else "crude_trade_log.csv"
-
-    file_exists = os.path.isfile(file)
-
-    with open(file, "a", newline="") as f:
-        writer = csv.writer(f)
-
-        if not file_exists:
-            writer.writerow(["time", "symbol", "entry", "exit", "pnl"])
-
-        writer.writerow([
-            datetime.datetime.now(),
-            symbol,
-            entry,
-            exit_price,
-            pnl
-        ])
-        
-def analyze_performance(instrument):
-
-    try:
-        file = "nifty_trade_log.csv" if instrument == "NIFTY" else "crude_trade_log.csv"
-
-        df = pd.read_csv(file)
-
-        if len(df) < 10:
-            return
-
-        win_rate = len(df[df["pnl"] > 0]) / len(df)
-        avg_pnl = df["pnl"].mean()
-
-        print(f"{instrument} → WinRate: {win_rate}, AvgPnL: {avg_pnl}")
-
-        if win_rate < 0.4:
-            mode = "ITM"
-        elif win_rate > 0.6:
-            mode = "OTM"
-        else:
-            mode = "ATM"
-
-        save_best_settings(mode, win_rate, avg_pnl, instrument)
-
-    except Exception as e:
-        print(f"{instrument} analyze error:", e)
-        
-def save_best_settings(mode, win_rate, avg_pnl, instrument):
-
-    file = "nifty_settings.json" if instrument == "NIFTY" else "crude_settings.json"
-
-    data = {
-        "date": str(datetime.date.today()),
-        "mode": mode,
-        "win_rate": win_rate,
-        "avg_pnl": avg_pnl
+    trade = {
+        "time": str(datetime.datetime.now()),
+        "symbol": symbol,
+        "entry": entry,
+        "exit": exit_price,
+        "pnl": pnl,
+        "instrument": instrument,
+        "session": get_market_session(instrument)
     }
 
+    file = "trade_log.json"
+
+    if not os.path.exists(file):
+        with open(file, "w") as f:
+            json.dump([], f)
+
+    with open(file, "r") as f:
+        data = json.load(f)
+
+    data.append(trade)
+
     with open(file, "w") as f:
-        json.dump(data, f)
-
-    print(f"💾 Saved {instrument} settings:", data)
-    
-def load_best_settings(instrument):
-
-    file = "nifty_settings.json" if instrument == "NIFTY" else "crude_settings.json"
-
-    try:
-        with open(file, "r") as f:
-            data = json.load(f)
-
-        print(f"📂 Loaded {instrument} settings:", data)
-
-        return data.get("mode", "ATM")
-
-    except:
-        return "ATM"
+        json.dump(data, f, indent=4)
+        
         
 def performance_loop():
     while True:
@@ -1262,7 +1382,7 @@ def get_quantity(lots, exchange):
 def get_balance():
     try:
         margin = kite.margins()
-        return margin["equity"]["available"]["cash"]
+        return margin["equity"]["available"]["cash"] or 10000
     except:
         return 0
         
@@ -1272,6 +1392,9 @@ def calculate_lots(price, exchange, instrument):
 
     balance = get_balance() or 10000
     risk_amount = balance * config.RISK_PER_TRADE
+    
+    if instrument == "CRUDE":
+        return 1
 
     if exchange == "NFO":
         lot_size = 65
@@ -1449,6 +1572,8 @@ def reset_daily_pnl():
     global daily_pnl, trade_count, last_reset_date
     global peak_pnl, win_streak, loss_streak
     global trade_alert_sent
+    global report_sent_today, max_drawdown
+    
 
     today = datetime.date.today()
 
@@ -1466,6 +1591,8 @@ def reset_daily_pnl():
         peak_pnl = 0
         win_streak = 0
         loss_streak = 0
+        report_sent_today = False
+        max_drawdown = 0
 
         last_reset_date = today
         
@@ -1617,6 +1744,334 @@ def is_false_breakout(token, signal):
     except Exception as e:
         print("False breakout error:", e)
         return False
+        
+        
+def get_market_session(instrument):
+
+    now = datetime.datetime.now(IST)
+
+    # -----------------------------
+    # NIFTY (NSE)
+    # -----------------------------
+    if instrument == "NIFTY":
+
+        if 9 <= now.hour < 11:
+            return "MORNING"
+
+        elif 11 <= now.hour < 13:
+            return "MIDDAY"
+
+        elif 13 <= now.hour < 15:
+            return "AFTERNOON"
+
+        else:
+            return "CLOSED"
+
+    # -----------------------------
+    # CRUDE (MCX)
+    # -----------------------------
+    else:
+
+        if 9 <= now.hour < 12:
+            return "MORNING"
+
+        elif 12 <= now.hour < 17:
+            return "MIDDAY"
+
+        elif 17 <= now.hour < 21:
+            return "EVENING_TREND"
+
+        elif 21 <= now.hour < 23:
+            return "VOLATILE_SESSION"
+
+        else:
+            return "CLOSED"
+            
+
+def vwap_signal(token):
+
+    try:
+        now = datetime.datetime.now()
+
+        df = pd.DataFrame(kite.historical_data(
+            token,
+            now - datetime.timedelta(minutes=60),
+            now,
+            "5minute"
+        ))
+
+        if len(df) < 10:
+            return "HOLD"
+
+        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
+        last = df.iloc[-1]
+
+        if last["close"] > last["vwap"]:
+            return "CALL"
+        elif last["close"] < last["vwap"]:
+            return "PUT"
+
+        return "HOLD"
+
+    except:
+        return "HOLD"
+        
+def breakout_signal(token):
+
+    try:
+        now = datetime.datetime.now()
+
+        df = pd.DataFrame(kite.historical_data(
+            token,
+            now - datetime.timedelta(minutes=30),
+            now,
+            "5minute"
+        ))
+
+        if len(df) < 5:
+            return "HOLD"
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        if last["close"] > prev["high"]:
+            return "CALL"
+        elif last["close"] < prev["low"]:
+            return "PUT"
+
+        return "HOLD"
+
+    except:
+        return "HOLD"
+        
+def pullback_signal(token):
+
+    try:
+        now = datetime.datetime.now()
+
+        df = pd.DataFrame(kite.historical_data(
+            token,
+            now - datetime.timedelta(minutes=60),
+            now,
+            "5minute"
+        ))
+
+        if len(df) < 20:
+            return "HOLD"
+
+        df["ema"] = df["close"].ewm(span=9).mean()
+
+        last = df.iloc[-1]
+
+        if last["close"] > last["ema"]:
+            return "CALL"
+        elif last["close"] < last["ema"]:
+            return "PUT"
+
+        return "HOLD"
+
+    except:
+        return "HOLD"
+        
+def multi_strategy_signal(token, instrument):
+
+    signals = []
+
+    vwap = vwap_signal(token)
+    breakout = breakout_signal(token)
+    pullback = pullback_signal(token)
+
+    signals.extend([vwap, breakout, pullback])
+
+    # Optional ML
+    try:
+        ml = ml_signal()
+        signals.append(ml)
+    except:
+        pass
+
+    print(f"📊 {instrument} Strategy Signals:", signals)
+
+    # -----------------------------
+    # 🔥 WEIGHTED SCORING (#4)
+    # -----------------------------
+    score = 0
+
+    for s in signals:
+        if s == "CALL":
+            score += 1
+        elif s == "PUT":
+            score -= 1
+
+    # -----------------------------
+    # 🔥 SESSION INTEGRATION (BONUS)
+    # -----------------------------
+    session = get_market_session(instrument)
+
+    # Midday → strict filtering
+    if session == "MIDDAY":
+        if abs(score) < 2:
+            print("⚠️ Midday weak signal — skipping")
+            return "HOLD"
+
+    # Evening crude → allow aggressive
+    if instrument == "CRUDE" and session == "EVENING_TREND":
+        if score >= 1:
+            return "CALL"
+        elif score <= -1:
+            return "PUT"
+
+    # -----------------------------
+    # FINAL DECISION
+    # -----------------------------
+    if score >= 2:
+        return "CALL"
+    elif score <= -2:
+        return "PUT"
+
+    return "HOLD"
+    
+    
+def analyze_performance():
+
+    file = "trade_log.json"
+
+    if not os.path.exists(file):
+        return
+
+    with open(file, "r") as f:
+        data = json.load(f)
+
+    if len(data) < 10:
+        return
+
+    results = {
+        "NIFTY": {"win": 0, "loss": 0},
+        "CRUDE": {"win": 0, "loss": 0}
+    }
+
+    for t in data[-50:]:  # last 50 trades
+
+        inst = t["instrument"]
+
+        if t["pnl"] > 0:
+            results[inst]["win"] += 1
+        else:
+            results[inst]["loss"] += 1
+
+    print("📊 Performance:", results)
+
+    return results
+    
+def adjust_strategy():
+
+    results = analyze_performance()
+
+    if not results:
+        return
+
+    for inst in ["NIFTY", "CRUDE"]:
+
+        wins = results[inst]["win"]
+        losses = results[inst]["loss"]
+
+        total = wins + losses
+
+        if total == 0:
+            continue
+
+        win_rate = wins / total
+
+        print(f"{inst} Win Rate: {round(win_rate,2)}")
+
+        # -----------------------------
+        # ADJUST CONFIDENCE
+        # -----------------------------
+        if win_rate < 0.4:
+            config.MIN_CONFIDENCE += 5
+            print(f"🔒 Increasing confidence for {inst}")
+
+        elif win_rate > 0.6:
+            config.MIN_CONFIDENCE -= 5
+            print(f"🚀 Relaxing confidence for {inst}")
+
+        # safety limits
+        config.MIN_CONFIDENCE = max(50, min(80, config.MIN_CONFIDENCE))
+        
+        
+def save_best_settings(instrument, mode):
+
+    file = f"{instrument}_settings.json"
+
+    with open(file, "w") as f:
+        json.dump({"mode": mode}, f)
+
+
+def load_best_settings(instrument):
+
+    file = f"{instrument}_settings.json"
+
+    if not os.path.exists(file):
+        return None
+
+    with open(file, "r") as f:
+        data = json.load(f)
+
+    return data.get("mode")
+    
+def portfolio_safe():
+
+    global portfolio_pnl, peak_portfolio, risk_off
+
+    # -----------------------------
+    # MAX LOSS
+    # -----------------------------
+    if portfolio_pnl <= config.MAX_PORTFOLIO_LOSS:
+        print("🚫 Portfolio max loss hit")
+        return False
+
+    # -----------------------------
+    # DRAWDOWN CONTROL
+    # -----------------------------
+    drawdown = portfolio_pnl - peak_portfolio
+
+    if drawdown <= config.MAX_DRAWDOWN:
+        print("🚫 Max drawdown hit")
+
+        if config.RISK_OFF_AFTER_LOSS:
+            risk_off = True
+
+        return False
+
+    return True
+    
+def send_daily_report():
+
+    global daily_pnl, trade_count, win_streak, loss_streak
+    global portfolio_pnl, max_drawdown
+
+    total_trades = trade_count
+    wins = win_streak
+    losses = loss_streak
+
+    win_rate = 0
+    if total_trades > 0:
+        win_rate = (wins / total_trades) * 100
+
+    report = f"""
+📊 DAILY REPORT
+
+💰 Total PnL: ₹{round(portfolio_pnl,2)}
+📈 Trades: {total_trades}
+✅ Wins: {wins}
+❌ Losses: {losses}
+🎯 Win Rate: {round(win_rate,2)}%
+
+📉 Max Drawdown: ₹{round(max_drawdown,2)}
+"""
+
+    send_message(report)
 
 # -----------------------------
 # MAIN

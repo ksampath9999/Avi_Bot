@@ -45,7 +45,7 @@ MAX_PREMIUM = 120
 # RISK MANAGEMENT
 # -----------------------------
 MAX_DAILY_LOSS = -3000      # stop after loss
-DAILY_TARGET = 5000         # stop after profit
+DAILY_TARGET = 10000         # stop after profit
 MAX_TRADES = 8             # max trades per day
 COOLDOWN_AFTER_LOSS = 300  # seconds (5 min)
 

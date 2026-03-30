@@ -57,7 +57,7 @@ RUN_BACKTEST = True
 
 # Strike Mode
 STRIKE_MODE = "ATM"   # ATM / ITM / OTM
-MIN_CONFIDENCE = 60
+MIN_CONFIDENCE = 55
 
 # -----------------------------
 # PORTFOLIO RISK

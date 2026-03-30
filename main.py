@@ -1887,17 +1887,18 @@ def is_news_volatility(token):
         return False
         
 def reset_daily_pnl():
+
     global daily_pnl, trade_count, last_reset_date
-    global peak_pnl, win_streak, loss_streak
+    global win_streak, loss_streak
     global trade_alert_sent
     global report_sent_today, max_drawdown
-    
+    global portfolio_pnl, peak_portfolio   # ✅ CORRECT VARIABLES
 
     today = datetime.date.today()
 
     if last_reset_date != today:
         print("🔄 Resetting daily stats")
-        
+
         trade_alert_sent = {
             "max_trades": False,
             "max_loss": False,
@@ -1906,7 +1907,11 @@ def reset_daily_pnl():
 
         daily_pnl = 0
         trade_count = 0
-        peak_pnl = 0
+
+        # ✅ FIXED VARIABLES
+        portfolio_pnl = 0
+        peak_portfolio = 0
+
         win_streak = 0
         loss_streak = 0
         report_sent_today = False

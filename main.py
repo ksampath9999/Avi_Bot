@@ -1148,9 +1148,17 @@ def nifty_loop():
             print("🚨 HARD STOP ACTIVATED — NIFTY")
             send_message("🚨 HARD STOP — Trading stopped (NIFTY)")
             break
+            
+        
 
         df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
-
+            print(f"DF: {df}")
+        
+        if df is None:
+            print("❌ DATA FETCH FAILED")
+            time.sleep(5)
+            continue
+        
         # ⏰ TIME FILTERS
         if 12 <= now.hour < 13:
             time.sleep(60)
@@ -1188,8 +1196,8 @@ def nifty_loop():
         # -----------------------------
         # DATA SAFETY (CRITICAL FIX)
         # -----------------------------
-        if df is None or len(df) < 5:
-            print("⚠️ Not enough data")
+        if df is None or len(df) < 3:
+            print("⚠️ Low data but continuing")
             time.sleep(5)
             continue
 
@@ -1371,6 +1379,12 @@ def crude_loop():
             break
 
         df = get_cached_data(config.CRUDE_TOKEN, "5minute", 20)
+            print(f"DF: {df}")
+            
+        if df is None:
+            print("❌ DATA FETCH FAILED")
+            time.sleep(5)
+            continue
 
         # ⏰ Skip weak hours
         if 12 <= now.hour < 13:
@@ -1407,8 +1421,8 @@ def crude_loop():
         # -----------------------------
         # DATA SAFETY (🔥 CRITICAL FIX)
         # -----------------------------
-        if df is None or len(df) < 5:
-            print("⚠️ Not enough data — skipping")
+        if df is None or len(df) < 3:
+            print("⚠️ Low data but continuing")
             time.sleep(5)
             continue
 
@@ -2310,6 +2324,8 @@ def is_low_range_market(token):
 def get_cached_data(token, interval, duration_minutes):
 
     global data_cache
+    
+    print(f"📊 Fetching data for {token}")
 
     key = f"{token}_{interval}_{duration_minutes}"
     now = time.time()
@@ -2331,6 +2347,8 @@ def get_cached_data(token, interval, duration_minutes):
 
         data_cache[key] = (now, df)
         return df
+        
+    print(f"📊 Data length: {len(df) if df is not None else 'None'}")
 
     except Exception as e:
         print("Cache fetch error:", e)
@@ -2466,6 +2484,14 @@ if __name__ == "__main__":
     import threading
 
     LOCK_FILE = "bot.lock"
+    
+    # ✅ QUICK TEST (ADD HERE)
+    try:
+        print("🔍 Testing Kite API...")
+        test = kite.ltp("NSE:NIFTY 50")
+        print("✅ Kite API working:", test)
+    except Exception as e:
+        print("❌ Kite API FAILED:", e)
 
     # -----------------------------
     # 🔒 LOCK FILE HANDLING (SAFE)

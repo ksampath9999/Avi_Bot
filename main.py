@@ -1132,7 +1132,7 @@ def nifty_loop():
     global last_analysis_time
     global report_sent_today
 
-    
+    print("🔥 NIFTY LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
         adjust_strategy()
@@ -1413,6 +1413,8 @@ def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
     global last_analysis_time
     global report_sent_today
+    
+    print("🔥 CRUDE LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
         adjust_strategy()
@@ -1424,6 +1426,8 @@ def crude_loop():
     while True:
         
         now = datetime.datetime.now(IST)
+        print("💓 CRUDE LOOP RUNNING")
+        
         # 🚨 HARD STOP (ADD HERE)
         if portfolio_pnl < HARD_STOP_LOSS:
             print("🚨 HARD STOP ACTIVATED — CRUDE")

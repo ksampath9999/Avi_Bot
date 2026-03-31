@@ -1,4 +1,10 @@
 from flask import Flask, jsonify
+
+# ✅ ADD THIS BLOCK HERE
+import logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
 import pandas as pd
 import datetime
 import os
@@ -6,6 +12,7 @@ import requests
 import joblib
 from kiteconnect import KiteConnect
 import config
+import time
 
 app = Flask(__name__)
 

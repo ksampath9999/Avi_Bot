@@ -19,34 +19,37 @@ kite.set_access_token(config.ACCESS_TOKEN)
 # MODEL CONFIG
 # -----------------------------
 MODEL_PATH = "ml_model.pkl"
-MODEL_URL = "https://drive.google.com/uc?export=download&id=1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc""   # <-- paste your Google Drive direct link
+MODEL_URL = "https://drive.google.com/uc?export=download&id=1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc"   # <-- paste your Google Drive direct link
 
 
 # -----------------------------
 # DOWNLOAD MODEL
 # -----------------------------
 def download_model():
-    if not os.path.exists(MODEL_PATH):
-        print("⬇️ Downloading model...")
+    if os.path.exists(MODEL_PATH):
+        print("✅ Model already exists — skipping download")
+        return
 
-        try:
-            response = requests.get(MODEL_URL, stream=True)
+    print("⬇️ Downloading model from Google Drive...")
 
-            # 🚨 VALIDATION
-            content_type = response.headers.get("Content-Type", "")
+    try:
+        response = requests.get(MODEL_URL, stream=True)
 
-            if "text/html" in content_type:
-                raise Exception("❌ Got HTML instead of model file")
+        # 🚨 VERY IMPORTANT CHECK
+        content_type = response.headers.get("Content-Type", "")
 
-            with open(MODEL_PATH, "wb") as f:
-                for chunk in response.iter_content(1024):
-                    if chunk:
-                        f.write(chunk)
+        if "text/html" in content_type:
+            raise Exception("❌ Google Drive returned HTML (quota exceeded or wrong link)")
 
-            print("✅ Model downloaded")
+        with open(MODEL_PATH, "wb") as f:
+            for chunk in response.iter_content(1024):
+                if chunk:
+                    f.write(chunk)
 
-        except Exception as e:
-            print("❌ Download failed:", e)
+        print("✅ Model downloaded successfully")
+
+    except Exception as e:
+        print("❌ Download failed:", e)
 
 
 # -----------------------------
@@ -56,12 +59,20 @@ model = None
 MODEL_LOADED = False
 
 try:
+    # 🔥 RETRY DOWNLOAD (PRO TIP ADDED HERE)
+    for _ in range(2):
+        try:
+            download_model()
+            break
+        except:
+            time.sleep(2)
+
     if os.path.exists(MODEL_PATH):
         model = joblib.load(MODEL_PATH)
         MODEL_LOADED = True
         print("✅ Model loaded successfully")
     else:
-        print("⚠️ Model file not found — ML disabled")
+        print("⚠️ Model file missing")
 
 except Exception as e:
     print("❌ Model load failed:", e)

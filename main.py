@@ -464,6 +464,7 @@ def get_instruments_cached(exchange):
 # -----------------------------
 def find_option(signal, instrument):
 
+    print(f"DEBUG OPTION → {symbol}, {price}, {lot}")
 
     if instrument == "NIFTY":
         exchange = "NFO"
@@ -574,9 +575,9 @@ def find_option(signal, instrument):
                 print("❌ Not liquid")
                 continue
 
-            if not is_good_spread(i["tradingsymbol"], exchange):
-                print("❌ Bad spread")
-                continue
+            #if not is_good_spread(i["tradingsymbol"], exchange):
+            #    print("❌ Bad spread")
+            #    continue
 
             trade_value = price * lot_size
 
@@ -636,8 +637,8 @@ def find_option(signal, instrument):
             if not is_liquid_option(i["tradingsymbol"], exchange):
                 continue
 
-            if not is_good_spread(i["tradingsymbol"], exchange):
-                continue
+            #if not is_good_spread(i["tradingsymbol"], exchange):
+            #    continue
 
             trade_value = price * lot_size
 
@@ -660,10 +661,12 @@ def find_option(signal, instrument):
 # -----------------------------
 
 def place_order(symbol, qty, exchange, instrument):
+    
+    print(f"🚀 PLACE ORDER CALLED: {symbol}, lot: {qty}, exchange: {exchange}")
 
-    if not is_good_spread(symbol, exchange):
-        print("🚫 Spread too high — skipping")
-        return None
+    #if not is_good_spread(symbol, exchange):
+    #    print("🚫 Spread too high — skipping")
+    #    return None
 
     try:
         full_symbol = f"{exchange}:{symbol}"
@@ -678,6 +681,8 @@ def place_order(symbol, qty, exchange, instrument):
 
         spread_buffer = 0.003 if exchange == "NFO" else 0.005
         price = round(ltp * (1 + spread_buffer), 1)
+        
+        print("➡️ Sending order to Zerodha...")
 
         order_id = kite.place_order(
             variety="regular",
@@ -687,7 +692,7 @@ def place_order(symbol, qty, exchange, instrument):
             quantity=get_quantity(qty, exchange),
             order_type="LIMIT",
             price=price,
-            product="MIS"
+            product = "MIS" if exchange == "NFO" else "NRML"
         )
 
         send_message(f"📥 Order placed: {symbol} @ {price}")
@@ -730,6 +735,7 @@ def place_order(symbol, qty, exchange, instrument):
         return filled_price
 
     except Exception as e:
+        print("❌ ORDER ERROR FULL:", str(e))
         send_message(f"❌ Order error: {e}")
         return None
 

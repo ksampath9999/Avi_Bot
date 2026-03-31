@@ -1,5 +1,8 @@
 import os
 
+#from dotenv import load_dotenv
+#load_dotenv()
+
 # -----------------------------
 # 🔐 ZERODHA API
 # -----------------------------
@@ -34,7 +37,7 @@ TARGET = 0.50      # 50%
 # 📈 INSTRUMENT
 # -----------------------------
 NIFTY_TOKEN = 256265
-CRUDE_TOKEN = 145398279 
+CRUDE_TOKEN = 124544519 
 # -----------------------------
 # 💰 OPTION SELECTION
 # -----------------------------

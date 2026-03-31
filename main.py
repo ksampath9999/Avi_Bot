@@ -12,6 +12,7 @@ import os
 import json
 
 
+
 bot_started = False
 lock = threading.Lock()
 IST = pytz.timezone("Asia/Kolkata")
@@ -74,6 +75,60 @@ LTP_TTL = 2  # seconds
 
 quote_cache = {}
 QUOTE_TTL = 2
+
+CRUDE_TOKEN = None
+NIFTY_FUT_TOKEN = None
+
+
+
+def get_nifty_fut_token():
+    try:
+        instruments = kite.instruments("NFO")
+
+        futures = [
+            inst for inst in instruments
+            if "NIFTY" in inst["tradingsymbol"]
+            and inst["instrument_type"] == "FUT"
+        ]
+
+        futures = sorted(futures, key=lambda x: x["expiry"])
+
+        if futures:
+            token = futures[0]["instrument_token"]
+            print(f"✅ NIFTY FUT TOKEN: {token} ({futures[0]['tradingsymbol']})")
+            return token
+
+        return None
+
+    except Exception as e:
+        print("❌ NIFTY FUT token error:", e)
+        return None
+
+
+def get_latest_fut_token(symbol, exchange):
+    try:
+        instruments = kite.instruments(exchange)
+
+        futures = [
+            inst for inst in instruments
+            if symbol in inst["tradingsymbol"]
+            and inst["instrument_type"] == "FUT"
+        ]
+
+        # Sort by expiry (nearest first)
+        futures = sorted(futures, key=lambda x: x["expiry"])
+
+        if futures:
+            token = futures[0]["instrument_token"]
+            print(f"✅ {symbol} TOKEN: {token} ({futures[0]['tradingsymbol']})")
+            return token
+
+        print(f"❌ No FUT found for {symbol}")
+        return None
+
+    except Exception as e:
+        print(f"❌ Token fetch error for {symbol}:", e)
+        return None
 
 
 def get_session_config(instrument):
@@ -477,7 +532,7 @@ def find_option(signal, instrument):
         exchange = "MCX"
         name = "CRUDEOIL"
         step = 100
-        token = config.CRUDE_TOKEN
+        token = CRUDE_TOKEN
         token_symbol = f"{exchange}:CRUDEOIL"
         lot_size = 100
         
@@ -760,7 +815,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
     # 🔥 SL CALCULATION (FIXED)
     # -----------------------------
     df = get_cached_data(
-        config.NIFTY_TOKEN if instrument == "NIFTY" else config.CRUDE_TOKEN,
+        config.NIFTY_TOKEN if instrument == "NIFTY" else CRUDE_TOKEN,
         "5minute",
         30
     )
@@ -787,7 +842,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
     risk = entry - sl
 
     strong_trend = is_strong_trend_day(
-        config.NIFTY_TOKEN if instrument == "NIFTY" else config.CRUDE_TOKEN
+        config.NIFTY_TOKEN if instrument == "NIFTY" else CRUDE_TOKEN
     )
 
     rr = 2
@@ -1141,30 +1196,35 @@ def nifty_loop():
         reset_daily_pnl()
 
     while True:
-        now = datetime.datetime.now(IST)
+        now = datetime.datetime.now()
 
         # 🚨 HARD STOP
         if portfolio_pnl < HARD_STOP_LOSS:
             print("🚨 HARD STOP ACTIVATED — NIFTY")
             send_message("🚨 HARD STOP — Trading stopped (NIFTY)")
             break
-            
-        
 
+        # -----------------------------
+        # FETCH DATA
+        # -----------------------------
         df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
-        print(f"DF: {df}")
-            
+
         if df is None or df.empty:
-            print("❌ EMPTY DATA — SKIPPING")
+            print("❌ EMPTY DATA — SKIPPING NIFTY")
             time.sleep(5)
             continue
-        
-        if df is None:
-            print("❌ DATA FETCH FAILED")
+
+        if len(df) < 5:
+            print("⚠️ Not enough candles")
             time.sleep(5)
             continue
-        
-        # ⏰ TIME FILTERS
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # -----------------------------
+        # TIME FILTERS
+        # -----------------------------
         if 12 <= now.hour < 13:
             time.sleep(60)
             continue
@@ -1199,29 +1259,37 @@ def nifty_loop():
             continue
 
         # -----------------------------
-        # DATA SAFETY (CRITICAL FIX)
-        # -----------------------------
-        if df is None or len(df) < 3:
-            print("⚠️ Low data but continuing")
-            time.sleep(5)
-            continue
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        # -----------------------------
         # TREND
         # -----------------------------
         trend = is_market_trending(config.NIFTY_TOKEN)
         strong_trend = is_strong_trend_day(config.NIFTY_TOKEN)
 
         # -----------------------------
-        # SIGNAL
+        # SIGNAL (FIXED POSITION)
         # -----------------------------
         signal = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+
         if signal == "HOLD":
             time.sleep(5)
             continue
+
+        # -----------------------------
+        # FUTURE CONFIRMATION (FIXED)
+        # -----------------------------
+        if NIFTY_FUT_TOKEN:
+            fut_df = get_cached_data(NIFTY_FUT_TOKEN, "5minute", 20)
+
+            if fut_df is not None and len(fut_df) > 5:
+                fut_last = fut_df.iloc[-1]
+                fut_prev = fut_df.iloc[-2]
+
+                if signal == "CALL" and fut_last["close"] < fut_prev["close"]:
+                    print("🚫 FUTURE NOT CONFIRMING CALL")
+                    continue
+
+                if signal == "PUT" and fut_last["close"] > fut_prev["close"]:
+                    print("🚫 FUTURE NOT CONFIRMING PUT")
+                    continue
 
         # -----------------------------
         # SCORING
@@ -1248,13 +1316,11 @@ def nifty_loop():
         if recent_move > last["close"] * 0.01:
             trade_score -= 15
 
-        # ✅ SAFE RANGE CHECK (FIXED)
         if rng < last["close"] * 0.002:
             trade_score -= 20
 
         print(f"🎯 Score: {trade_score}")
 
-        # ✅ RELAXED FILTER
         if trade_score < 22:
             continue
 
@@ -1266,13 +1332,23 @@ def nifty_loop():
             time.sleep(60)
             continue
 
-        confidence = get_trade_confidence(config.NIFTY_TOKEN, signal, df, strong_trend)
+        confidence = get_trade_confidence(
+            config.NIFTY_TOKEN, signal, df, strong_trend
+        )
+
+        # ✅ FUTURE VOLUME BOOST (FIXED POSITION)
+        if NIFTY_FUT_TOKEN and 'fut_df' in locals() and fut_df is not None:
+            try:
+                fut_vol_ma = fut_df["volume"].rolling(5).mean().iloc[-1]
+                if fut_last["volume"] > fut_vol_ma:
+                    confidence += 5
+            except:
+                pass
 
         if not trend and confidence < 60:
             continue
 
         if confidence < session_cfg["min_conf"]:
-            time.sleep(10)
             continue
 
         print(f"Confidence: {confidence}")
@@ -1297,11 +1373,9 @@ def nifty_loop():
             continue
 
         # -----------------------------
-        # OPTION
+        # OPTION SELECTION
         # -----------------------------
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
-
-        print(f"Selected: {symbol}, Lot: {lot}")
 
         if not symbol or not price or lot is None:
             continue
@@ -1321,9 +1395,6 @@ def nifty_loop():
         lot = int(lot * session_cfg["lot_mult"])
         lot = min(lot, config.MAX_LOTS)
         lot = max(1, lot)
-
-        if strong_trend and trade_score > 70:
-            lot = min(int(lot * 1.2), config.MAX_LOTS)
 
         # -----------------------------
         # ENTRY TIMING
@@ -1383,7 +1454,7 @@ def crude_loop():
             send_message("🚨 HARD STOP — Trading stopped (CRUDE)")
             break
 
-        df = get_cached_data(config.CRUDE_TOKEN, "5minute", 20)
+        df = get_cached_data(CRUDE_TOKEN, "5minute", 20)
         print(f"DF: {df}")
         
         if df is None or df.empty:
@@ -1442,8 +1513,8 @@ def crude_loop():
         # -----------------------------
         # TREND
         # -----------------------------
-        trend = is_market_trending(config.CRUDE_TOKEN)
-        strong_trend = is_strong_trend_day(config.CRUDE_TOKEN)
+        trend = is_market_trending(CRUDE_TOKEN)
+        strong_trend = is_strong_trend_day(CRUDE_TOKEN)
 
         # -----------------------------
         # SCORING
@@ -1477,8 +1548,8 @@ def crude_loop():
         # -----------------------------
         # SIGNAL
         # -----------------------------
-        signal = multi_strategy_signal(config.CRUDE_TOKEN, "CRUDE")
-        crude_sig = get_crude_signal(config.CRUDE_TOKEN)
+        signal = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
+        crude_sig = get_crude_signal(CRUDE_TOKEN)
 
         print(f"Signal: {signal}, Score: {trade_score}")
 
@@ -1501,7 +1572,7 @@ def crude_loop():
             time.sleep(60)
             continue
 
-        confidence = get_trade_confidence(config.CRUDE_TOKEN, signal, df, strong_trend)
+        confidence = get_trade_confidence(CRUDE_TOKEN, signal, df, strong_trend)
 
         if crude_sig == signal:
             confidence += 10
@@ -1529,7 +1600,7 @@ def crude_loop():
         if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
             continue
 
-        if not confirm_entry(config.CRUDE_TOKEN, signal, df):
+        if not confirm_entry(CRUDE_TOKEN, signal, df):
             continue
 
         # -----------------------------
@@ -1755,7 +1826,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
         token = config.NIFTY_TOKEN
     else:
         lot_size = 100
-        token = config.CRUDE_TOKEN
+        token = CRUDE_TOKEN
 
     sl_points = price * 0.10
     risk_per_lot = sl_points * lot_size
@@ -2334,10 +2405,10 @@ def is_low_range_market(token):
 def get_cached_data(token, interval, duration):
 
     try:
-        now = datetime.datetime.now(IST)
+        now = datetime.datetime.now()
 
-        # 🔥 IMPORTANT: use 1 day range (fix empty data)
-        from_time = now - datetime.timedelta(days=1)
+        # ✅ USE WIDE RANGE (WORKS ALWAYS)
+        from_time = now - datetime.timedelta(days=2)
 
         data = kite.historical_data(
             token,
@@ -2349,13 +2420,18 @@ def get_cached_data(token, interval, duration):
         df = pd.DataFrame(data)
 
         print(f"📊 Data length: {len(df)}")
+        print("FROM:", from_time)
+        print("TO:", now)
+        print("RAW:", data[:2])
 
         return df
 
     except Exception as e:
         print("❌ Data fetch error:", e)
         return None
-        
+
+
+
         
 def backtest(token, instrument, days=5):
 
@@ -2474,7 +2550,6 @@ def send_daily_report():
 """
 
     send_message(report)
-
 # -----------------------------
 # MAIN
 # -----------------------------
@@ -2485,9 +2560,23 @@ if __name__ == "__main__":
     import atexit
     import threading
 
-    LOCK_FILE = "bot.lock"
-    
-    # ✅ QUICK TEST (ADD HERE)
+    # -----------------------------
+    # 🎯 TOKEN INITIALIZATION (FIXED)
+    # -----------------------------
+    NIFTY_TOKEN = 256265  # Index (always safe)
+
+    CRUDE_TOKEN = get_latest_fut_token("CRUDEOIL", "MCX")
+    NIFTY_FUT_TOKEN = get_nifty_fut_token()
+
+    if CRUDE_TOKEN is None:
+        print("🚨 CRUDE DISABLED — TOKEN NOT FOUND")
+
+    if NIFTY_FUT_TOKEN is None:
+        print("⚠️ NIFTY FUT TOKEN NOT FOUND")
+
+    # -----------------------------
+    # 🔍 API TEST
+    # -----------------------------
     try:
         print("🔍 Testing Kite API...")
         test = kite.ltp("NSE:NIFTY 50")
@@ -2496,26 +2585,25 @@ if __name__ == "__main__":
         print("❌ Kite API FAILED:", e)
 
     # -----------------------------
-    # 🔒 LOCK FILE HANDLING (SAFE)
+    # 🔒 LOCK FILE HANDLING
     # -----------------------------
+    LOCK_FILE = "bot.lock"
+
     def remove_lock():
         if os.path.exists(LOCK_FILE):
             os.remove(LOCK_FILE)
 
-    # Remove stale lock (Render restart safe)
     if os.path.exists(LOCK_FILE):
         print("⚠️ Removing stale lock file")
         os.remove(LOCK_FILE)
 
-    # Create lock
     with open(LOCK_FILE, "w") as f:
         f.write("running")
 
-    # Auto cleanup on exit
     atexit.register(remove_lock)
 
     # -----------------------------
-    # 🚀 START ML SERVER THREAD
+    # 🚀 START ML SERVER
     # -----------------------------
     threading.Thread(target=run_ml_server, daemon=True).start()
     print("✅ ML thread started")
@@ -2526,12 +2614,17 @@ if __name__ == "__main__":
     # 🚀 START TRADING LOOPS
     # -----------------------------
     threading.Thread(target=nifty_loop, daemon=True).start()
-    threading.Thread(target=crude_loop, daemon=True).start()
+
+    # ✅ Start CRUDE only if token valid
+    if CRUDE_TOKEN:
+        threading.Thread(target=crude_loop, daemon=True).start()
+    else:
+        print("⚠️ CRUDE LOOP SKIPPED")
 
     print("🚀 Trading engine started")
 
     # -----------------------------
-    # 📢 STARTUP MESSAGE (AFTER FULL INIT)
+    # 📢 START MESSAGE
     # -----------------------------
     time.sleep(2)
     try:
@@ -2540,7 +2633,28 @@ if __name__ == "__main__":
         pass
 
     # -----------------------------
-    # 🔁 KEEP MAIN THREAD ALIVE
+    # 🔁 DAILY TOKEN REFRESH (PRO)
+    # -----------------------------
+    def refresh_tokens():
+        global CRUDE_TOKEN, NIFTY_FUT_TOKEN
+
+        while True:
+            now = datetime.datetime.now()
+
+            if now.hour == 9 and now.minute < 5:
+                print("🔄 Refreshing tokens...")
+
+                CRUDE_TOKEN = get_latest_fut_token("CRUDEOIL", "MCX")
+                NIFTY_FUT_TOKEN = get_nifty_fut_token()
+
+                print("✅ Tokens refreshed")
+
+            time.sleep(60)
+
+    threading.Thread(target=refresh_tokens, daemon=True).start()
+
+    # -----------------------------
+    # 🔁 KEEP ALIVE
     # -----------------------------
     while True:
         time.sleep(60)

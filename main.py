@@ -1152,7 +1152,7 @@ def nifty_loop():
         
 
         df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
-            print(f"DF: {df}")
+        print(f"DF: {df}")
         
         if df is None:
             print("❌ DATA FETCH FAILED")
@@ -1379,7 +1379,7 @@ def crude_loop():
             break
 
         df = get_cached_data(config.CRUDE_TOKEN, "5minute", 20)
-            print(f"DF: {df}")
+        print(f"DF: {df}")
             
         if df is None:
             print("❌ DATA FETCH FAILED")
@@ -2348,7 +2348,7 @@ def get_cached_data(token, interval, duration_minutes):
         data_cache[key] = (now, df)
         return df
         
-    print(f"📊 Data length: {len(df) if df is not None else 'None'}")
+        print(f"📊 Data length: {len(df) if df is not None else 'None'}")
 
     except Exception as e:
         print("Cache fetch error:", e)

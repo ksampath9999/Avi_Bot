@@ -67,6 +67,13 @@ trade_alert_sent = {
     "target_hit": False
 }
 
+instrument_cache = {}
+
+ltp_cache = {}
+LTP_TTL = 2  # seconds
+
+quote_cache = {}
+QUOTE_TTL = 2
 
 
 def get_session_config(instrument):
@@ -102,11 +109,23 @@ def get_session_config(instrument):
 
 
 def safe_ltp(symbol):
-    for _ in range(3):
+    global ltp_cache
+
+    now = time.time()
+
+    if symbol in ltp_cache:
+        ts, price = ltp_cache[symbol]
+        if now - ts < LTP_TTL:
+            return price
+
+    for _ in range(2):
         try:
-            return kite.ltp(symbol)[symbol]["last_price"]
+            price = kite.ltp(symbol)[symbol]["last_price"]
+            ltp_cache[symbol] = (now, price)
+            return price
         except:
-            time.sleep(1)
+            time.sleep(0.5)
+
     return None
 
 # -----------------------------
@@ -279,12 +298,33 @@ def get_crude_signal(token):
     except:
         return "HOLD"
         
+        
+def get_quote(symbol):
+    global quote_cache
+
+    now = time.time()
+
+    if symbol in quote_cache:
+        ts, data = quote_cache[symbol]
+        if now - ts < QUOTE_TTL:
+            return data
+
+    try:
+        data = kite.quote([symbol])[symbol]
+        quote_cache[symbol] = (now, data)
+        return data
+    except:
+        return None        
+
+        
 def is_liquid_option(symbol, exchange):
 
     try:
         full_symbol = f"{exchange}:{symbol}"
 
-        data = kite.quote([full_symbol])[full_symbol]
+        data = get_quote(full_symbol)
+        if not data:
+            return False
 
         price = data.get("last_price", 0)
 
@@ -367,7 +407,9 @@ def is_good_spread(symbol, exchange):
     try:
         full_symbol = f"{exchange}:{symbol}"
 
-        data = kite.quote([full_symbol])[full_symbol]
+        data = get_quote(full_symbol)
+        if not data:
+            return False
 
         depth = data.get("depth", {})
 
@@ -401,6 +443,21 @@ def is_good_spread(symbol, exchange):
         print("Spread error:", e)
         return False
         
+
+def get_instruments_cached(exchange):
+    global instrument_cache
+
+    if exchange in instrument_cache:
+        return instrument_cache[exchange]
+
+    try:
+        data = kite.instruments(exchange)
+        instrument_cache[exchange] = data
+        return data
+    except Exception as e:
+        print("Instrument fetch error:", e)
+        return []
+
 
 # -----------------------------
 # OPTION SELECTOR
@@ -458,7 +515,7 @@ def find_option(signal, instrument):
     else:
         strikes = [atm, atm - step, atm + step]
 
-    instruments = kite.instruments(exchange)
+    instruments = get_instruments_cached(exchange)
     today = datetime.datetime.now().date()
 
     opts = [
@@ -1038,6 +1095,29 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
         except Exception as e:
             print("Trade error:", e)
             break
+            
+            
+            
+def run_trade_wrapper(symbol, price, lot, exchange, instrument):
+    global nifty_active, crude_active
+
+    # ✅ SET ACTIVE FLAG
+    if instrument == "NIFTY":
+        nifty_active = True
+    else:
+        crude_active = True
+
+    try:
+        manage_trade(symbol, price, lot, exchange, instrument)
+
+    finally:
+        # ✅ RESET ONLY AFTER TRADE COMPLETES
+        if instrument == "NIFTY":
+            nifty_active = False
+        else:
+            crude_active = False
+ 
+ 
 # -----------------------------
 # THREADS
 # -----------------------------
@@ -1168,7 +1248,7 @@ def nifty_loop():
         if rng < 80:
             trade_score -= 20
             
-        if trade_score < 30:
+        if trade_score < 25:
             continue
         
         print(f"🎯 Trade Score: {trade_score}")
@@ -1310,18 +1390,18 @@ def nifty_loop():
             last_signal_nifty = signal
             last_trade_time_nifty = time.time()
 
-            nifty_active = True
             threading.Thread(
-                target=manage_trade,
+                target=run_trade_wrapper,
                 args=(symbol, filled_price, lot, exchange, "NIFTY"),
                 daemon=True
             ).start()
-            nifty_active = False
             
         # 🔁 Re-entry logic (trend continuation)
         if win_streak >= 2 and strong_trend and time.time() - last_trade_time_nifty > 120:
             print("🔁 Re-entry allowed")
             last_signal_nifty = None
+            
+        time.sleep(1)
 
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
@@ -1431,7 +1511,7 @@ def crude_loop():
         # -----------------------------
         # ⚠️ APPLY RANGE PENALTY LAST
         # -----------------------------
-        if rng < 80:
+        if rng < last["close"] * 0.002:
             trade_score -= 20
 
         signal = multi_strategy_signal(config.CRUDE_TOKEN, "CRUDE")
@@ -1444,7 +1524,7 @@ def crude_loop():
         
         # ✅ FINAL DECISION (ADD HERE)
 
-        if trade_score < 30:
+        if trade_score < 25:
             continue
             
          
@@ -1589,17 +1669,17 @@ def crude_loop():
             last_signal_crude = signal
             last_trade_time_crude = time.time()
 
-            crude_active = True
             threading.Thread(
-                target=manage_trade,
+                target=run_trade_wrapper,
                 args=(symbol, filled_price, lot, exchange, "CRUDE"),
                 daemon=True
             ).start()
-            crude_active = False
             
         if win_streak >= 2 and strong_trend and time.time() - last_trade_time_crude > 120:
             print("🔁 Re-entry allowed")
             last_signal_crude = None
+            
+        time.sleep(1)
         
 def get_strike_mode(token):
 

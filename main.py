@@ -1274,7 +1274,7 @@ def nifty_loop():
         # -----------------------------
         confidence = get_trade_confidence(config.NIFTY_TOKEN, signal, df, strong_trend)
         
-        if not trend  and confidence < 65:
+        if not trend  and confidence < 60:
             continue
 
 
@@ -1375,7 +1375,7 @@ def nifty_loop():
         if ltp1 is None or ltp2 is None:
             continue
 
-        if signal == "CALL" and ltp2 < ltp1:
+        if signal == "CALL" and ltp2 < ltp1 * 0.995:
             continue
 
         if signal == "PUT" and ltp2 > ltp1:
@@ -1552,9 +1552,9 @@ def crude_loop():
         # Reject conflicts
         if crude_sig != "HOLD" and crude_sig != signal:
             print("🚫 CRUDE mismatch — skipping")
-            continue
+            
         
-        if not trend and confidence < 65:
+        if not trend and confidence < 60:
             continue
 
         if confidence < session_cfg["min_conf"]:
@@ -1653,7 +1653,7 @@ def crude_loop():
         if ltp1 is None or ltp2 is None:
             continue
 
-        if signal == "CALL" and ltp2 < ltp1:
+        if signal == "CALL" and ltp2 < ltp1 * 0.995:
             print("🚫 Weak momentum — skip entry")
             continue
 
@@ -1678,6 +1678,12 @@ def crude_loop():
         if win_streak >= 2 and strong_trend and time.time() - last_trade_time_crude > 120:
             print("🔁 Re-entry allowed")
             last_signal_crude = None
+            
+        print(f"Selected Option: {symbol}, Price: {price}, Lot: {lot}")
+        print(f"Signal: {signal}")
+        print(f"Crude Signal: {crude_sig}")
+        print(f"Score: {trade_score}")
+        print(f"Confidence: {confidence}")
             
         time.sleep(1)
         

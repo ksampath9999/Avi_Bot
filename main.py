@@ -11,6 +11,8 @@ import csv
 import os
 import json
 
+
+bot_started = False
 lock = threading.Lock()
 
 kite = KiteConnect(api_key=config.API_KEY)
@@ -2475,22 +2477,59 @@ def send_daily_report():
 # -----------------------------
 if __name__ == "__main__":
 
-    # 🚀 START ML SERVER THREAD
-    threading.Thread(target=run_ml_server, daemon=True).start()
+    import time
+    import os
+    import atexit
+    import threading
 
+    LOCK_FILE = "bot.lock"
+
+    # -----------------------------
+    # 🔒 LOCK FILE HANDLING (SAFE)
+    # -----------------------------
+    def remove_lock():
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+
+    # Remove stale lock (Render restart safe)
+    if os.path.exists(LOCK_FILE):
+        print("⚠️ Removing stale lock file")
+        os.remove(LOCK_FILE)
+
+    # Create lock
+    with open(LOCK_FILE, "w") as f:
+        f.write("running")
+
+    # Auto cleanup on exit
+    atexit.register(remove_lock)
+
+    # -----------------------------
+    # 🚀 START ML SERVER THREAD
+    # -----------------------------
+    threading.Thread(target=run_ml_server, daemon=True).start()
     print("✅ ML thread started")
 
-    import time
     time.sleep(2)
 
-    print("🚀 Starting trading engine...")
+    # -----------------------------
+    # 🚀 START TRADING LOOPS
+    # -----------------------------
+    threading.Thread(target=nifty_loop, daemon=True).start()
+    threading.Thread(target=crude_loop, daemon=True).start()
 
+    print("🚀 Trading engine started")
+
+    # -----------------------------
+    # 📢 STARTUP MESSAGE (AFTER FULL INIT)
+    # -----------------------------
+    time.sleep(2)
+    try:
+        send_message("🚀 Bot started successfully")
+    except:
+        pass
+
+    # -----------------------------
+    # 🔁 KEEP MAIN THREAD ALIVE
+    # -----------------------------
     while True:
-        try:
-            nifty_loop()
-            crude_loop()
-            time.sleep(5)
-
-        except Exception as e:
-            print("❌ Main loop error:", e)
-            time.sleep(5)
+        time.sleep(60)

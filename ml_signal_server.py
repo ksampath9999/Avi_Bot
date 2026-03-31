@@ -44,13 +44,16 @@ def download_model():
 # -----------------------------
 # LOAD MODEL
 # -----------------------------
+model = None
 MODEL_LOADED = False
 
 try:
-    download_model()
-    model = joblib.load(MODEL_PATH)
-    MODEL_LOADED = True
-    print("✅ Model loaded successfully")
+    if os.path.exists(MODEL_PATH):
+        model = joblib.load(MODEL_PATH)
+        MODEL_LOADED = True
+        print("✅ Model loaded successfully")
+    else:
+        print("⚠️ Model file not found — ML disabled")
 
 except Exception as e:
     print("❌ Model load failed:", e)
@@ -114,7 +117,7 @@ def get_signal():
         # -----------------------------
         # ML PREDICTION
         # -----------------------------
-        if MODEL_LOADED:
+        if MODEL_LOADED and model is not None:
 
             try:
                 features = [[
@@ -166,5 +169,5 @@ def get_signal():
 # RUN SERVER (RENDER READY)
 # -----------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

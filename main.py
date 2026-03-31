@@ -1662,7 +1662,15 @@ def log_trade(symbol, entry, exit_price, pnl, instrument):
 
     with open(file, "w") as f:
         json.dump(data, f, indent=4)
-        
+
+
+def run_ml_server():
+    try:
+        from ml_signal_server import app
+        print("🚀 Starting ML server thread...")
+        app.run(host="0.0.0.0", port=10000)
+    except Exception as e:
+        print("❌ ML server failed:", e)
         
 def performance_loop():
     while True:
@@ -2140,6 +2148,15 @@ def pullback_signal(token):
     except:
         return "HOLD"
         
+        
+
+def get_ml_signal():
+    try:
+        res = requests.get("http://127.0.0.1:10000/signal", timeout=1)
+        return res.json().get("signal", "HOLD")
+    except:
+        return "HOLD"
+        
 def multi_strategy_signal(token, instrument):
 
     signals = []
@@ -2148,7 +2165,7 @@ def multi_strategy_signal(token, instrument):
     signals.append(breakout_signal(token))
     signals.append(pullback_signal(token))
 
-    ml = ml_signal()
+    ml = get_ml_signal()
     if ml != "HOLD":
         signals.append(ml)
 
@@ -2326,6 +2343,7 @@ def get_cached_data(token, interval, duration_minutes):
         print("Cache fetch error:", e)
         return None
         
+        
 def backtest(token, instrument, days=5):
 
     print(f"📊 Running backtest for {instrument}")
@@ -2449,12 +2467,22 @@ def send_daily_report():
 # -----------------------------
 if __name__ == "__main__":
 
-    send_message("🚀 BOT STARTED")
+    # 🚀 START ML SERVER THREAD
+    threading.Thread(target=run_ml_server, daemon=True).start()
 
-    if config.RUN_BACKTEST:
-        backtest(config.NIFTY_TOKEN, "NIFTY", days=3)
-        backtest(config.CRUDE_TOKEN, "CRUDE", days=3)
+    print("✅ ML thread started")
 
-    threading.Thread(target=performance_loop, daemon=True).start()
-    threading.Thread(target=nifty_loop, daemon=True).start()
-    threading.Thread(target=crude_loop, daemon=True).start()
+    import time
+    time.sleep(2)
+
+    print("🚀 Starting trading engine...")
+
+    while True:
+        try:
+            nifty_loop()
+            crude_loop()
+            time.sleep(5)
+
+        except Exception as e:
+            print("❌ Main loop error:", e)
+            time.sleep(5)

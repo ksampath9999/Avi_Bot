@@ -53,7 +53,7 @@ peak_portfolio = 0
 risk_off = False
 
 data_cache = {}
-CACHE_TTL = 10  # seconds
+CACHE_TTL = 15  # seconds
 
 report_sent_today = False
 max_drawdown = 0
@@ -178,7 +178,7 @@ def can_trade():
 # -----------------------------
 def ml_signal():
     try:
-        data = requests.get(SIGNAL_URL, timeout=5).json()
+        data = requests.get(SIGNAL_URL, timeout=1).json()
         sig = data.get("signal", "HOLD")
         if sig in ["CALL", "PUT"]:
             return sig
@@ -1309,7 +1309,11 @@ def nifty_loop():
             last_trade_time_nifty = time.time()
 
             nifty_active = True
-            manage_trade(symbol, filled_price, lot, exchange, "NIFTY")
+            threading.Thread(
+                target=manage_trade,
+                args=(symbol, filled_price, lot, exchange, "NIFTY"),
+                daemon=True
+            ).start()
             nifty_active = False
             
         # 🔁 Re-entry logic (trend continuation)
@@ -1584,7 +1588,11 @@ def crude_loop():
             last_trade_time_crude = time.time()
 
             crude_active = True
-            manage_trade(symbol, filled_price, lot, exchange, "CRUDE")
+            threading.Thread(
+                target=manage_trade,
+                args=(symbol, filled_price, lot, exchange, "CRUDE"),
+                daemon=True
+            ).start()
             crude_active = False
             
         if win_streak >= 2 and strong_trend and time.time() - last_trade_time_crude > 120:

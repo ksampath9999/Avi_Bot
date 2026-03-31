@@ -19,7 +19,7 @@ kite.set_access_token(config.ACCESS_TOKEN)
 # MODEL CONFIG
 # -----------------------------
 MODEL_PATH = "ml_model.pkl"
-MODEL_URL = "https://drive.google.com/file/d/1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc/view?usp=drive_link"   # <-- paste your Google Drive direct link
+MODEL_URL = "https://drive.google.com/uc?export=download&id=1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc""   # <-- paste your Google Drive direct link
 
 
 # -----------------------------
@@ -27,13 +27,21 @@ MODEL_URL = "https://drive.google.com/file/d/1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc/v
 # -----------------------------
 def download_model():
     if not os.path.exists(MODEL_PATH):
-        print("⬇️ Downloading model from Google Drive...")
+        print("⬇️ Downloading model...")
 
         try:
-            response = requests.get(MODEL_URL)
+            response = requests.get(MODEL_URL, stream=True)
+
+            # 🚨 VALIDATION
+            content_type = response.headers.get("Content-Type", "")
+
+            if "text/html" in content_type:
+                raise Exception("❌ Got HTML instead of model file")
 
             with open(MODEL_PATH, "wb") as f:
-                f.write(response.content)
+                for chunk in response.iter_content(1024):
+                    if chunk:
+                        f.write(chunk)
 
             print("✅ Model downloaded")
 
@@ -169,5 +177,5 @@ def get_signal():
 # RUN SERVER (RENDER READY)
 # -----------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = 10000
     app.run(host="0.0.0.0", port=port)

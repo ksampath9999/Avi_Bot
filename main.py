@@ -1129,59 +1129,48 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument):
 # -----------------------------
 def nifty_loop():
     global nifty_active, last_signal_nifty, last_trade_time_nifty
-    global last_analysis_time
-    global report_sent_today
+    global last_analysis_time, report_sent_today
 
     print("🔥 NIFTY LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
         adjust_strategy()
         last_analysis_time = time.time()
-        
+
     if last_reset_date != datetime.date.today():
         reset_daily_pnl()
 
     while True:
-        
         now = datetime.datetime.now(IST)
-        
-        # 🚨 HARD STOP (ADD HERE)
+
+        # 🚨 HARD STOP
         if portfolio_pnl < HARD_STOP_LOSS:
             print("🚨 HARD STOP ACTIVATED — NIFTY")
             send_message("🚨 HARD STOP — Trading stopped (NIFTY)")
             break
-            
-        # 🔥 SINGLE FETCH (ADD HERE)
+
         df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
-        
-        # ⏰ Avoid low edge hours
+
+        # ⏰ TIME FILTERS
         if 12 <= now.hour < 13:
-            print("⏳ Low edge time — skipping")
             time.sleep(60)
             continue
-        
-        # Send report after 3:30 PM
-        if now.hour == 15 and now.minute >= 30 and not report_sent_today:
-            send_daily_report()
-            report_sent_today = True
 
-        # -----------------------------
-        # MARKET TIME
-        # -----------------------------
+        if now.hour == 9 and now.minute < 20:
+            time.sleep(60)
+            continue
+
+        if now.hour == 15 and now.minute > 25:
+            time.sleep(60)
+            continue
+
         if not (9 <= now.hour < 15 or (now.hour == 15 and now.minute <= 30)):
             time.sleep(60)
             continue
-            
-        if now.hour == 9 and now.minute < 20:
-            print("⏳ Skipping opening volatility")
-            time.sleep(60)
-            continue
 
-        # Avoid late trades
-        if now.hour == 15 and now.minute > 25:
-            print("⚠️ Avoiding late NIFTY trades")
-            time.sleep(60)
-            continue
+        if now.hour == 15 and now.minute >= 30 and not report_sent_today:
+            send_daily_report()
+            report_sent_today = True
 
         if nifty_active:
             time.sleep(5)
@@ -1190,190 +1179,142 @@ def nifty_loop():
         if not can_trade():
             time.sleep(30)
             continue
+
         if risk_off:
             print("🛑 Risk OFF active")
             time.sleep(60)
             continue
-            
-            
 
-       
-        # 🔥 TREND CACHE (ADD HERE)
+        # -----------------------------
+        # DATA SAFETY (CRITICAL FIX)
+        # -----------------------------
+        if df is None or len(df) < 5:
+            print("⚠️ Not enough data")
+            time.sleep(5)
+            continue
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # -----------------------------
+        # TREND
+        # -----------------------------
         trend = is_market_trending(config.NIFTY_TOKEN)
         strong_trend = is_strong_trend_day(config.NIFTY_TOKEN)
 
+        # -----------------------------
+        # SIGNAL
+        # -----------------------------
         signal = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
-
         if signal == "HOLD":
             time.sleep(5)
             continue
 
-        # 🔥 SINGLE FETCH (ADD HERE)
-
-        if df is None or len(df) < 5:
-            time.sleep(5)
-            continue
-
-        # 🧠 TRADE SCORING SYSTEM (ADD HERE)
-
-        trade_score = 0
-        rng = 100
-        if df is not None and len(df) >= 5:
-
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            body = abs(last["close"] - last["open"])
-            rng = last["high"] - last["low"]
-
-            # 1. Momentum
-            move = abs(last["close"] - prev["close"])
-            if move > last["close"] * 0.003:
-                trade_score += 20
-
-            # 2. Strong candle
-            if rng > 0 and body > rng * 0.5:
-                trade_score += 20
-
-            # 3. Volume
-            vol_ma = df["volume"].rolling(5).mean().iloc[-1]
-            if last["volume"] > vol_ma:
-                trade_score += 20
-
-            # 4. Trend
-            if trend:
-                trade_score += 20
-                
-            # Overextension penalty
-            recent_move = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
-            if recent_move > last["close"] * 0.01:
-                trade_score -= 15
-
-        
-         # inside scoring block
-        if rng < 80:
-            trade_score -= 20
-            
-        if trade_score < 25:
-            continue
-        
-        print(f"🎯 Trade Score: {trade_score}")
-        if strong_trend and trade_score > 70:
-            print("🚀 High quality trade — priority execution")
-        
-       
-
-            
         # -----------------------------
-        # SESSION LOGIC
+        # SCORING
+        # -----------------------------
+        body = abs(last["close"] - last["open"])
+        rng = last["high"] - last["low"]
+        trade_score = 0
+
+        move = abs(last["close"] - prev["close"])
+        if move > last["close"] * 0.003:
+            trade_score += 20
+
+        if rng > 0 and body > rng * 0.5:
+            trade_score += 20
+
+        vol_ma = df["volume"].rolling(5).mean().iloc[-1]
+        if last["volume"] > vol_ma:
+            trade_score += 20
+
+        if trend:
+            trade_score += 20
+
+        recent_move = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
+        if recent_move > last["close"] * 0.01:
+            trade_score -= 15
+
+        # ✅ SAFE RANGE CHECK (FIXED)
+        if rng < last["close"] * 0.002:
+            trade_score -= 20
+
+        print(f"🎯 Score: {trade_score}")
+
+        # ✅ RELAXED FILTER
+        if trade_score < 22:
+            continue
+
+        # -----------------------------
+        # SESSION
         # -----------------------------
         session_cfg = get_session_config("NIFTY")
-
         if not session_cfg:
             time.sleep(60)
             continue
 
-        print(f"🕒 NIFTY Session: {get_market_session('NIFTY')}")
-
-        # -----------------------------
-        # HIGH PROBABILITY FILTER
-        # -----------------------------
         confidence = get_trade_confidence(config.NIFTY_TOKEN, signal, df, strong_trend)
-        
-        if not trend  and confidence < 60:
-            continue
 
+        if not trend and confidence < 60:
+            continue
 
         if confidence < session_cfg["min_conf"]:
-            print("❌ Low confidence (session)")
             time.sleep(10)
             continue
-        
+
+        print(f"Confidence: {confidence}")
 
         # -----------------------------
         # FAST FILTERS
         # -----------------------------
         if signal == last_signal_nifty:
-            time.sleep(10)
             continue
 
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
-            time.sleep(10)
             continue
-
-        # -----------------------------
-        # HEAVY FILTERS
-        # -----------------------------
-        #if is_news_volatility(config.NIFTY_TOKEN):
-        #    time.sleep(20)
-        #    continue
 
         if not confirm_entry(config.NIFTY_TOKEN, signal, df):
-            time.sleep(10)
             continue
-            
-        #if is_false_breakout(config.NIFTY_TOKEN, signal):
-        #    print("🚫 False breakout — skipping")
-        #    time.sleep(10)
-        #    continue
-
-        #if is_reversal_trap(config.NIFTY_TOKEN, signal):
-        #    time.sleep(10)
-        #    continue
 
         # -----------------------------
-        # FIND OPTION
+        # WEAK CANDLE FILTER
         # -----------------------------
-        # 🚫 Skip weak candles
+        if rng > 0 and body < rng * 0.3:
+            print("🚫 Weak candle")
+            continue
 
-        if df is not None:
-            last = df.iloc[-1]
-            body = abs(last["close"] - last["open"])
-            rng = last["high"] - last["low"]
-
-            if rng > 0 and body < rng * 0.3:
-                print("🚫 Weak candle — skipping trade")
-                continue
-        
+        # -----------------------------
+        # OPTION
+        # -----------------------------
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
+        print(f"Selected: {symbol}, Lot: {lot}")
+
         if not symbol or not price or lot is None:
-            print("❌ Invalid option — skipping")
-            time.sleep(10)
             continue
 
-        # Reduce size in weak trend
+        # -----------------------------
+        # LOT SIZE
+        # -----------------------------
         if not strong_trend:
             lot = 1
-
-        # High confidence boost
-        # 🚀 Micro position scaling (ADD HERE)
 
         if strong_trend:
             if confidence > 90:
                 lot = int(lot * 1.8)
             elif confidence > 80:
                 lot = int(lot * 1.5)
-            
+
         lot = int(lot * session_cfg["lot_mult"])
         lot = min(lot, config.MAX_LOTS)
         lot = max(1, lot)
-        
-        # 🚀 ELITE TRADE SIZE BOOST (ADD HERE)
 
-        lot = min(lot, config.MAX_LOTS)
         if strong_trend and trade_score > 70:
-            print("🚀 Increasing lot for elite trade")
             lot = min(int(lot * 1.2), config.MAX_LOTS)
-            
-        
 
         # -----------------------------
-        # PLACE ORDER
+        # ENTRY TIMING
         # -----------------------------
-        
-        # 🔥 MICRO TIMING (MOVE HERE)
-
         ltp1 = safe_ltp(f"{exchange}:{symbol}")
         time.sleep(0.3)
         ltp2 = safe_ltp(f"{exchange}:{symbol}")
@@ -1387,9 +1328,11 @@ def nifty_loop():
         if signal == "PUT" and ltp2 > ltp1:
             continue
 
-        # 🔒 FINAL LOT SAFETY (VERY IMPORTANT)
-        lot = min(lot, config.MAX_LOTS)
-        # ✅ THEN PLACE ORDER
+        # -----------------------------
+        # ORDER
+        # -----------------------------
+        print(f"🚀 Placing NIFTY order: {symbol}, lot: {lot}")
+
         filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
         if filled_price:
@@ -1401,62 +1344,49 @@ def nifty_loop():
                 args=(symbol, filled_price, lot, exchange, "NIFTY"),
                 daemon=True
             ).start()
-            
-        # 🔁 Re-entry logic (trend continuation)
-        if win_streak >= 2 and strong_trend and time.time() - last_trade_time_nifty > 120:
-            print("🔁 Re-entry allowed")
-            last_signal_nifty = None
-            
+
         time.sleep(1)
 
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
-    global last_analysis_time
-    global report_sent_today
-    
+    global last_analysis_time, report_sent_today
+
     print("🔥 CRUDE LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
         adjust_strategy()
         last_analysis_time = time.time()
-        
+
     if last_reset_date != datetime.date.today():
         reset_daily_pnl()
 
     while True:
-        
         now = datetime.datetime.now(IST)
         print("💓 CRUDE LOOP RUNNING")
-        
-        # 🚨 HARD STOP (ADD HERE)
+
+        # 🚨 HARD STOP
         if portfolio_pnl < HARD_STOP_LOSS:
             print("🚨 HARD STOP ACTIVATED — CRUDE")
             send_message("🚨 HARD STOP — Trading stopped (CRUDE)")
             break
-            
+
         df = get_cached_data(config.CRUDE_TOKEN, "5minute", 20)
 
-        
-        # ⏰ Avoid low edge hours
-       
+        # ⏰ Skip weak hours
         if 12 <= now.hour < 13:
-            print("⏳ Low edge time — skipping")
             time.sleep(60)
             continue
 
         if now.hour == 9 and now.minute < 20:
-            print("⏳ Skipping opening volatility")
             time.sleep(60)
             continue
-        
-        # Send report at 11 PM
+
+        # 📊 Daily report
         if now.hour == 23 and not report_sent_today:
             send_daily_report()
             report_sent_today = True
 
-        # -----------------------------
-        # MARKET TIME (MCX)
-        # -----------------------------
+        # 🕒 Market time
         if not (9 <= now.hour < 23):
             time.sleep(60)
             continue
@@ -1468,194 +1398,156 @@ def crude_loop():
         if not can_trade():
             time.sleep(30)
             continue
-            
+
         if risk_off:
             print("🛑 Risk OFF active")
             time.sleep(60)
             continue
-            
-            
 
-        # 🔥 TREND CACHE
+        # -----------------------------
+        # DATA SAFETY (🔥 CRITICAL FIX)
+        # -----------------------------
+        if df is None or len(df) < 5:
+            print("⚠️ Not enough data — skipping")
+            time.sleep(5)
+            continue
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # -----------------------------
+        # TREND
+        # -----------------------------
         trend = is_market_trending(config.CRUDE_TOKEN)
         strong_trend = is_strong_trend_day(config.CRUDE_TOKEN)
-        
 
-        rng = 100  # safe default
+        # -----------------------------
+        # SCORING
+        # -----------------------------
+        body = abs(last["close"] - last["open"])
+        rng = last["high"] - last["low"]
         trade_score = 0
 
-        # -----------------------------
-        # 🧠 SCORING FIRST
-        # -----------------------------
-        if df is not None and len(df) >= 5:
+        move = abs(last["close"] - prev["close"])
+        if move > last["close"] * 0.003:
+            trade_score += 20
 
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
+        if rng > 0 and body > rng * 0.5:
+            trade_score += 20
 
-            body = abs(last["close"] - last["open"])
-            rng = last["high"] - last["low"]
+        vol_ma = df["volume"].rolling(5).mean().iloc[-1]
+        if last["volume"] > vol_ma:
+            trade_score += 20
 
-            # 1. Momentum
-            move = abs(last["close"] - prev["close"])
-            if move > last["close"] * 0.003:
-                trade_score += 20
+        if trend:
+            trade_score += 20
 
-            # 2. Strong candle
-            if rng > 0 and body > rng * 0.5:
-                trade_score += 20
+        recent_move = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
+        if recent_move > last["close"] * 0.01:
+            trade_score -= 15
 
-            # 3. Volume
-            vol_ma = df["volume"].rolling(5).mean().iloc[-1]
-            if last["volume"] > vol_ma:
-                trade_score += 20
-
-            # 4. Trend
-            if trend:
-                trade_score += 20
-
-            # Overextension penalty
-            recent_move = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
-            if recent_move > last["close"] * 0.01:
-                trade_score -= 15
-
-        # -----------------------------
-        # ⚠️ APPLY RANGE PENALTY LAST
-        # -----------------------------
+        # ✅ SAFE RANGE CHECK
         if rng < last["close"] * 0.002:
             trade_score -= 20
 
+        # -----------------------------
+        # SIGNAL
+        # -----------------------------
         signal = multi_strategy_signal(config.CRUDE_TOKEN, "CRUDE")
+        crude_sig = get_crude_signal(config.CRUDE_TOKEN)
+
+        print(f"Signal: {signal}, Score: {trade_score}")
+
         if signal == "HOLD":
             time.sleep(5)
             continue
 
-        crude_sig = get_crude_signal(config.CRUDE_TOKEN)
-
-        
-        # ✅ FINAL DECISION (ADD HERE)
-
-        if trade_score < 25:
-            continue
-            
-         
-            
         # -----------------------------
-        # SESSION LOGIC
+        # RELAXED SCORE FILTER
+        # -----------------------------
+        if trade_score < 22:
+            print("🚫 Low score")
+            continue
+
+        # -----------------------------
+        # SESSION
         # -----------------------------
         session_cfg = get_session_config("CRUDE")
-
         if not session_cfg:
             time.sleep(60)
             continue
 
-        print(f"🕒 CRUDE Session: {get_market_session('CRUDE')}")
-
-        # -----------------------------
-        # HIGH PROBABILITY FILTER
-        # -----------------------------
         confidence = get_trade_confidence(config.CRUDE_TOKEN, signal, df, strong_trend)
-        
-        # Boost confidence
+
         if crude_sig == signal:
             confidence += 10
 
-        # Reject conflicts
+        # ⚠️ RELAXED CONFLICT (IMPORTANT FIX)
         if crude_sig != "HOLD" and crude_sig != signal:
-            print("🚫 CRUDE mismatch — skipping")
-            
-        
+            print("⚠️ Signal conflict — allowing")
+
         if not trend and confidence < 60:
             continue
 
         if confidence < session_cfg["min_conf"]:
-            print("❌ Low confidence (session)")
+            print("❌ Low confidence")
             time.sleep(10)
             continue
-        
+
+        print(f"Confidence: {confidence}")
 
         # -----------------------------
         # FAST FILTERS
         # -----------------------------
         if signal == last_signal_crude:
-            time.sleep(10)
             continue
 
         if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
-            time.sleep(10)
             continue
-
-        # -----------------------------
-        # HEAVY FILTERS
-        # -----------------------------
-        #if is_news_volatility(config.CRUDE_TOKEN):
-        #    time.sleep(20)
-        #    continue
-            
-        
 
         if not confirm_entry(config.CRUDE_TOKEN, signal, df):
-            time.sleep(10)
             continue
-            
-        #if is_false_breakout(config.CRUDE_TOKEN, signal):
-        #    print("🚫 False breakout — skipping")
-        #    time.sleep(10)
-        #    continue
-
-        #if is_reversal_trap(config.CRUDE_TOKEN, signal):
-        #    time.sleep(10)
-        #    continue
 
         # -----------------------------
-        # FIND OPTION
+        # WEAK CANDLE FILTER
         # -----------------------------
-        
-        # 🚫 Skip weak candles
+        if rng > 0 and body < rng * 0.3:
+            print("🚫 Weak candle")
+            continue
 
-        if df is not None:
-            last = df.iloc[-1]
-            body = abs(last["close"] - last["open"])
-            rng = last["high"] - last["low"]
-
-            if rng > 0 and body < rng * 0.3:
-                print("🚫 Weak candle — skipping trade")
-                continue
-        
+        # -----------------------------
+        # OPTION
+        # -----------------------------
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
+        print(f"Selected Option: {symbol}, Price: {price}, Lot: {lot}")
+
         if not symbol or not price or lot is None:
-            print("❌ Invalid option — skipping")
-            time.sleep(10)
+            print("❌ Invalid option")
             continue
 
-        # Reduce size in weak trend
+        # -----------------------------
+        # LOT SIZE
+        # -----------------------------
         if not strong_trend:
             lot = 1
-
-        # High confidence boost
-        # 🚀 Micro position scaling (ADD HERE)
 
         if strong_trend:
             if confidence > 90:
                 lot = int(lot * 1.8)
             elif confidence > 80:
                 lot = int(lot * 1.5)
-            
+
         lot = int(lot * session_cfg["lot_mult"])
         lot = min(lot, config.MAX_LOTS)
         lot = max(1, lot)
-        
-        # 🚀 ELITE TRADE SIZE BOOST
-        lot = min(lot, config.MAX_LOTS)
+
         if strong_trend and trade_score > 70:
-            print("🚀 Increasing lot for elite trade")
             lot = min(int(lot * 1.2), config.MAX_LOTS)
 
         # -----------------------------
-        # PLACE ORDER
+        # ENTRY TIMING
         # -----------------------------
-        # 🔥 MICRO TIMING BEFORE ENTRY (FIXED)
-
         ltp1 = safe_ltp(f"{exchange}:{symbol}")
         time.sleep(0.3)
         ltp2 = safe_ltp(f"{exchange}:{symbol}")
@@ -1664,15 +1556,18 @@ def crude_loop():
             continue
 
         if signal == "CALL" and ltp2 < ltp1 * 0.995:
-            print("🚫 Weak momentum — skip entry")
+            print("🚫 Weak CALL momentum")
             continue
 
         if signal == "PUT" and ltp2 > ltp1:
-            print("🚫 Weak momentum — skip entry")
+            print("🚫 Weak PUT momentum")
             continue
 
-        # ✅ THEN PLACE ORDER
-        lot = min(lot, config.MAX_LOTS)
+        # -----------------------------
+        # ORDER
+        # -----------------------------
+        print(f"🚀 Placing order: {symbol}, lot: {lot}")
+
         filled_price = place_order(symbol, lot, exchange, "CRUDE")
 
         if filled_price:
@@ -1684,18 +1579,10 @@ def crude_loop():
                 args=(symbol, filled_price, lot, exchange, "CRUDE"),
                 daemon=True
             ).start()
-            
-        if win_streak >= 2 and strong_trend and time.time() - last_trade_time_crude > 120:
-            print("🔁 Re-entry allowed")
-            last_signal_crude = None
-            
-        print(f"Selected Option: {symbol}, Price: {price}, Lot: {lot}")
-        print(f"Signal: {signal}")
-        print(f"Crude Signal: {crude_sig}")
-        print(f"Score: {trade_score}")
-        print(f"Confidence: {confidence}")
-            
+
         time.sleep(1)
+
+
         
 def get_strike_mode(token):
 

@@ -19,7 +19,7 @@ kite.set_access_token(config.ACCESS_TOKEN)
 # MODEL CONFIG
 # -----------------------------
 MODEL_PATH = "ml_model.pkl"
-MODEL_URL = "https://drive.google.com/uc?export=download&id=1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc"   # <-- paste your Google Drive direct link
+MODEL_URL = "https://drive.google.com/file/d/1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc/view?usp=drive_link"   # <-- paste your Google Drive direct link
 
 
 # -----------------------------

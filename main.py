@@ -1153,6 +1153,11 @@ def nifty_loop():
 
         df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
         print(f"DF: {df}")
+            
+        if df is None or df.empty:
+            print("❌ EMPTY DATA — SKIPPING")
+            time.sleep(5)
+            continue
         
         if df is None:
             print("❌ DATA FETCH FAILED")
@@ -1380,6 +1385,11 @@ def crude_loop():
 
         df = get_cached_data(config.CRUDE_TOKEN, "5minute", 20)
         print(f"DF: {df}")
+        
+        if df is None or df.empty:
+            print("❌ EMPTY DATA — SKIPPING")
+            time.sleep(5)
+            continue
             
         if df is None:
             print("❌ DATA FETCH FAILED")
@@ -2321,37 +2331,27 @@ def is_low_range_market(token):
         return True
         
         
-def get_cached_data(token, interval, duration_minutes):
+def get_cached_data(token, interval, duration):
 
-    global data_cache
-    
-    print(f"📊 Fetching data for {token}")
-
-    key = f"{token}_{interval}_{duration_minutes}"
-    now = time.time()
-
-    # Return cached if valid
-    if key in data_cache:
-        cached_time, df = data_cache[key]
-        if now - cached_time < CACHE_TTL:
-            return df
-
-    # Fetch new data
     try:
-        df = pd.DataFrame(kite.historical_data(
-            token,
-            datetime.datetime.now() - datetime.timedelta(minutes=duration_minutes),
-            datetime.datetime.now(),
-            interval
-        ))
+        now = datetime.datetime.now(IST)
+        from_time = now - datetime.timedelta(minutes=duration * 5)
 
-        data_cache[key] = (now, df)
+        data = kite.historical_data(
+            token,
+            from_time,
+            now,
+            interval
+        )
+
+        df = pd.DataFrame(data)
+
+        print(f"📊 Data length: {len(df)}")
+
         return df
-        
-        print(f"📊 Data length: {len(df) if df is not None else 'None'}")
 
     except Exception as e:
-        print("Cache fetch error:", e)
+        print("❌ Data fetch error:", e)
         return None
         
         

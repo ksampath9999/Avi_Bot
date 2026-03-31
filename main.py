@@ -14,7 +14,7 @@ import json
 
 bot_started = False
 lock = threading.Lock()
-
+IST = pytz.timezone("Asia/Kolkata")
 kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
@@ -2335,7 +2335,9 @@ def get_cached_data(token, interval, duration):
 
     try:
         now = datetime.datetime.now(IST)
-        from_time = now - datetime.timedelta(minutes=duration * 5)
+
+        # 🔥 IMPORTANT: use 1 day range (fix empty data)
+        from_time = now - datetime.timedelta(days=1)
 
         data = kite.historical_data(
             token,

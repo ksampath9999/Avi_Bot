@@ -79,6 +79,8 @@ QUOTE_TTL = 2
 CRUDE_TOKEN = None
 NIFTY_FUT_TOKEN = None
 
+ml_cache = {"time": 0, "data": None}
+ML_CACHE_TTL = 2  # seconds
 
 
 def get_nifty_fut_token():
@@ -250,18 +252,7 @@ def can_trade():
 
     return True
 
-# -----------------------------
-# ML SIGNAL
-# -----------------------------
-def ml_signal():
-    try:
-        data = requests.get(SIGNAL_URL, timeout=1).json()
-        sig = data.get("signal", "HOLD")
-        if sig in ["CALL", "PUT"]:
-            return sig
-    except:
-        pass
-    return "HOLD"
+
 
 # -----------------------------
 # NIFTY STRATEGIES
@@ -319,6 +310,8 @@ def get_crude_signal(token):
 
         if len(df) < 20:
             return "HOLD"
+            
+        df = df.copy()
 
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
         df["vol_ma"] = df["volume"].rolling(10).mean()
@@ -1265,27 +1258,16 @@ def nifty_loop():
         # -----------------------------
         # SIGNAL (FIXED POSITION)
         # -----------------------------
-        signal = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+        signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+
+        if ml_conf < 60:
+            print("⚠️ Weak ML — skipping")
+            continue
+       
 
         if signal == "HOLD":
             time.sleep(5)
             continue
-
-        # -----------------------------
-        # FUTURE CONFIRMATION (FIXED)
-        # -----------------------------
-        if NIFTY_FUT_TOKEN:
-            fut_df = get_cached_data(NIFTY_FUT_TOKEN, "5minute", 20)
-
-            if fut_df is not None and len(fut_df) > 5:
-                fut_last = fut_df.iloc[-1]
-                fut_prev = fut_df.iloc[-2]
-
-                if signal == "CALL" and fut_last["close"] < fut_prev["close"]:
-                    confidence -= 5   # don't block, just reduce strength
-
-                if signal == "PUT" and fut_last["close"] > fut_prev["close"]:
-                    confidence -= 5
 
         # -----------------------------
         # SCORING
@@ -1308,16 +1290,11 @@ def nifty_loop():
         if trend:
             trade_score += 20
 
-        recent_move = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
-        if recent_move > last["close"] * 0.01:
-            trade_score -= 15
-
-        if rng < last["close"] * 0.002:
-            trade_score -= 20
+        
 
         print(f"🎯 Score: {trade_score}")
 
-        if trade_score < 18:
+        if trade_score < 15:
             continue
 
         # -----------------------------
@@ -1331,6 +1308,19 @@ def nifty_loop():
         confidence = get_trade_confidence(
             config.NIFTY_TOKEN, signal, df, strong_trend
         )
+        
+        if NIFTY_FUT_TOKEN:
+            fut_df = get_cached_data(NIFTY_FUT_TOKEN, "5minute", 20)
+
+            if fut_df is not None and len(fut_df) > 5:
+                fut_last = fut_df.iloc[-1]
+                fut_prev = fut_df.iloc[-2]
+
+                if signal == "CALL" and fut_last["close"] < fut_prev["close"]:
+                    confidence -= 5
+
+                if signal == "PUT" and fut_last["close"] > fut_prev["close"]:
+                    confidence -= 5
 
         # ✅ FUTURE VOLUME BOOST (FIXED POSITION)
         if NIFTY_FUT_TOKEN and 'fut_df' in locals() and fut_df is not None:
@@ -1341,10 +1331,7 @@ def nifty_loop():
             except:
                 pass
 
-        if not trend and confidence < 60:
-            continue
-
-        if confidence < (session_cfg["min_conf"] - 5):
+        if confidence < session_cfg["min_conf"]:
             continue
 
         print(f"Confidence: {confidence}")
@@ -1361,12 +1348,6 @@ def nifty_loop():
         if not confirm_entry(config.NIFTY_TOKEN, signal, df):
             continue
 
-        # -----------------------------
-        # WEAK CANDLE FILTER
-        # -----------------------------
-        if rng > 0 and body < rng * 0.3:
-            print("🚫 Weak candle")
-            continue
 
         # -----------------------------
         # OPTION SELECTION
@@ -1391,6 +1372,15 @@ def nifty_loop():
         lot = int(lot * session_cfg["lot_mult"])
         lot = min(lot, config.MAX_LOTS)
         lot = max(1, lot)
+        
+        # 🚀 Confidence-based lot boost
+        if ml_conf > 90:
+            lot = int(lot * 2)
+        elif ml_conf > 80:
+            lot = int(lot * 1.5)
+       
+
+
 
         # -----------------------------
         # ENTRY TIMING
@@ -1402,7 +1392,7 @@ def nifty_loop():
         if ltp1 is None or ltp2 is None:
             continue
 
-        if signal == "CALL" and ltp2 < ltp1 * 0.997:
+        if signal == "CALL" and ltp2 < ltp1:
             continue
 
         if signal == "PUT" and ltp2 > ltp1:
@@ -1529,17 +1519,17 @@ def crude_loop():
         if trend:
             trade_score += 20
 
-        recent_move = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
-        if recent_move > last["close"] * 0.01:
-            trade_score -= 15
-
-        if rng < last["close"] * 0.002:
-            trade_score -= 20
+        
 
         # -----------------------------
         # SIGNAL
         # -----------------------------
-        signal = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
+        signal, ml_conf = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
+
+        if ml_conf < 60:
+            print("⚠️ Weak ML — skipping")
+            continue
+        
         crude_sig = get_crude_signal(CRUDE_TOKEN)
 
         print(f"🎯 Signal: {signal}, Score: {trade_score}")
@@ -1551,7 +1541,7 @@ def crude_loop():
         # -----------------------------
         # RELAXED SCORE
         # -----------------------------
-        if trade_score < 18:
+        if trade_score < 15:
             print("🚫 Low score")
             continue
 
@@ -1575,12 +1565,9 @@ def crude_loop():
         if crude_sig != "HOLD" and crude_sig != signal:
             print("⚠️ Signal conflict — allowing")
 
-        # ✅ RELAXED TREND FILTER
-        if not trend and confidence < 55:
-            continue
 
         # ✅ RELAXED CONFIDENCE
-        if confidence < (session_cfg["min_conf"] - 5):
+        if confidence < session_cfg["min_conf"]:
             print("❌ Low confidence")
             time.sleep(10)
             continue
@@ -1600,12 +1587,6 @@ def crude_loop():
         if not confirm_entry(CRUDE_TOKEN, signal, df):
             print("⚠️ Weak confirmation — allowing")
 
-        # -----------------------------
-        # WEAK CANDLE FILTER
-        # -----------------------------
-        if rng > 0 and body < rng * 0.3:
-            print("🚫 Weak candle")
-            continue
 
         # -----------------------------
         # OPTION SELECTION
@@ -1633,6 +1614,13 @@ def crude_loop():
         lot = int(lot * session_cfg["lot_mult"])
         lot = min(lot, config.MAX_LOTS)
         lot = max(1, lot)
+        
+        # 🚀 Confidence-based lot boost
+        if ml_conf > 90:
+            lot = int(lot * 2)
+        elif ml_conf > 80:
+            lot = int(lot * 1.5)
+        
 
         if strong_trend and trade_score > 70:
             lot = min(int(lot * 1.2), config.MAX_LOTS)
@@ -1647,8 +1635,7 @@ def crude_loop():
         if ltp1 is None or ltp2 is None:
             continue
 
-        if signal == "CALL" and ltp2 < ltp1 * 0.997:
-            print("🚫 Weak CALL momentum")
+        if signal == "CALL" and ltp2 < ltp1:
             continue
 
         if signal == "PUT" and ltp2 > ltp1:
@@ -1769,7 +1756,9 @@ def confirm_entry(token, signal, df=None):
 
         if df is None or len(df) < 10:
             return False
-
+            
+            
+        df = df.copy()
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
         last = df.iloc[-1]
@@ -1933,6 +1922,8 @@ def is_news_volatility(token):
 
         if len(df) < 10:
             return False
+            
+        df = df.copy()
 
         # Candle range
         df["range"] = df["high"] - df["low"]
@@ -2002,6 +1993,7 @@ def get_trade_confidence(token, signal, df=None, strong_trend=False):
         if df is None or len(df) < 10:
             return 0
 
+        df = df.copy()
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
         df["vol_ma"] = df["volume"].rolling(5).mean()
 
@@ -2051,6 +2043,8 @@ def is_false_breakout(token, signal):
         df = get_cached_data(token, "5minute", 30)
         if df is None or len(df) < 10:
             return False
+            
+        df = df.copy()
 
         df["vol_ma"] = df["volume"].rolling(5).mean()
 
@@ -2155,6 +2149,8 @@ def vwap_signal(token):
         df = get_cached_data(token, "5minute", 30)
         if df is None or len(df) < 10:
             return "HOLD"
+            
+        df = df.copy()    
 
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
         last = df.iloc[-1]
@@ -2213,38 +2209,56 @@ def pullback_signal(token):
     except:
         return "HOLD"
         
+def get_ml_cached():
+    global ml_cache
+
+    now = time.time()
+
+    if ml_cache["data"] and (now - ml_cache["time"] < ML_CACHE_TTL):
+        return ml_cache["data"]
+
+    try:
+        data = requests.get(SIGNAL_URL, timeout=1).json()
+        ml_cache["time"] = now
+        ml_cache["data"] = data
+        return data
+    except:
+        return None
         
 
-def get_ml_signal():
-    try:
-        res = requests.get("http://127.0.0.1:10000/signal", timeout=1)
-        return res.json().get("signal", "HOLD")
-    except:
-        return "HOLD"
         
 def multi_strategy_signal(token, instrument):
 
     signals = []
+    ml_conf = 50
 
     signals.append(vwap_signal(token))
     signals.append(breakout_signal(token))
     signals.append(pullback_signal(token))
 
-    ml = get_ml_signal()
-    if ml != "HOLD":
-        signals.append(ml)
+    try:
+        data = get_ml_cached()
+
+        if data:
+            ml_signal = data.get("signal", "HOLD")
+            ml_conf = data.get("confidence", 50)
+
+            if ml_conf > 60:
+                signals.append(ml_signal)
+
+    except:
+        pass
 
     call_count = signals.count("CALL")
     put_count = signals.count("PUT")
 
-    # Relaxed logic (IMPORTANT)
     if call_count >= 2:
-        return "CALL"
+        return "CALL", ml_conf
 
     if put_count >= 2:
-        return "PUT"
+        return "PUT", ml_conf
 
-    return "HOLD"
+    return "HOLD", ml_conf
     
 def analyze_performance():
 
@@ -2381,10 +2395,19 @@ def is_low_range_market(token):
         
 def get_cached_data(token, interval, duration):
 
+    global data_cache
+
+    key = f"{token}_{interval}"
+
+    now_ts = time.time()
+
+    if key in data_cache:
+        ts, df = data_cache[key]
+        if now_ts - ts < CACHE_TTL:
+            return df
+
     try:
         now = datetime.datetime.now()
-
-        # ✅ USE WIDE RANGE (WORKS ALWAYS)
         from_time = now - datetime.timedelta(days=2)
 
         data = kite.historical_data(
@@ -2396,10 +2419,7 @@ def get_cached_data(token, interval, duration):
 
         df = pd.DataFrame(data)
 
-        print(f"📊 Data length: {len(df)}")
-        print("FROM:", from_time)
-        print("TO:", now)
-        print("RAW:", data[:2])
+        data_cache[key] = (now_ts, df)
 
         return df
 

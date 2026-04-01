@@ -1449,20 +1449,27 @@ def crude_loop():
             send_message("🚨 HARD STOP — Trading stopped (CRUDE)")
             break
 
+        # -----------------------------
+        # DATA FETCH
+        # -----------------------------
         df = get_cached_data(CRUDE_TOKEN, "5minute", 20)
-        print(f"DF: {df}")
-        
+
         if df is None or df.empty:
             print("❌ EMPTY DATA — SKIPPING")
             time.sleep(5)
             continue
-            
-        if df is None:
-            print("❌ DATA FETCH FAILED")
+
+        if len(df) < 5:
+            print("⚠️ Not enough candles")
             time.sleep(5)
             continue
 
-        # ⏰ Skip weak hours
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # -----------------------------
+        # TIME FILTERS (FIXED)
+        # -----------------------------
         if 12 <= now.hour < 13:
             time.sleep(60)
             continue
@@ -1471,15 +1478,15 @@ def crude_loop():
             time.sleep(60)
             continue
 
+        # ✅ CRUDE FULL SESSION
+        if not (9 <= now.hour <= 23):
+            time.sleep(60)
+            continue
+
         # 📊 Daily report
         if now.hour == 23 and not report_sent_today:
             send_daily_report()
             report_sent_today = True
-
-        # 🕒 Market time
-        if not (9 <= now.hour < 23):
-            time.sleep(60)
-            continue
 
         if crude_active:
             time.sleep(5)
@@ -1495,21 +1502,10 @@ def crude_loop():
             continue
 
         # -----------------------------
-        # DATA SAFETY (🔥 CRITICAL FIX)
+        # TREND (OPTIMIZED)
         # -----------------------------
-        if df is None or len(df) < 3:
-            print("⚠️ Low data but continuing")
-            time.sleep(5)
-            continue
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        # -----------------------------
-        # TREND
-        # -----------------------------
-        trend = is_market_trending(CRUDE_TOKEN)
-        strong_trend = is_strong_trend_day(CRUDE_TOKEN)
+        trend = is_market_trending(CRUDE_TOKEN, df)
+        strong_trend = is_strong_trend_day(CRUDE_TOKEN, df)
 
         # -----------------------------
         # SCORING
@@ -1536,7 +1532,6 @@ def crude_loop():
         if recent_move > last["close"] * 0.01:
             trade_score -= 15
 
-        # ✅ SAFE RANGE CHECK
         if rng < last["close"] * 0.002:
             trade_score -= 20
 
@@ -1546,21 +1541,21 @@ def crude_loop():
         signal = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
         crude_sig = get_crude_signal(CRUDE_TOKEN)
 
-        print(f"Signal: {signal}, Score: {trade_score}")
+        print(f"🎯 Signal: {signal}, Score: {trade_score}")
 
         if signal == "HOLD":
             time.sleep(5)
             continue
 
         # -----------------------------
-        # RELAXED SCORE FILTER
+        # RELAXED SCORE
         # -----------------------------
         if trade_score < 18:
             print("🚫 Low score")
             continue
 
         # -----------------------------
-        # SESSION
+        # SESSION CONFIG
         # -----------------------------
         session_cfg = get_session_config("CRUDE")
         if not session_cfg:
@@ -1569,16 +1564,21 @@ def crude_loop():
 
         confidence = get_trade_confidence(CRUDE_TOKEN, signal, df, strong_trend)
 
+        # ✅ SIGNAL BOOST
         if crude_sig == signal:
             confidence += 10
 
-        # ⚠️ RELAXED CONFLICT (IMPORTANT FIX)
+        # ✅ SMALL BOOST (NO ML fallback)
+        confidence += 3
+
         if crude_sig != "HOLD" and crude_sig != signal:
             print("⚠️ Signal conflict — allowing")
 
-        if not trend and confidence < 60:
+        # ✅ RELAXED TREND FILTER
+        if not trend and confidence < 55:
             continue
 
+        # ✅ RELAXED CONFIDENCE
         if confidence < (session_cfg["min_conf"] - 5):
             print("❌ Low confidence")
             time.sleep(10)
@@ -1595,8 +1595,9 @@ def crude_loop():
         if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
             continue
 
+        # ✅ SOFT CONFIRMATION (FIXED)
         if not confirm_entry(CRUDE_TOKEN, signal, df):
-            continue
+            print("⚠️ Weak confirmation — allowing")
 
         # -----------------------------
         # WEAK CANDLE FILTER
@@ -1606,7 +1607,7 @@ def crude_loop():
             continue
 
         # -----------------------------
-        # OPTION
+        # OPTION SELECTION
         # -----------------------------
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
@@ -1671,7 +1672,6 @@ def crude_loop():
             ).start()
 
         time.sleep(1)
-
 
         
 def get_strike_mode(token):

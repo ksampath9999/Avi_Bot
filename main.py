@@ -519,8 +519,14 @@ def get_instruments_cached(exchange):
 # -----------------------------
 def find_option(signal, instrument):
 
-    print(f"DEBUG OPTION → {symbol}, {price}, {lot}")
+    symbol = None
+    price = None
+    lot = None
+    exchange = None
 
+    # -----------------------------
+    # CONFIG
+    # -----------------------------
     if instrument == "NIFTY":
         exchange = "NFO"
         name = "NIFTY"
@@ -535,11 +541,17 @@ def find_option(signal, instrument):
         token = CRUDE_TOKEN
         token_symbol = f"{exchange}:CRUDEOIL"
         lot_size = 100
-        
-    df = get_cached_data(token, "5minute", 15)
 
     # -----------------------------
-    # GET LTP
+    # FETCH DATA (SAFE)
+    # -----------------------------
+    df = get_cached_data(token, "5minute", 15)
+    if df is None or df.empty:
+        print("❌ No data for option scoring")
+        return None, None, None, None
+
+    # -----------------------------
+    # LTP
     # -----------------------------
     ltp = safe_ltp(token_symbol)
     if ltp is None:
@@ -594,11 +606,9 @@ def find_option(signal, instrument):
     candidates = []
 
     # -----------------------------
-    # MAIN LOOP
+    # MAIN SELECTION
     # -----------------------------
     for strike in strikes:
-
-        print(f"🔍 Trying strike: {strike}")
 
         for i in opts:
 
@@ -616,35 +626,24 @@ def find_option(signal, instrument):
             if s != strike:
                 continue
 
-            symbol = f"{exchange}:{i['tradingsymbol']}"
+            sym = f"{exchange}:{i['tradingsymbol']}"
+            p = safe_ltp(sym)
 
-            price = safe_ltp(symbol)
-
-            if price is None:
-                print(f"❌ LTP failed: {symbol}")
+            if p is None:
                 continue
-
-            print(f"Checking: {i['tradingsymbol']} | Price: {price}")
 
             if not is_liquid_option(i["tradingsymbol"], exchange):
-                print("❌ Not liquid")
                 continue
 
-            #if not is_good_spread(i["tradingsymbol"], exchange):
-            #    print("❌ Bad spread")
-            #    continue
-
-            trade_value = price * lot_size
-
+            trade_value = p * lot_size
             if trade_value > max_trade_value * 3:
-                print("❌ Too expensive")
                 continue
 
             score = score_option(i["tradingsymbol"], exchange, token, signal, df)
 
             candidates.append({
                 "symbol": i["tradingsymbol"],
-                "price": price,
+                "price": p,
                 "score": score
             })
 
@@ -660,7 +659,7 @@ def find_option(signal, instrument):
 
         return best["symbol"], best["price"], lot, exchange
 
-    print("🚫 No candidates after filtering")
+    print("🚫 No candidates — fallback")
 
     # -----------------------------
     # FALLBACK
@@ -683,34 +682,32 @@ def find_option(signal, instrument):
 
         if diff < min_diff:
 
-            symbol = f"{exchange}:{i['tradingsymbol']}"
-            price = safe_ltp(symbol)
+            sym = f"{exchange}:{i['tradingsymbol']}"
+            p = safe_ltp(sym)
 
-            if price is None:
+            if p is None:
                 continue
 
             if not is_liquid_option(i["tradingsymbol"], exchange):
                 continue
 
-            #if not is_good_spread(i["tradingsymbol"], exchange):
-            #    continue
-
-            trade_value = price * lot_size
-
+            trade_value = p * lot_size
             if trade_value <= max_trade_value * 3:
                 min_diff = diff
                 best = i["tradingsymbol"]
-                best_price = price
+                best_price = p
 
     if best:
         print(f"✅ Fallback selected: {best} @ {best_price}")
 
-        lot = calculate_lots(best_price, exchange, instrument,strong_trend=False)
+        lot = calculate_lots(best_price, exchange, instrument, strong_trend=False)
 
         return best, best_price, lot, exchange
 
-    print("❌ No strike found even in fallback")
+    print("❌ No valid option found")
+
     return None, None, None, None
+
 # -----------------------------
 # ORDER
 # -----------------------------

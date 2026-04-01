@@ -186,27 +186,28 @@ def safe_ltp(symbol):
 # -----------------------------
 # MARKET FILTERS
 # -----------------------------
-def is_market_trending(token):
+def is_market_trending(token, df=None):
+
     try:
-        now = datetime.datetime.now()
-        df = get_cached_data(token, "5minute", 120)
+        # ✅ Use passed data (FAST)
+        if df is None:
+            df = get_cached_data(token, "5minute", 20)
 
         if df is None or len(df) < 10:
             return False
 
-        df["tr"] = df["high"] - df["low"]
-        df["atr"] = df["tr"].rolling(14).mean()
+        last = df.iloc[-1]
 
-        recent_range = df["high"].max() - df["low"].min()
-        atr = df["atr"].iloc[-1]
+        # Example logic (keep your existing if different)
+        vwap = df["close"].mean()
+        atr = (df["high"] - df["low"]).rolling(5).mean().iloc[-1]
 
-        if atr < 5:
-            return False
-        if recent_range < atr * 3:
-            return False
+        print(f"🔥 Trend Check → VWAP Dist: {abs(last['close'] - vwap)}, ATR: {atr}")
 
-        return True
-    except:
+        return abs(last["close"] - vwap) > atr * 0.5
+
+    except Exception as e:
+        print("Trend error:", e)
         return False
 
 # -----------------------------
@@ -1857,39 +1858,20 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
 
     return lots
 
-def is_strong_trend_day(token):
+def is_strong_trend_day(token, df=None):
 
     try:
-        now = datetime.datetime.now()
-
-        df = get_cached_data(token, "15minute", 120)
+        if df is None:
+            df = get_cached_data(token, "5minute", 20)
 
         if df is None or len(df) < 10:
             return False
 
-        # VWAP
-        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        move = abs(df.iloc[-1]["close"] - df.iloc[0]["close"])
 
-        last = df.iloc[-1]
+        return move > df.iloc[-1]["close"] * 0.01
 
-        # ATR
-        df["range"] = df["high"] - df["low"]
-        atr = df["range"].rolling(14).mean().iloc[-1]
-
-        vwap_distance = abs(last["close"] - last["vwap"])
-
-        print(f"🔥 Trend Check → VWAP Dist: {vwap_distance}, ATR: {atr}")
-
-        # -----------------------------
-        # STRONG TREND CONDITIONS
-        # -----------------------------
-        if vwap_distance > 20 and atr > 25:
-            return True
-
-        return False
-
-    except Exception as e:
-        print("Trend detection error:", e)
+    except:
         return False
         
 def is_reversal_trap(token, signal):

@@ -1284,12 +1284,10 @@ def nifty_loop():
                 fut_prev = fut_df.iloc[-2]
 
                 if signal == "CALL" and fut_last["close"] < fut_prev["close"]:
-                    print("🚫 FUTURE NOT CONFIRMING CALL")
-                    continue
+                    confidence -= 5   # don't block, just reduce strength
 
                 if signal == "PUT" and fut_last["close"] > fut_prev["close"]:
-                    print("🚫 FUTURE NOT CONFIRMING PUT")
-                    continue
+                    confidence -= 5
 
         # -----------------------------
         # SCORING
@@ -1321,7 +1319,7 @@ def nifty_loop():
 
         print(f"🎯 Score: {trade_score}")
 
-        if trade_score < 22:
+        if trade_score < 18:
             continue
 
         # -----------------------------
@@ -1348,7 +1346,7 @@ def nifty_loop():
         if not trend and confidence < 60:
             continue
 
-        if confidence < session_cfg["min_conf"]:
+        if confidence < (session_cfg["min_conf"] - 5):
             continue
 
         print(f"Confidence: {confidence}")
@@ -1406,7 +1404,7 @@ def nifty_loop():
         if ltp1 is None or ltp2 is None:
             continue
 
-        if signal == "CALL" and ltp2 < ltp1 * 0.995:
+        if signal == "CALL" and ltp2 < ltp1 * 0.997:
             continue
 
         if signal == "PUT" and ltp2 > ltp1:
@@ -1560,7 +1558,7 @@ def crude_loop():
         # -----------------------------
         # RELAXED SCORE FILTER
         # -----------------------------
-        if trade_score < 22:
+        if trade_score < 18:
             print("🚫 Low score")
             continue
 
@@ -1584,7 +1582,7 @@ def crude_loop():
         if not trend and confidence < 60:
             continue
 
-        if confidence < session_cfg["min_conf"]:
+        if confidence < (session_cfg["min_conf"] - 5):
             print("❌ Low confidence")
             time.sleep(10)
             continue
@@ -1650,7 +1648,7 @@ def crude_loop():
         if ltp1 is None or ltp2 is None:
             continue
 
-        if signal == "CALL" and ltp2 < ltp1 * 0.995:
+        if signal == "CALL" and ltp2 < ltp1 * 0.997:
             print("🚫 Weak CALL momentum")
             continue
 

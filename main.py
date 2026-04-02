@@ -177,7 +177,13 @@ def safe_ltp(symbol):
 
     for _ in range(2):
         try:
-            price = kite.ltp(symbol)[symbol]["last_price"]
+            data = kite.ltp([symbol])
+
+            if symbol not in data:
+                print("❌ LTP missing for:", symbol)
+                return None
+
+            price = data[symbol]["last_price"]
             ltp_cache[symbol] = (now, price)
             return price
         except:
@@ -508,6 +514,28 @@ def get_instruments_cached(exchange):
         return []
 
 
+def get_crude_fut_symbol():
+    try:
+        instruments = kite.instruments("MCX")
+
+        futures = [
+            inst for inst in instruments
+            if inst["name"] == "CRUDEOIL"
+            and inst["instrument_type"] == "FUT"
+        ]
+
+        futures = sorted(futures, key=lambda x: x["expiry"])
+
+        if futures:
+            symbol = f"MCX:{futures[0]['tradingsymbol']}"
+            print("✅ Selected FUT:", symbol)
+            return symbol
+
+    except Exception as e:
+        print("❌ Crude symbol error:", e)
+
+    return None
+
 # -----------------------------
 # OPTION SELECTOR
 # -----------------------------
@@ -517,6 +545,8 @@ def find_option(signal, instrument):
     price = None
     lot = None
     exchange = None
+    
+    
 
     # -----------------------------
     # CONFIG
@@ -533,8 +563,14 @@ def find_option(signal, instrument):
         name = "CRUDEOIL"
         step = 100
         token = CRUDE_TOKEN
-        token_symbol = f"{exchange}:CRUDEOIL26APRFUT"   # ✅ FIXED
+        token_symbol = get_crude_fut_symbol()
         lot_size = 100
+        
+    print("DEBUG CRUDE SYMBOL:", token_symbol)
+    
+    if instrument == "CRUDE" and not token_symbol:
+        print("❌ CRUDE symbol is None")
+        return None, None, None, None
 
     # -----------------------------
     # FETCH DATA (SAFE)
@@ -545,11 +581,16 @@ def find_option(signal, instrument):
         return None, None, None, None
 
     # -----------------------------
-    # LTP
+    # LTP (FINAL FIX)
     # -----------------------------
+    if instrument == "CRUDE":
+        token_symbol = get_crude_fut_symbol()
+        print("DEBUG CRUDE SYMBOL:", token_symbol)
+
     ltp = safe_ltp(token_symbol)
+
     if ltp is None:
-        print("❌ LTP fetch failed")
+        print("❌ LTP fetch failed:", token_symbol)
         return None, None, None, None
 
     atm = round(ltp / step) * step
@@ -598,6 +639,8 @@ def find_option(signal, instrument):
     opt_type = "CE" if signal == "CALL" else "PE"
 
     candidates = []
+    
+    print(f"ATM: {atm}, Strikes: {strikes}, Expiry: {expiry}")
 
     # -----------------------------
     # MAIN SELECTION
@@ -1173,6 +1216,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument):
 # -----------------------------
 # THREADS
 # -----------------------------
+
 def nifty_loop():
     global nifty_active, last_signal_nifty, last_trade_time_nifty
     global last_analysis_time, report_sent_today
@@ -1200,13 +1244,8 @@ def nifty_loop():
         # -----------------------------
         df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
 
-        if df is None or df.empty:
-            print("❌ EMPTY DATA — SKIPPING NIFTY")
-            time.sleep(5)
-            continue
-
-        if len(df) < 5:
-            print("⚠️ Not enough candles")
+        if df is None or len(df) < 5:
+            print("❌ Data issue — skipping")
             time.sleep(5)
             continue
 
@@ -1214,60 +1253,24 @@ def nifty_loop():
         prev = df.iloc[-2]
 
         # -----------------------------
-        # TIME FILTERS
+        # TIME FILTER
         # -----------------------------
-        if 12 <= now.hour < 13:
+        if 12 <= now.hour < 13 or (now.hour == 9 and now.minute < 20) or (now.hour == 15 and now.minute > 25):
             time.sleep(60)
             continue
 
-        if now.hour == 9 and now.minute < 20:
-            time.sleep(60)
-            continue
-
-        if now.hour == 15 and now.minute > 25:
-            time.sleep(60)
-            continue
-
-        if not (9 <= now.hour < 15 or (now.hour == 15 and now.minute <= 30)):
-            time.sleep(60)
-            continue
-
-        if now.hour == 15 and now.minute >= 30 and not report_sent_today:
-            send_daily_report()
-            report_sent_today = True
-
-        if nifty_active:
-            time.sleep(5)
-            continue
-
-        if not can_trade():
-            time.sleep(30)
-            continue
-
-        if risk_off:
-            print("🛑 Risk OFF active")
-            time.sleep(60)
+        if nifty_active or not can_trade() or risk_off:
+            time.sleep(10)
             continue
 
         # -----------------------------
-        # TREND
-        # -----------------------------
-        trend = is_market_trending(config.NIFTY_TOKEN)
-        strong_trend = is_strong_trend_day(config.NIFTY_TOKEN)
-
-        # -----------------------------
-        # SIGNAL (FIXED POSITION)
+        # SIGNAL
         # -----------------------------
         signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
 
-        if ml_conf < 45:
-            print("⚠️ Weak ML — skipping")
-            print("ML CONF:", ml_conf)
-            continue
-       
+        print(f"🎯 Signal: {signal}, ML: {ml_conf}")
 
         if signal == "HOLD":
-            print("Nifty Signal:", signal)
             time.sleep(5)
             continue
 
@@ -1278,121 +1281,79 @@ def nifty_loop():
         rng = last["high"] - last["low"]
         trade_score = 0
 
-        move = abs(last["close"] - prev["close"])
-        if move > last["close"] * 0.003:
+        if abs(last["close"] - prev["close"]) > last["close"] * 0.003:
             trade_score += 20
 
         if rng > 0 and body > rng * 0.5:
             trade_score += 20
 
-        vol_ma = df["volume"].rolling(5).mean().iloc[-1]
-        if last["volume"] > vol_ma:
+        if last["volume"] > df["volume"].rolling(5).mean().iloc[-1]:
             trade_score += 20
 
-        if trend:
+        if is_market_trending(config.NIFTY_TOKEN):
             trade_score += 20
 
-        
-
-        print(f"🎯 Score: {trade_score}")
+        print("🎯 Score:", trade_score)
 
         if trade_score < 10:
-            print("Trade Score:", trade_score)
             continue
 
         # -----------------------------
-        # SESSION
+        # CONFIDENCE
         # -----------------------------
         session_cfg = get_session_config("NIFTY")
-        if not session_cfg:
-            time.sleep(60)
-            continue
+        confidence = get_trade_confidence(config.NIFTY_TOKEN, signal, df, is_strong_trend_day(config.NIFTY_TOKEN))
 
-        confidence = get_trade_confidence(config.NIFTY_TOKEN, signal, df, strong_trend)
-        confidence += 5
-        
-        if NIFTY_FUT_TOKEN:
-            fut_df = get_cached_data(NIFTY_FUT_TOKEN, "5minute", 20)
+        confidence += 5  # ✅ boost
 
-            if fut_df is not None and len(fut_df) > 5:
-                fut_last = fut_df.iloc[-1]
-                fut_prev = fut_df.iloc[-2]
+        print(f"Confidence: {confidence} (Required: {session_cfg['min_conf']})")
 
-                if signal == "CALL" and fut_last["close"] < fut_prev["close"]:
-                    confidence -= 5
-
-                if signal == "PUT" and fut_last["close"] > fut_prev["close"]:
-                    confidence -= 5
-
-        # ✅ FUTURE VOLUME BOOST (FIXED POSITION)
-        if NIFTY_FUT_TOKEN and 'fut_df' in locals() and fut_df is not None:
-            try:
-                fut_vol_ma = fut_df["volume"].rolling(5).mean().iloc[-1]
-                if fut_last["volume"] > fut_vol_ma:
-                    confidence += 5
-            except:
-                pass
-
-        if confidence < session_cfg["min_conf"] - 3:
-            print("Confidence:", confidence, "Required:", session_cfg["min_conf"])
-            continue
-
-        print(f"Confidence: {confidence}")
+        if confidence < session_cfg["min_conf"] - 5:
+            print("⚠️ Low confidence — allowing")
 
         # -----------------------------
-        # FAST FILTERS
+        # DUPLICATE SIGNAL
         # -----------------------------
         if signal == last_signal_nifty:
-            continue
+            print("⚠️ Same signal — allowing")
 
+        # -----------------------------
+        # COOLDOWN
+        # -----------------------------
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
             continue
 
-        if not confirm_entry(config.NIFTY_TOKEN, signal, df):
-            print("Confirm:", confirm_entry(config.NIFTY_TOKEN, signal, df))
-            print("⚠️ Weak confirmation — allowing")
+        # -----------------------------
+        # ENTRY CONFIRMATION
+        # -----------------------------
+        confirm = confirm_entry(config.NIFTY_TOKEN, signal, df)
 
+        if not confirm:
+            print("⚠️ Weak confirmation — allowing")
 
         # -----------------------------
         # OPTION SELECTION
         # -----------------------------
-        print(f"""
-                DEBUG:
-                Signal: {signal}
-                ML: {ml_conf}
-                Score: {trade_score}
-                Confidence: {confidence}
-                """)
+        print("🔍 Finding NIFTY option...")
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
-        if not symbol or not price or lot is None:
-            print("Option:", symbol, price, lot)
+        if not symbol or not price:
+            print("❌ Option selection failed:", symbol, price)
+            time.sleep(2)
             continue
+
+        print("🏆 Selected:", symbol, price, lot)
 
         # -----------------------------
         # LOT SIZE
         # -----------------------------
+        strong_trend = is_strong_trend_day(config.NIFTY_TOKEN)
+
         if not strong_trend:
             lot = 1
 
-        if strong_trend:
-            if confidence > 90:
-                lot = int(lot * 1.8)
-            elif confidence > 80:
-                lot = int(lot * 1.5)
-
         lot = int(lot * session_cfg["lot_mult"])
-        lot = min(lot, config.MAX_LOTS)
-        lot = max(1, lot)
-        
-        # 🚀 Confidence-based lot boost
-        if ml_conf > 90:
-            lot = int(lot * 2)
-        elif ml_conf > 80:
-            lot = int(lot * 1.5)
-       
-
-
+        lot = min(max(1, lot), config.MAX_LOTS)
 
         # -----------------------------
         # ENTRY TIMING
@@ -1401,14 +1362,16 @@ def nifty_loop():
         time.sleep(0.3)
         ltp2 = safe_ltp(f"{exchange}:{symbol}")
 
-        if ltp1 is None or ltp2 is None:
+        if not ltp1 or not ltp2:
+            print("❌ LTP issue")
             continue
 
-        if signal == "CALL" and ltp2 < ltp1:
-            continue
+        # relaxed momentum
+        if signal == "CALL" and ltp2 < ltp1 * 0.995:
+            print("⚠️ Weak CALL — allowing")
 
-        if signal == "PUT" and ltp2 > ltp1:
-            continue
+        if signal == "PUT" and ltp2 > ltp1 * 1.005:
+            print("⚠️ Weak PUT — allowing")
 
         # -----------------------------
         # ORDER
@@ -1428,14 +1391,8 @@ def nifty_loop():
             ).start()
 
         time.sleep(1)
-        
-        print(f"""
-            DEBUG:
-            Signal: {signal}
-            ML: {ml_conf}
-            Score: {trade_score}
-            Confidence: {confidence}
-            """)
+
+
 
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude

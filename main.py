@@ -533,7 +533,7 @@ def find_option(signal, instrument):
         name = "CRUDEOIL"
         step = 100
         token = CRUDE_TOKEN
-        token_symbol = f"{exchange}:CRUDEOIL{datetime.datetime.now().strftime('%y%b').upper()}FUT"
+        token_symbol = f"{exchange}:CRUDEOIL26APRFUT"   # ✅ FIXED
         lot_size = 100
 
     # -----------------------------
@@ -547,7 +547,7 @@ def find_option(signal, instrument):
     # -----------------------------
     # LTP
     # -----------------------------
-    ltp = safe_ltp(f"{exchange}:{symbol}") if symbol else None
+    ltp = safe_ltp(token_symbol)
     if ltp is None:
         print("❌ LTP fetch failed")
         return None, None, None, None
@@ -1260,7 +1260,7 @@ def nifty_loop():
         # -----------------------------
         signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
 
-        if ml_conf < 50:
+        if ml_conf < 45:
             print("⚠️ Weak ML — skipping")
             print("ML CONF:", ml_conf)
             continue
@@ -1356,6 +1356,13 @@ def nifty_loop():
         # -----------------------------
         # OPTION SELECTION
         # -----------------------------
+        print(f"""
+                DEBUG:
+                Signal: {signal}
+                ML: {ml_conf}
+                Score: {trade_score}
+                Confidence: {confidence}
+                """)
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
         if not symbol or not price or lot is None:
@@ -1539,7 +1546,7 @@ def crude_loop():
         # -----------------------------
         signal, ml_conf = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
 
-        if ml_conf < 50:
+        if ml_conf < 45:
             print("ML CONF:", ml_conf)
             continue
         
@@ -1574,8 +1581,6 @@ def crude_loop():
         if crude_sig == signal:
             confidence += 10
 
-        # ✅ SMALL BOOST (NO ML fallback)
-        confidence += 3
 
         if crude_sig != "HOLD" and crude_sig != signal:
             print("⚠️ Signal conflict — allowing")
@@ -1600,13 +1605,23 @@ def crude_loop():
             continue
 
         # ✅ SOFT CONFIRMATION (FIXED)
-        if not confirm_entry(CRUDE_TOKEN, signal, df):
-            print("Confirm:", confirm_entry(CRUDE_TOKEN, signal, df))
+        confirm = confirm_entry(CRUDE_TOKEN, signal, df)
+
+        if not confirm:
+            print("⚠️ Weak confirmation — allowing")
 
 
         # -----------------------------
         # OPTION SELECTION
         # -----------------------------
+        print(f"""
+                DEBUG:
+                Signal: {signal}
+                ML: {ml_conf}
+                Score: {trade_score}
+                Confidence: {confidence}
+                """)
+        
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
         print(f"Selected Option: {symbol}, Price: {price}, Lot: {lot}")

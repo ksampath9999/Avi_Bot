@@ -338,6 +338,7 @@ def momentum_signal(token):
 # PRO CRUDE STRATEGY
 # -----------------------------
 def get_crude_signal(token):
+    
     try:
         now = datetime.datetime.now()
 
@@ -419,6 +420,10 @@ def get_crude_signal(token):
         # -----------------------------
         # DEFAULT
         # -----------------------------
+        return "HOLD"
+        
+    except Exception as e:
+        print("CRUDE SIGNAL ERROR:", e)
         return "HOLD"
         
         

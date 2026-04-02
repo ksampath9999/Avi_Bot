@@ -1536,12 +1536,23 @@ def crude_loop():
         # -----------------------------
         # SIGNAL
         # -----------------------------
-        signal, ml_conf = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
+        signal = get_crude_signal(CRUDE_TOKEN)
+
+        # ML confirmation
+        ml_data = get_ml_cached()
+        ml_conf = ml_data.get("confidence", 50) if ml_data else 50
+
+        print(f"🎯 CRUDE Signal: {signal}, ML: {ml_conf}")
 
         if signal == "HOLD":
             continue
 
         print(f"🎯 CRUDE Signal: {signal}, ML: {ml_conf}")
+        
+        
+        if not is_market_trending(CRUDE_TOKEN, df):
+            print("⚠️ No trend — skipping")
+            continue
 
         # -----------------------------
         # 🧠 AI EDGE

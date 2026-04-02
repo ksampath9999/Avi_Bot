@@ -1378,11 +1378,23 @@ def nifty_loop():
         # -----------------------------
         print(f"🚀 Placing NIFTY order: {symbol}, lot: {lot}")
 
+        # 🚀 SET FLAG BEFORE ORDER (CRITICAL)
+        nifty_active = True
+
         filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
         if filled_price:
             last_signal_nifty = signal
             last_trade_time_nifty = time.time()
+
+            threading.Thread(
+                target=run_trade_wrapper,
+                args=(symbol, filled_price, lot, exchange, "NIFTY"),
+                daemon=True
+            ).start()
+        else:
+            # ❌ RESET if order failed
+            nifty_active = False
 
             threading.Thread(
                 target=run_trade_wrapper,

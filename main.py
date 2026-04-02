@@ -143,7 +143,7 @@ def get_session_config(instrument):
             return {"min_conf": 50, "lot_mult": 1.2}
 
         elif session == "MIDDAY":
-            return {"min_conf": 70, "lot_mult": 0.5}
+            return {"min_conf": 60, "lot_mult": 0.5}
 
         elif session == "AFTERNOON":
             return {"min_conf": 60, "lot_mult": 1}
@@ -154,7 +154,7 @@ def get_session_config(instrument):
             return {"min_conf": 55, "lot_mult": 1}
 
         elif session == "MIDDAY":
-            return {"min_conf": 75, "lot_mult": 0.5}
+            return {"min_conf": 60, "lot_mult": 0.5}
 
         elif session == "EVENING_TREND":
             return {"min_conf": 50, "lot_mult": 1.5}
@@ -1260,12 +1260,14 @@ def nifty_loop():
         # -----------------------------
         signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
 
-        if ml_conf < 60:
+        if ml_conf < 55:
             print("⚠️ Weak ML — skipping")
+            print("ML CONF:", ml_conf)
             continue
        
 
         if signal == "HOLD":
+            print("Nifty Signal:", signal)
             time.sleep(5)
             continue
 
@@ -1295,6 +1297,7 @@ def nifty_loop():
         print(f"🎯 Score: {trade_score}")
 
         if trade_score < 15:
+            print("Trade Score:", trade_score)
             continue
 
         # -----------------------------
@@ -1332,6 +1335,7 @@ def nifty_loop():
                 pass
 
         if confidence < session_cfg["min_conf"]:
+            print("Confidence:", confidence, "Required:", session_cfg["min_conf"])
             continue
 
         print(f"Confidence: {confidence}")
@@ -1346,6 +1350,7 @@ def nifty_loop():
             continue
 
         if not confirm_entry(config.NIFTY_TOKEN, signal, df):
+            print("Confirm:", confirm_entry(config.NIFTY_TOKEN, signal, df))
             continue
 
 
@@ -1355,6 +1360,7 @@ def nifty_loop():
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
         if not symbol or not price or lot is None:
+            print("Option:", symbol, price, lot)
             continue
 
         # -----------------------------
@@ -1416,6 +1422,14 @@ def nifty_loop():
             ).start()
 
         time.sleep(1)
+        
+        print(f"""
+            DEBUG:
+            Signal: {signal}
+            ML: {ml_conf}
+            Score: {trade_score}
+            Confidence: {confidence}
+            """)
 
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
@@ -1526,8 +1540,8 @@ def crude_loop():
         # -----------------------------
         signal, ml_conf = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
 
-        if ml_conf < 60:
-            print("⚠️ Weak ML — skipping")
+        if ml_conf < 55:
+            print("ML CONF:", ml_conf)
             continue
         
         crude_sig = get_crude_signal(CRUDE_TOKEN)
@@ -1535,6 +1549,7 @@ def crude_loop():
         print(f"🎯 Signal: {signal}, Score: {trade_score}")
 
         if signal == "HOLD":
+            print("Crude Signal:", signal)
             time.sleep(5)
             continue
 
@@ -1542,7 +1557,7 @@ def crude_loop():
         # RELAXED SCORE
         # -----------------------------
         if trade_score < 15:
-            print("🚫 Low score")
+            print("Trade Score:", trade_score)
             continue
 
         # -----------------------------
@@ -1568,7 +1583,8 @@ def crude_loop():
 
         # ✅ RELAXED CONFIDENCE
         if confidence < session_cfg["min_conf"]:
-            print("❌ Low confidence")
+            print("Confidence:", confidence, "Required:", session_cfg["min_conf"])
+            
             time.sleep(10)
             continue
 
@@ -1585,7 +1601,7 @@ def crude_loop():
 
         # ✅ SOFT CONFIRMATION (FIXED)
         if not confirm_entry(CRUDE_TOKEN, signal, df):
-            print("⚠️ Weak confirmation — allowing")
+            print("Confirm:", confirm_entry(CRUDE_TOKEN, signal, df))
 
 
         # -----------------------------
@@ -1596,7 +1612,7 @@ def crude_loop():
         print(f"Selected Option: {symbol}, Price: {price}, Lot: {lot}")
 
         if not symbol or not price or lot is None:
-            print("❌ Invalid option")
+            print("Option:", symbol, price, lot)
             continue
 
         # -----------------------------
@@ -1660,6 +1676,14 @@ def crude_loop():
             ).start()
 
         time.sleep(1)
+        
+        print(f"""
+            DEBUG:
+            Signal: {signal}
+            ML: {ml_conf}
+            Score: {trade_score}
+            Confidence: {confidence}
+            """)
 
         
 def get_strike_mode(token):
@@ -2458,6 +2482,7 @@ def backtest(token, instrument, days=5):
         signal = "CALL" if slice_df.iloc[-1]["close"] > slice_df.iloc[-2]["close"] else "PUT"
 
         if signal == "HOLD":
+            print("Backtest Signal:", signal)
             continue
 
         entry = current_price

@@ -1379,10 +1379,10 @@ def nifty_loop():
         print(f"🧠 AI Probability: {probability}")
         
         if probability < 50:
-        if signal == "CALL" and ml_conf >= 55:
-            print("⚡ Allowing ML-supported trade")
-        else:
-            continue
+            if signal == "CALL" and ml_conf >= 55:
+                print("⚡ Allowing ML-supported trade")
+            else:
+                continue
 
         #if not ai_trade_filter(config.NIFTY_TOKEN, signal, df):
         #    continue
@@ -1617,10 +1617,10 @@ def crude_loop():
         print(f"🧠 Probability: {probability}")
         
         if probability < 50:
-        if signal == "CALL" and ml_conf >= 55:
-            print("⚡ Allowing ML-supported trade")
-        else:
-            continue
+            if signal == "CALL" and ml_conf >= 55:
+                print("⚡ Allowing ML-supported trade")
+            else:
+                continue
 
 
         #if not ai_trade_filter(CRUDE_TOKEN, signal, df):

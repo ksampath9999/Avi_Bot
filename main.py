@@ -1308,10 +1308,8 @@ def nifty_loop():
             time.sleep(60)
             continue
 
-        confidence = get_trade_confidence(
-            config.NIFTY_TOKEN, signal, df, strong_trend
-        )
-        confidence += 3
+        confidence = get_trade_confidence(config.NIFTY_TOKEN, signal, df, strong_trend)
+        confidence += 5
         
         if NIFTY_FUT_TOKEN:
             fut_df = get_cached_data(NIFTY_FUT_TOKEN, "5minute", 20)
@@ -1570,7 +1568,7 @@ def crude_loop():
             continue
 
         confidence = get_trade_confidence(CRUDE_TOKEN, signal, df, strong_trend)
-        confidence += 3
+        confidence += 5
 
         # ✅ SIGNAL BOOST
         if crude_sig == signal:

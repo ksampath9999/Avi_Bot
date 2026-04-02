@@ -1258,6 +1258,13 @@ def get_trade_probability(token, signal, df):
             score += 25
         elif signal == "PUT" and last["close"] < prev["low"]:
             score += 25
+            
+        # Momentum fallback boost
+        if signal == "CALL" and last["close"] > prev["close"]:
+            score += 10
+
+        if signal == "PUT" and last["close"] < prev["close"]:
+            score += 10
 
         # Volume spike
         vol_ma = df["volume"].rolling(5).mean().iloc[-1]
@@ -1372,6 +1379,9 @@ def nifty_loop():
         print(f"🧠 AI Probability: {probability}")
         
         if probability < 50:
+        if signal == "CALL" and ml_conf >= 55:
+            print("⚡ Allowing ML-supported trade")
+        else:
             continue
 
         #if not ai_trade_filter(config.NIFTY_TOKEN, signal, df):
@@ -1607,6 +1617,9 @@ def crude_loop():
         print(f"🧠 Probability: {probability}")
         
         if probability < 50:
+        if signal == "CALL" and ml_conf >= 55:
+            print("⚡ Allowing ML-supported trade")
+        else:
             continue
 
 

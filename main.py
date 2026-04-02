@@ -533,7 +533,7 @@ def find_option(signal, instrument):
         name = "CRUDEOIL"
         step = 100
         token = CRUDE_TOKEN
-        token_symbol = f"{exchange}:CRUDEOIL"
+        token_symbol = f"{exchange}:CRUDEOIL{datetime.datetime.now().strftime('%y%b').upper()}FUT"
         lot_size = 100
 
     # -----------------------------
@@ -547,7 +547,7 @@ def find_option(signal, instrument):
     # -----------------------------
     # LTP
     # -----------------------------
-    ltp = safe_ltp(token_symbol)
+    ltp = safe_ltp(f"{exchange}:{symbol}") if symbol else None
     if ltp is None:
         print("❌ LTP fetch failed")
         return None, None, None, None
@@ -626,8 +626,8 @@ def find_option(signal, instrument):
             if p is None:
                 continue
 
-            if not is_liquid_option(i["tradingsymbol"], exchange):
-                continue
+            #if not is_liquid_option(i["tradingsymbol"], exchange):
+            #    continue
 
             trade_value = p * lot_size
             if trade_value > max_trade_value * 3:
@@ -682,8 +682,8 @@ def find_option(signal, instrument):
             if p is None:
                 continue
 
-            if not is_liquid_option(i["tradingsymbol"], exchange):
-                continue
+            #if not is_liquid_option(i["tradingsymbol"], exchange):
+            #    continue
 
             trade_value = p * lot_size
             if trade_value <= max_trade_value * 3:
@@ -1350,7 +1350,7 @@ def nifty_loop():
 
         if not confirm_entry(config.NIFTY_TOKEN, signal, df):
             print("Confirm:", confirm_entry(config.NIFTY_TOKEN, signal, df))
-            continue
+            print("⚠️ Weak confirmation — allowing")
 
 
         # -----------------------------

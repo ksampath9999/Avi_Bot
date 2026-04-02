@@ -143,7 +143,7 @@ def get_session_config(instrument):
             return {"min_conf": 50, "lot_mult": 1.2}
 
         elif session == "MIDDAY":
-            return {"min_conf": 60, "lot_mult": 0.5}
+            return {"min_conf": 55, "lot_mult": 0.7}
 
         elif session == "AFTERNOON":
             return {"min_conf": 60, "lot_mult": 1}
@@ -154,7 +154,7 @@ def get_session_config(instrument):
             return {"min_conf": 55, "lot_mult": 1}
 
         elif session == "MIDDAY":
-            return {"min_conf": 60, "lot_mult": 0.5}
+            return {"min_conf": 55, "lot_mult": 0.7}
 
         elif session == "EVENING_TREND":
             return {"min_conf": 50, "lot_mult": 1.5}
@@ -1260,7 +1260,7 @@ def nifty_loop():
         # -----------------------------
         signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
 
-        if ml_conf < 55:
+        if ml_conf < 50:
             print("⚠️ Weak ML — skipping")
             print("ML CONF:", ml_conf)
             continue
@@ -1296,7 +1296,7 @@ def nifty_loop():
 
         print(f"🎯 Score: {trade_score}")
 
-        if trade_score < 15:
+        if trade_score < 10:
             print("Trade Score:", trade_score)
             continue
 
@@ -1311,6 +1311,7 @@ def nifty_loop():
         confidence = get_trade_confidence(
             config.NIFTY_TOKEN, signal, df, strong_trend
         )
+        confidence += 5
         
         if NIFTY_FUT_TOKEN:
             fut_df = get_cached_data(NIFTY_FUT_TOKEN, "5minute", 20)
@@ -1540,7 +1541,7 @@ def crude_loop():
         # -----------------------------
         signal, ml_conf = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
 
-        if ml_conf < 55:
+        if ml_conf < 50:
             print("ML CONF:", ml_conf)
             continue
         
@@ -1556,7 +1557,7 @@ def crude_loop():
         # -----------------------------
         # RELAXED SCORE
         # -----------------------------
-        if trade_score < 15:
+        if trade_score < 10:
             print("Trade Score:", trade_score)
             continue
 
@@ -1569,6 +1570,7 @@ def crude_loop():
             continue
 
         confidence = get_trade_confidence(CRUDE_TOKEN, signal, df, strong_trend)
+        confidence += 5
 
         # ✅ SIGNAL BOOST
         if crude_sig == signal:

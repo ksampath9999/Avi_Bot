@@ -83,6 +83,9 @@ ml_cache = {"time": 0, "data": None}
 ML_CACHE_TTL = 2  # seconds
 
 
+last_executed_signal_nifty = None
+
+
 def get_nifty_fut_token():
     try:
         instruments = kite.instruments("NFO")
@@ -1220,6 +1223,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument):
 def nifty_loop():
     global nifty_active, last_signal_nifty, last_trade_time_nifty
     global last_analysis_time, report_sent_today
+    global last_executed_signal_nifty   # ✅ IMPORTANT
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1260,7 +1264,8 @@ def nifty_loop():
             continue
 
         if nifty_active or not can_trade() or risk_off:
-            time.sleep(10)
+            print("⛔ Trade already running or blocked")
+            time.sleep(5)
             continue
 
         # -----------------------------
@@ -1270,8 +1275,24 @@ def nifty_loop():
 
         print(f"🎯 Signal: {signal}, ML: {ml_conf}")
 
+        # ✅ HANDLE HOLD FIRST
         if signal == "HOLD":
             time.sleep(5)
+            continue
+
+        # -----------------------------
+        # 🔄 RESET ON NEW SIGNAL
+        # -----------------------------
+        if last_executed_signal_nifty and signal != last_executed_signal_nifty:
+            print("🔄 New signal detected — allowing trade")
+            last_executed_signal_nifty = None
+
+        # -----------------------------
+        # 🚫 DUPLICATE SIGNAL BLOCK
+        # -----------------------------
+        if signal == last_executed_signal_nifty:
+            print(f"🚫 Duplicate signal blocked: {signal}")
+            time.sleep(2)
             continue
 
         # -----------------------------
@@ -1302,20 +1323,20 @@ def nifty_loop():
         # CONFIDENCE
         # -----------------------------
         session_cfg = get_session_config("NIFTY")
-        confidence = get_trade_confidence(config.NIFTY_TOKEN, signal, df, is_strong_trend_day(config.NIFTY_TOKEN))
 
-        confidence += 5  # ✅ boost
+        confidence = get_trade_confidence(
+            config.NIFTY_TOKEN,
+            signal,
+            df,
+            is_strong_trend_day(config.NIFTY_TOKEN)
+        )
+
+        confidence += 5
 
         print(f"Confidence: {confidence} (Required: {session_cfg['min_conf']})")
 
         if confidence < session_cfg["min_conf"] - 5:
             print("⚠️ Low confidence — allowing")
-
-        # -----------------------------
-        # DUPLICATE SIGNAL
-        # -----------------------------
-        if signal == last_signal_nifty:
-            print("⚠️ Same signal — allowing")
 
         # -----------------------------
         # COOLDOWN
@@ -1366,7 +1387,6 @@ def nifty_loop():
             print("❌ LTP issue")
             continue
 
-        # relaxed momentum
         if signal == "CALL" and ltp2 < ltp1 * 0.995:
             print("⚠️ Weak CALL — allowing")
 
@@ -1378,12 +1398,13 @@ def nifty_loop():
         # -----------------------------
         print(f"🚀 Placing NIFTY order: {symbol}, lot: {lot}")
 
-        # 🚀 SET FLAG BEFORE ORDER (CRITICAL)
+        # ✅ CRITICAL FIX (SET BEFORE ORDER)
         nifty_active = True
 
         filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
         if filled_price:
+            last_executed_signal_nifty = signal
             last_signal_nifty = signal
             last_trade_time_nifty = time.time()
 
@@ -1393,17 +1414,10 @@ def nifty_loop():
                 daemon=True
             ).start()
         else:
-            # ❌ RESET if order failed
+            # ✅ RESET FLAG IF ORDER FAILED
             nifty_active = False
 
-            threading.Thread(
-                target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "NIFTY"),
-                daemon=True
-            ).start()
-
         time.sleep(1)
-
 
 
 def crude_loop():

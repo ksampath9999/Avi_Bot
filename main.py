@@ -143,7 +143,7 @@ def get_session_config(instrument):
             return {"min_conf": 50, "lot_mult": 1.2}
 
         elif session == "MIDDAY":
-            return {"min_conf": 55, "lot_mult": 0.7}
+            return {"min_conf": 50, "lot_mult": 0.7}
 
         elif session == "AFTERNOON":
             return {"min_conf": 60, "lot_mult": 1}
@@ -154,7 +154,7 @@ def get_session_config(instrument):
             return {"min_conf": 55, "lot_mult": 1}
 
         elif session == "MIDDAY":
-            return {"min_conf": 55, "lot_mult": 0.7}
+            return {"min_conf": 50, "lot_mult": 0.7}
 
         elif session == "EVENING_TREND":
             return {"min_conf": 50, "lot_mult": 1.5}
@@ -1311,7 +1311,7 @@ def nifty_loop():
         confidence = get_trade_confidence(
             config.NIFTY_TOKEN, signal, df, strong_trend
         )
-        confidence += 5
+        confidence += 3
         
         if NIFTY_FUT_TOKEN:
             fut_df = get_cached_data(NIFTY_FUT_TOKEN, "5minute", 20)
@@ -1335,7 +1335,7 @@ def nifty_loop():
             except:
                 pass
 
-        if confidence < session_cfg["min_conf"]:
+        if confidence < session_cfg["min_conf"] - 3:
             print("Confidence:", confidence, "Required:", session_cfg["min_conf"])
             continue
 
@@ -1570,7 +1570,7 @@ def crude_loop():
             continue
 
         confidence = get_trade_confidence(CRUDE_TOKEN, signal, df, strong_trend)
-        confidence += 5
+        confidence += 3
 
         # ✅ SIGNAL BOOST
         if crude_sig == signal:
@@ -1584,7 +1584,7 @@ def crude_loop():
 
 
         # ✅ RELAXED CONFIDENCE
-        if confidence < session_cfg["min_conf"]:
+        if confidence < session_cfg["min_conf"] - 3:
             print("Confidence:", confidence, "Required:", session_cfg["min_conf"])
             
             time.sleep(10)

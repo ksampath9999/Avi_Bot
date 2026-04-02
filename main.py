@@ -1617,9 +1617,9 @@ def crude_loop():
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
         print(f"🧠 Probability: {probability}")
         
-        if probability < 50:
-            if signal == "CALL" and ml_conf >= 55:
-                print("⚡ Allowing ML-supported trade")
+        if probability < 40:
+            if ml_conf >= 55:
+                print("⚡ ML override — allowing trade")
             else:
                 continue
 

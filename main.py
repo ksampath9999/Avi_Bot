@@ -436,8 +436,10 @@ def get_quote(symbol):
         data = kite.quote([symbol])[symbol]
         quote_cache[symbol] = (now, data)
         return data
-    except:
-        return None        
+
+    except Exception as e:
+        print("Quote fetch error:", e)
+        return None       
 
         
 def is_liquid_option(symbol, exchange):

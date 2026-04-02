@@ -19,7 +19,6 @@ IST = pytz.timezone("Asia/Kolkata")
 kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
-IST = pytz.timezone("Asia/Kolkata")
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 last_analysis_time = 0
 
@@ -84,6 +83,33 @@ ML_CACHE_TTL = 2  # seconds
 
 
 last_executed_signal_nifty = None
+last_exit_time_crude = 0
+last_exit_time_nifty = 0
+REENTRY_COOLDOWN = 600  # 10 min
+CRUDE_SYMBOL = None
+pyramid_done = False
+
+TRADE_LOG_FILE = "trade_log.csv"
+
+
+def log_trade_full(symbol, entry, exit_price, pnl, instrument, signal, probability):
+
+    import csv
+    from datetime import datetime
+
+    with open(TRADE_LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+
+        writer.writerow([
+            datetime.now(),
+            instrument,
+            symbol,
+            signal,
+            entry,
+            exit_price,
+            pnl,
+            probability
+        ])
 
 
 def get_nifty_fut_token():
@@ -549,6 +575,11 @@ def find_option(signal, instrument):
     lot = None
     exchange = None
     
+    global CRUDE_SYMBOL
+
+    if CRUDE_SYMBOL is None:
+        CRUDE_SYMBOL = get_crude_fut_symbol()
+
     
 
     # -----------------------------
@@ -566,7 +597,7 @@ def find_option(signal, instrument):
         name = "CRUDEOIL"
         step = 100
         token = CRUDE_TOKEN
-        token_symbol = get_crude_fut_symbol()
+        token_symbol = CRUDE_SYMBOL
         lot_size = 100
         
     print("DEBUG CRUDE SYMBOL:", token_symbol)
@@ -586,9 +617,10 @@ def find_option(signal, instrument):
     # -----------------------------
     # LTP (FINAL FIX)
     # -----------------------------
-    if instrument == "CRUDE":
-        token_symbol = get_crude_fut_symbol()
-        print("DEBUG CRUDE SYMBOL:", token_symbol)
+
+    if not token_symbol or ":" not in token_symbol:
+        print("❌ Invalid token symbol")
+        return None, None, None, None
 
     ltp = safe_ltp(token_symbol)
 
@@ -596,7 +628,10 @@ def find_option(signal, instrument):
         print("❌ LTP fetch failed:", token_symbol)
         return None, None, None, None
 
-    atm = round(ltp / step) * step
+    if instrument == "CRUDE":
+        atm = int(round(ltp / 100) * 100)   # 🔥 FORCE 100 STRIKE
+    else:
+        atm = round(ltp / step) * step
 
     # -----------------------------
     # MODE
@@ -616,10 +651,16 @@ def find_option(signal, instrument):
     # -----------------------------
     # STRIKES
     # -----------------------------
-    if signal == "CALL":
-        strikes = [atm, atm + step, atm - step]
+    if instrument == "CRUDE":
+        if signal == "CALL":
+            strikes = [atm, atm + 100, atm - 100]
+        else:
+            strikes = [atm, atm - 100, atm + 100]
     else:
-        strikes = [atm, atm - step, atm + step]
+        if signal == "CALL":
+            strikes = [atm, atm + step, atm - step]
+        else:
+            strikes = [atm, atm - step, atm + step]
 
     instruments = get_instruments_cached(exchange)
     today = datetime.datetime.now().date()
@@ -676,7 +717,9 @@ def find_option(signal, instrument):
             #    continue
 
             trade_value = p * lot_size
-            if trade_value > max_trade_value * 3:
+            limit = max_trade_value * (5 if instrument == "CRUDE" else 3)
+
+            if trade_value > limit:
                 continue
 
             score = score_option(i["tradingsymbol"], exchange, token, signal, df)
@@ -830,16 +873,37 @@ def place_order(symbol, qty, exchange, instrument):
         print("❌ ORDER ERROR FULL:", str(e))
         send_message(f"❌ Order error: {e}")
         return None
+        
+        
+def update_streak(pnl):
+    global win_streak, loss_streak, last_loss_time
+
+    if pnl > 0:
+        win_streak += 1
+        loss_streak = 0
+    else:
+        loss_streak += 1
+        win_streak = 0
+        last_loss_time = time.time()
+
+
+def update_exit_time(instrument):
+    global last_exit_time_nifty, last_exit_time_crude
+
+    if instrument == "NIFTY":
+        last_exit_time_nifty = time.time()
+    else:
+        last_exit_time_crude = time.time()
 
 # -----------------------------
 # TRADE MGMT
 # -----------------------------
-def manage_trade(symbol, entry, qty, exchange, instrument):
+def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
 
     global daily_pnl, trade_count, last_loss_time
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio, risk_off
-    global max_drawdown
+    global max_drawdown, last_exit_time_nifty, last_exit_time_crude
 
     with lock:
         trade_count += 1
@@ -848,355 +912,239 @@ def manage_trade(symbol, entry, qty, exchange, instrument):
     actual_qty = get_quantity(qty, exchange)
     remaining_qty = actual_qty
 
-    # -----------------------------
-    # 🔥 SL CALCULATION (FIXED)
-    # -----------------------------
+    pyramid_count = 0
+    MAX_PYRAMID = 2
+
     df = get_cached_data(
         config.NIFTY_TOKEN if instrument == "NIFTY" else CRUDE_TOKEN,
         "5minute",
         30
     )
 
+    # -----------------------------
+    # SL CALCULATION
+    # -----------------------------
     if df is not None and len(df) > 10:
         df["range"] = df["high"] - df["low"]
         atr = df["range"].rolling(10).mean().iloc[-1]
 
-        if instrument == "NIFTY":
-            sl = max(entry - (atr * 0.8), entry * 0.88)
+        strength = abs(df.iloc[-1]["close"] - df.iloc[0]["close"]) / df.iloc[-1]["close"]
 
-        elif instrument == "CRUDE":
-            sl = max(entry - (atr * 1.2), entry * 0.82)
-
+        if strength > 0.01:
+            sl = entry - atr * 1.5
         else:
-            sl = max(entry - atr, entry * 0.85)
-
+            sl = entry - atr * 0.8
     else:
-        sl = entry * 0.90 if instrument == "NIFTY" else entry * 0.85
+        sl = entry * 0.90
 
-    # -----------------------------
-    # 🎯 DYNAMIC RR
-    # -----------------------------
     risk = entry - sl
-
-    strong_trend = is_strong_trend_day(
-        config.NIFTY_TOKEN if instrument == "NIFTY" else CRUDE_TOKEN
-    )
-
-    rr = 2
-    if instrument == "NIFTY":
-        rr = 3 if strong_trend else 2
-    elif instrument == "CRUDE":
-        rr = 3.5 if strong_trend else 2.5
-
+    rr = 3 if is_strong_trend_day(config.NIFTY_TOKEN) else 2
     target = entry + risk * rr
 
     trailing_sl = sl
     highest_price = entry
-
     entry_time = time.time()
     partial_booked = False
 
-    send_message(f"🚀 {instrument} TRADE\n{symbol} @ {entry}")
+    send_message(f"🚀 ELITE TRADE\n{symbol} @ {entry}")
 
     while True:
         try:
             ltp = safe_ltp(full_symbol)
-            if ltp is None:
-                time.sleep(1)
-                continue
+            retry = 0
+
+            while True:
+                ltp = safe_ltp(full_symbol)
+
+                if ltp is None:
+                    retry += 1
+                    if retry > 5:
+                        print("❌ LTP failed — exiting trade")
+                        return   # ✅ EXIT FUNCTION COMPLETELY
+                    time.sleep(1)
+                    continue
+
+                break
 
             profit = ltp - entry
 
             # -----------------------------
-            # 🔥 QUICK SL (ADJUSTED)
+            # PYRAMIDING
             # -----------------------------
-            if (instrument == "NIFTY" and profit < -entry * 0.05) or \
-               (instrument == "CRUDE" and profit < -entry * 0.08):
+            if pyramid_count < MAX_PYRAMID:
+                trigger = 1.10 + (pyramid_count * 0.05)
 
+                if ltp > entry * trigger:
+                    extra_qty = max(1, actual_qty // (2 + pyramid_count))
+
+                    try:
+                        kite.place_order(
+                            variety="regular",
+                            exchange=exchange,
+                            tradingsymbol=symbol,
+                            transaction_type="BUY",
+                            quantity=extra_qty,
+                            order_type="MARKET",
+                            product="MIS" if exchange == "NFO" else "NRML"
+                        )
+
+                        pyramid_count += 1
+                        send_message(f"🚀 Pyramid {pyramid_count}\n{symbol}")
+
+                    except Exception as e:
+                        print("Pyramid error:", e)
+
+            # -----------------------------
+            # ⚡ EARLY EXIT
+            # -----------------------------
+            if profit > 0 and ltp < highest_price * 0.985:
                 pnl = (ltp - entry) * remaining_qty
+                send_message(f"⚡ Weakness exit\n{symbol}")
 
+                # ✅ UPDATE SYSTEM
                 with lock:
-                    daily_pnl += pnl
                     portfolio_pnl += pnl
+                    daily_pnl += pnl
 
-                    # 🚀 ADD THIS (PEAK TRACKING)
-                    if portfolio_pnl > peak_portfolio:
+                    if peak_portfolio == 0:
                         peak_portfolio = portfolio_pnl
-                        
-                    # 📉 TRACK MAX DRAWDOWN (ADD THIS)
-                    drawdown = peak_portfolio - portfolio_pnl
-                    if drawdown > max_drawdown:
-                        max_drawdown = drawdown
+                    else:
+                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
 
+                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
+
+                    update_streak(pnl)
+
+                update_exit_time(instrument)
+                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+                break
+
+            # -----------------------------
+            # QUICK SL
+            # -----------------------------
+            if profit < -entry * 0.05:
+                pnl = (ltp - entry) * remaining_qty
                 send_message(f"🚫 Quick SL\n{symbol}")
-                log_trade(symbol, entry, ltp, pnl, instrument)
-
-                # ✅ UPDATE STREAKS (CORRECT PLACE)
-                if pnl > 0:
-                    win_streak += 1
-                    loss_streak = 0
-                else:
-                    loss_streak += 1
-                    win_streak = 0
-                    last_loss_time = time.time()
-
-                break
-                
-
-            # -----------------------------
-            # ⏱ TIME EXIT
-            # -----------------------------
-            if time.time() - entry_time > 900:
-                pnl = (ltp - entry) * remaining_qty
 
                 with lock:
-                    daily_pnl += pnl
                     portfolio_pnl += pnl
-                    
-                    # 🚀 ADD THIS (PEAK TRACKING)
-                    if portfolio_pnl > peak_portfolio:
+                    daily_pnl += pnl
+
+                    if peak_portfolio == 0:
                         peak_portfolio = portfolio_pnl
-                        
-                    # 📉 TRACK MAX DRAWDOWN (ADD THIS)
-                    drawdown = peak_portfolio - portfolio_pnl
-                    if drawdown > max_drawdown:
-                        max_drawdown = drawdown
+                    else:
+                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
 
-                send_message(f"⏱ TIME EXIT\n{symbol}")
-                log_trade(symbol, entry, ltp, pnl, instrument)
+                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
 
-                # ✅ UPDATE STREAKS (CORRECT PLACE)
-                if pnl > 0:
-                    win_streak += 1
-                    loss_streak = 0
-                else:
-                    loss_streak += 1
-                    win_streak = 0
-                    last_loss_time = time.time()
+                    update_streak(pnl)
 
+                update_exit_time(instrument)
+                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
                 break
 
             # -----------------------------
-            # 📈 TRACK HIGH
+            # TRACK HIGH
             # -----------------------------
             if ltp > highest_price:
                 highest_price = ltp
 
             # -----------------------------
-            # 💰 PARTIAL BOOKING
+            # PARTIAL
             # -----------------------------
-            if not partial_booked and remaining_qty == actual_qty:
+            if not partial_booked and profit > entry * 0.10:
+                half = remaining_qty // 2
 
-                if (instrument == "NIFTY" and profit > entry * 0.08) or \
-                   (instrument == "CRUDE" and profit > entry * 0.12):
-
-                    partial_qty = actual_qty // 2
-
-                    if partial_qty > 0:
-                        pnl = (ltp - entry) * partial_qty
-
-                        with lock:
-                            daily_pnl += pnl
-                            portfolio_pnl += pnl
-                            
-                            # 🚀 ADD THIS (PEAK TRACKING)
-                            if portfolio_pnl > peak_portfolio:
-                                peak_portfolio = portfolio_pnl
-                                
-                                
-                            # 📉 TRACK MAX DRAWDOWN (ADD THIS)
-                            drawdown = peak_portfolio - portfolio_pnl
-                            if drawdown > max_drawdown:
-                                max_drawdown = drawdown
-
-                        remaining_qty -= partial_qty
-                        partial_booked = True
-
-                        send_message(f"💰 PARTIAL EXIT\n{symbol}")
-                        log_trade(symbol, entry, ltp, pnl, instrument + "_PARTIAL")
-
-                        
-                        
-            # ⚡ REVERSAL EXIT (VERY POWERFUL)
-
-            if instrument == "NIFTY" and profit > 0:
-                if ltp < highest_price * 0.98:
-                    pnl = (ltp - entry) * remaining_qty
-
-                    with lock:
-                        daily_pnl += pnl
-                        portfolio_pnl += pnl
-                        
-                        # 🚀 ADD THIS (PEAK TRACKING)
-                        if portfolio_pnl > peak_portfolio:
-                            peak_portfolio = portfolio_pnl
-                            
-                        # 📉 TRACK MAX DRAWDOWN (ADD THIS)
-                        drawdown = peak_portfolio - portfolio_pnl
-                        if drawdown > max_drawdown:
-                            max_drawdown = drawdown
-
-                    send_message(f"⚡ Momentum exit\n{symbol}")
-                    log_trade(symbol, entry, ltp, pnl, instrument)
-
-                    # ✅ UPDATE STREAKS (CORRECT PLACE)
-                    if pnl > 0:
-                        win_streak += 1
-                        loss_streak = 0
-                    else:
-                        loss_streak += 1
-                        win_streak = 0
-                        last_loss_time = time.time()
-
-                    break
-
-            if instrument == "CRUDE" and profit > 0:
-                if ltp < highest_price * 0.97:
-
-                    pnl = (ltp - entry) * remaining_qty
-
-                    with lock:
-                        daily_pnl += pnl
-                        portfolio_pnl += pnl
-                        
-                        
-                        # 🚀 ADD THIS (PEAK TRACKING)
-                        if portfolio_pnl > peak_portfolio:
-                            peak_portfolio = portfolio_pnl
-                            
-                        # 📉 TRACK MAX DRAWDOWN (ADD THIS)
-                        drawdown = peak_portfolio - portfolio_pnl
-                        if drawdown > max_drawdown:
-                            max_drawdown = drawdown
-
-                    send_message(f"⚡ Momentum exit\n{symbol}")
-                    log_trade(symbol, entry, ltp, pnl, instrument)
-
-                    # ✅ UPDATE STREAKS (CORRECT PLACE)
-                    if pnl > 0:
-                        win_streak += 1
-                        loss_streak = 0
-                    else:
-                        loss_streak += 1
-                        win_streak = 0
-                        last_loss_time = time.time()
-
-                    break
+                if half > 0:
+                    remaining_qty -= half
+                    partial_booked = True
+                    send_message(f"💰 Partial booked\n{symbol}")
 
             # -----------------------------
-            # ⚡ TRAILING SL
+            # TRAILING
             # -----------------------------
-            trail_pct = 0.96 if instrument == "NIFTY" else 0.97
-
             if profit > entry * 0.05:
-                trailing_sl = max(trailing_sl, entry * 1.02)
+                trailing_sl = max(trailing_sl, entry * 1.03)
 
-            if ltp > entry:
-                trailing_sl = max(trailing_sl, ltp * trail_pct)
+            trailing_sl = max(trailing_sl, ltp * 0.97)
 
-            # -----------------------------
-            # 🛑 SL EXIT
-            # -----------------------------
             if ltp <= trailing_sl:
-
                 pnl = (ltp - entry) * remaining_qty
+                send_message(f"🛑 Trailing exit\n{symbol}")
 
                 with lock:
-                    daily_pnl += pnl
                     portfolio_pnl += pnl
-                    
-                    
-                    # 🚀 ADD THIS (PEAK TRACKING)
-                    if portfolio_pnl > peak_portfolio:
+                    daily_pnl += pnl
+
+                    if peak_portfolio == 0:
                         peak_portfolio = portfolio_pnl
-                        
-                    # 📉 TRACK MAX DRAWDOWN (ADD THIS)
-                    drawdown = peak_portfolio - portfolio_pnl
-                    if drawdown > max_drawdown:
-                        max_drawdown = drawdown
+                    else:
+                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
 
-                send_message(f"🛑 EXIT\n{symbol}")
-                log_trade(symbol, entry, ltp, pnl, instrument)
+                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
 
-                # ✅ UPDATE STREAKS (CORRECT PLACE)
-                if pnl > 0:
-                    win_streak += 1
-                    loss_streak = 0
-                else:
-                    loss_streak += 1
-                    win_streak = 0
-                    last_loss_time = time.time()
+                    update_streak(pnl)
 
+                update_exit_time(instrument)
+                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
                 break
 
             # -----------------------------
-            # 🎯 TARGET HIT
+            # TARGET
             # -----------------------------
             if ltp >= target:
+                pnl = (ltp - entry) * remaining_qty
+                send_message(f"🎯 Target hit\n{symbol}")
 
-                if remaining_qty > 1:
-                    half = remaining_qty // 2
+                with lock:
+                    portfolio_pnl += pnl
+                    daily_pnl += pnl
 
-                    pnl = (ltp - entry) * half
-
-                    with lock:
-                        daily_pnl += pnl
-                        portfolio_pnl += pnl
-                        
-                        
-                         # 🚀 ADD THIS (PEAK TRACKING)
-                        if portfolio_pnl > peak_portfolio:
-                            peak_portfolio = portfolio_pnl
-                            
-                        # 📉 TRACK MAX DRAWDOWN (ADD THIS)
-                        drawdown = peak_portfolio - portfolio_pnl
-                        if drawdown > max_drawdown:
-                            max_drawdown = drawdown
-
-                    remaining_qty -= half
-                    send_message(f"💰 Runner booked\n{symbol}")
-                    continue
-
-                else:
-                    pnl = (ltp - entry) * remaining_qty
-
-                    with lock:
-                        daily_pnl += pnl
-                        portfolio_pnl += pnl
-                        
-                        
-                        # 🚀 ADD THIS (PEAK TRACKING)
-                        if portfolio_pnl > peak_portfolio:
-                            peak_portfolio = portfolio_pnl
-                            
-                        # 📉 TRACK MAX DRAWDOWN (ADD THIS)
-                        drawdown = peak_portfolio - portfolio_pnl
-                        if drawdown > max_drawdown:
-                            max_drawdown = drawdown
-
-                    send_message(f"🎯 FINAL EXIT\n{symbol}")
-                    log_trade(symbol, entry, ltp, pnl, instrument)
-
-                    # ✅ UPDATE STREAKS (CORRECT PLACE)
-                    if pnl > 0:
-                        win_streak += 1
-                        loss_streak = 0
+                    if peak_portfolio == 0:
+                        peak_portfolio = portfolio_pnl
                     else:
-                        loss_streak += 1
-                        win_streak = 0
-                        last_loss_time = time.time()
+                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
 
-                    break
+                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
+
+                    update_streak(pnl)
+
+                update_exit_time(instrument)
+                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+                break
+
+            # -----------------------------
+            # TIME EXIT
+            # -----------------------------
+            if time.time() - entry_time > 900:
+                pnl = (ltp - entry) * remaining_qty
+                send_message(f"⏱ Time exit\n{symbol}")
+
+                with lock:
+                    portfolio_pnl += pnl
+                    daily_pnl += pnl
+
+                    if peak_portfolio == 0:
+                        peak_portfolio = portfolio_pnl
+                    else:
+                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
+
+                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
+
+                    update_streak(pnl)
+
+                update_exit_time(instrument)
+                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+                break
 
             time.sleep(1)
 
         except Exception as e:
             print("Trade error:", e)
-            break
+            break            
             
             
-            
-def run_trade_wrapper(symbol, price, lot, exchange, instrument):
+def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probability):
     global nifty_active, crude_active
 
     # ✅ SET ACTIVE FLAG
@@ -1206,7 +1154,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument):
         crude_active = True
 
     try:
-        manage_trade(symbol, price, lot, exchange, instrument)
+        manage_trade(symbol, price, lot, exchange, instrument, signal, probability)
 
     finally:
         # ✅ RESET ONLY AFTER TRADE COMPLETES
@@ -1214,6 +1162,93 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument):
             nifty_active = False
         else:
             crude_active = False
+            
+            
+def analyze_performance():
+
+    import pandas as pd
+
+    try:
+        df = pd.read_csv(TRADE_LOG_FILE)
+
+        if len(df) < 20:
+            return
+
+        win_rate = (df["pnl"] > 0).mean()
+        avg_profit = df[df["pnl"] > 0]["pnl"].mean()
+        avg_loss = df[df["pnl"] <= 0]["pnl"].mean()
+
+        print(f"""
+        📊 PERFORMANCE:
+        Win Rate: {win_rate:.2f}
+        Avg Profit: {avg_profit}
+        Avg Loss: {avg_loss}
+        """)
+
+        return win_rate, avg_profit, avg_loss
+
+    except Exception as e:
+        print("Analysis error:", e)
+            
+            
+            
+def get_trade_probability(token, signal, df):
+
+    try:
+        score = 0
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # VWAP alignment
+        vwap = df["close"].mean()
+        if signal == "CALL" and last["close"] > vwap:
+            score += 20
+        elif signal == "PUT" and last["close"] < vwap:
+            score += 20
+
+        # Breakout strength
+        if signal == "CALL" and last["close"] > prev["high"]:
+            score += 25
+        elif signal == "PUT" and last["close"] < prev["low"]:
+            score += 25
+
+        # Volume spike
+        vol_ma = df["volume"].rolling(5).mean().iloc[-1]
+        if last["volume"] > vol_ma * 1.3:
+            score += 20
+
+        # Candle strength
+        body = abs(last["close"] - last["open"])
+        rng = last["high"] - last["low"]
+
+        if rng > 0 and body > rng * 0.6:
+            score += 15
+
+        return min(score, 100)
+
+    except:
+        return 0
+        
+        
+def ai_trade_filter(token, signal, df):
+
+    # ❌ News volatility
+    if is_news_volatility(token):
+        print("🚫 Skipping — news volatility")
+        return False
+
+    # ❌ Fake breakout
+    if is_false_breakout(token, signal):
+        print("🚫 Skipping — fake breakout")
+        return False
+
+    # ❌ Reversal trap
+    if is_reversal_trap(token, signal):
+        print("🚫 Skipping — reversal trap")
+        return False
+
+    return True
  
  
 # -----------------------------
@@ -1223,7 +1258,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument):
 def nifty_loop():
     global nifty_active, last_signal_nifty, last_trade_time_nifty
     global last_analysis_time, report_sent_today
-    global last_executed_signal_nifty   # ✅ IMPORTANT
+    global last_executed_signal_nifty, last_exit_time_nifty
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1249,7 +1284,6 @@ def nifty_loop():
         df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
 
         if df is None or len(df) < 5:
-            print("❌ Data issue — skipping")
             time.sleep(5)
             continue
 
@@ -1259,12 +1293,19 @@ def nifty_loop():
         # -----------------------------
         # TIME FILTER
         # -----------------------------
+        
+            
+        # 📊 SEND DAILY REPORT AFTER MARKET CLOSE
+        if now.hour >= 15 and now.minute >= 30 and not report_sent_today:
+            send_daily_report()
+            report_sent_today = True
+            
         if 12 <= now.hour < 13 or (now.hour == 9 and now.minute < 20) or (now.hour == 15 and now.minute > 25):
             time.sleep(60)
             continue
 
         if nifty_active or not can_trade() or risk_off:
-            print("⛔ Trade already running or blocked")
+            print("⛔ Trade already running")
             time.sleep(5)
             continue
 
@@ -1275,43 +1316,50 @@ def nifty_loop():
 
         print(f"🎯 Signal: {signal}, ML: {ml_conf}")
 
-        # ✅ HANDLE HOLD FIRST
         if signal == "HOLD":
-            time.sleep(5)
             continue
 
         # -----------------------------
-        # 🔄 RESET ON NEW SIGNAL
+        # AI EDGE
+        # -----------------------------
+        probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
+        print(f"🧠 AI Probability: {probability}")
+        
+        if probability < 50:
+            continue
+
+        #if not ai_trade_filter(config.NIFTY_TOKEN, signal, df):
+        #    continue
+
+        # -----------------------------
+        # DUPLICATE + REENTRY
         # -----------------------------
         if last_executed_signal_nifty and signal != last_executed_signal_nifty:
-            print("🔄 New signal detected — allowing trade")
+            print("🔄 New signal")
             last_executed_signal_nifty = None
 
-        # -----------------------------
-        # 🚫 DUPLICATE SIGNAL BLOCK
-        # -----------------------------
         if signal == last_executed_signal_nifty:
-            print(f"🚫 Duplicate signal blocked: {signal}")
-            time.sleep(2)
-            continue
+            if time.time() - last_exit_time_nifty < REENTRY_COOLDOWN:
+                print("🚫 Duplicate blocked")
+                continue
+            else:
+                print("🔁 Re-entry allowed")
 
         # -----------------------------
-        # SCORING
+        # SCORE
         # -----------------------------
-        body = abs(last["close"] - last["open"])
-        rng = last["high"] - last["low"]
         trade_score = 0
 
         if abs(last["close"] - prev["close"]) > last["close"] * 0.003:
             trade_score += 20
 
-        if rng > 0 and body > rng * 0.5:
+        if abs(last["close"] - last["open"]) > (last["high"] - last["low"]) * 0.5:
             trade_score += 20
 
         if last["volume"] > df["volume"].rolling(5).mean().iloc[-1]:
             trade_score += 20
 
-        if is_market_trending(config.NIFTY_TOKEN):
+        if is_market_trending(config.NIFTY_TOKEN, df):
             trade_score += 20
 
         print("🎯 Score:", trade_score)
@@ -1331,12 +1379,9 @@ def nifty_loop():
             is_strong_trend_day(config.NIFTY_TOKEN)
         )
 
-        confidence += 5
+        confidence += (probability - 50) * 0.3
 
-        print(f"Confidence: {confidence} (Required: {session_cfg['min_conf']})")
-
-        if confidence < session_cfg["min_conf"] - 5:
-            print("⚠️ Low confidence — allowing")
+        print(f"Confidence: {confidence}")
 
         # -----------------------------
         # COOLDOWN
@@ -1345,28 +1390,19 @@ def nifty_loop():
             continue
 
         # -----------------------------
-        # ENTRY CONFIRMATION
-        # -----------------------------
-        confirm = confirm_entry(config.NIFTY_TOKEN, signal, df)
-
-        if not confirm:
-            print("⚠️ Weak confirmation — allowing")
-
-        # -----------------------------
         # OPTION SELECTION
         # -----------------------------
-        print("🔍 Finding NIFTY option...")
+        print("🔍 Finding option...")
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
         if not symbol or not price:
-            print("❌ Option selection failed:", symbol, price)
-            time.sleep(2)
+            print("❌ Option fail")
             continue
 
-        print("🏆 Selected:", symbol, price, lot)
+        print("🏆 Selected:", symbol, price)
 
         # -----------------------------
-        # LOT SIZE
+        # LOT CALCULATION (FINAL CORRECT PLACE)
         # -----------------------------
         strong_trend = is_strong_trend_day(config.NIFTY_TOKEN)
 
@@ -1374,31 +1410,49 @@ def nifty_loop():
             lot = 1
 
         lot = int(lot * session_cfg["lot_mult"])
-        lot = min(max(1, lot), config.MAX_LOTS)
+        
+        
+
+        # ML scaling
+        if ml_conf > 85:
+            lot *= 1.5
+        elif ml_conf > 70:
+            lot *= 1.2
+        elif ml_conf < 40:
+            lot *= 0.7
+
+        # AI scaling
+        if probability > 80:
+            lot *= 1.5
+        elif probability > 70:
+            lot *= 1.2
+            
+        # 🔥 WIN STREAK BOOST
+        if win_streak >= 3:
+            print("🔥 Win streak boost applied")
+            lot = int(lot * 1.3)
+
+        lot = int(max(1, min(lot, config.MAX_LOTS)))
+        
+        if not confirm_entry(config.NIFTY_TOKEN, signal, df):
+            print("🚫 Weak entry")
+            continue
 
         # -----------------------------
-        # ENTRY TIMING
+        # ENTRY CHECK
         # -----------------------------
         ltp1 = safe_ltp(f"{exchange}:{symbol}")
         time.sleep(0.3)
         ltp2 = safe_ltp(f"{exchange}:{symbol}")
 
         if not ltp1 or not ltp2:
-            print("❌ LTP issue")
             continue
-
-        if signal == "CALL" and ltp2 < ltp1 * 0.995:
-            print("⚠️ Weak CALL — allowing")
-
-        if signal == "PUT" and ltp2 > ltp1 * 1.005:
-            print("⚠️ Weak PUT — allowing")
 
         # -----------------------------
         # ORDER
         # -----------------------------
-        print(f"🚀 Placing NIFTY order: {symbol}, lot: {lot}")
+        
 
-        # ✅ CRITICAL FIX (SET BEFORE ORDER)
         nifty_active = True
 
         filled_price = place_order(symbol, lot, exchange, "NIFTY")
@@ -1410,11 +1464,10 @@ def nifty_loop():
 
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "NIFTY"),
+                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, probability),
                 daemon=True
             ).start()
         else:
-            # ✅ RESET FLAG IF ORDER FAILED
             nifty_active = False
 
         time.sleep(1)
@@ -1423,6 +1476,7 @@ def nifty_loop():
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
     global last_analysis_time, report_sent_today
+    global last_executed_signal_crude, last_exit_time_crude
 
     print("🔥 CRUDE LOOP STARTED")
 
@@ -1435,26 +1489,24 @@ def crude_loop():
 
     while True:
         now = datetime.datetime.now(IST)
+
         print("💓 CRUDE LOOP RUNNING")
 
         # 🚨 HARD STOP
         if portfolio_pnl < HARD_STOP_LOSS:
-            print("🚨 HARD STOP ACTIVATED — CRUDE")
-            send_message("🚨 HARD STOP — Trading stopped (CRUDE)")
+            send_message("🚨 HARD STOP — CRUDE")
             break
 
         # -----------------------------
-        # DATA FETCH
+        # DATA
         # -----------------------------
         df = get_cached_data(CRUDE_TOKEN, "5minute", 20)
-
-        if df is None or df.empty:
-            print("❌ EMPTY DATA — SKIPPING")
-            time.sleep(5)
+        if not CRUDE_TOKEN:
+            print("❌ CRUDE TOKEN MISSING")
+            time.sleep(10)
             continue
 
-        if len(df) < 5:
-            print("⚠️ Not enough candles")
+        if df is None or len(df) < 5:
             time.sleep(5)
             continue
 
@@ -1462,226 +1514,182 @@ def crude_loop():
         prev = df.iloc[-2]
 
         # -----------------------------
-        # TIME FILTERS (FIXED)
+        # TIME FILTER
         # -----------------------------
+        if not (9 <= now.hour <= 23):
+            time.sleep(60)
+            continue
+            
+        # 📊 SEND DAILY REPORT AFTER MARKET CLOSE
+        if now.hour >= 23 and now.minute >= 30 and not report_sent_today:
+            send_daily_report()
+            report_sent_today = True
+
         if 12 <= now.hour < 13:
             time.sleep(60)
             continue
 
-        if now.hour == 9 and now.minute < 20:
-            time.sleep(60)
-            continue
-
-        # ✅ CRUDE FULL SESSION
-        if not (9 <= now.hour <= 23):
-            time.sleep(60)
-            continue
-
-        # 📊 Daily report
-        if now.hour == 23 and not report_sent_today:
-            send_daily_report()
-            report_sent_today = True
-
-        if crude_active:
+        if crude_active or not can_trade() or risk_off:
             time.sleep(5)
             continue
-
-        if not can_trade():
-            time.sleep(30)
-            continue
-
-        if risk_off:
-            print("🛑 Risk OFF active")
-            time.sleep(60)
-            continue
-
-        # -----------------------------
-        # TREND (OPTIMIZED)
-        # -----------------------------
-        trend = is_market_trending(CRUDE_TOKEN, df)
-        strong_trend = is_strong_trend_day(CRUDE_TOKEN, df)
-
-        # -----------------------------
-        # SCORING
-        # -----------------------------
-        body = abs(last["close"] - last["open"])
-        rng = last["high"] - last["low"]
-        trade_score = 0
-
-        move = abs(last["close"] - prev["close"])
-        if move > last["close"] * 0.003:
-            trade_score += 20
-
-        if rng > 0 and body > rng * 0.5:
-            trade_score += 20
-
-        vol_ma = df["volume"].rolling(5).mean().iloc[-1]
-        if last["volume"] > vol_ma:
-            trade_score += 20
-
-        if trend:
-            trade_score += 20
-
-        
 
         # -----------------------------
         # SIGNAL
         # -----------------------------
         signal, ml_conf = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
 
-        if ml_conf < 45:
-            print("ML CONF:", ml_conf)
-            continue
-        
-        crude_sig = get_crude_signal(CRUDE_TOKEN)
-
-        print(f"🎯 Signal: {signal}, Score: {trade_score}")
-
         if signal == "HOLD":
-            print("Crude Signal:", signal)
-            time.sleep(5)
             continue
 
+        print(f"🎯 CRUDE Signal: {signal}, ML: {ml_conf}")
+
         # -----------------------------
-        # RELAXED SCORE
+        # 🧠 AI EDGE
         # -----------------------------
+        probability = get_trade_probability(CRUDE_TOKEN, signal, df)
+        print(f"🧠 Probability: {probability}")
+        
+        if probability < 50:
+            continue
+
+
+        #if not ai_trade_filter(CRUDE_TOKEN, signal, df):
+        #    continue
+
+        # -----------------------------
+        # DUPLICATE + REENTRY
+        # -----------------------------
+        if last_executed_signal_crude and signal != last_executed_signal_crude:
+            last_executed_signal_crude = None
+
+        if signal == last_executed_signal_crude:
+            if time.time() - last_exit_time_crude < REENTRY_COOLDOWN:
+                print("🚫 Duplicate blocked")
+                continue
+            else:
+                print("🔁 Re-entry allowed")
+
+        # -----------------------------
+        # SCORE
+        # -----------------------------
+        trade_score = 0
+
+        if abs(last["close"] - prev["close"]) > last["close"] * 0.003:
+            trade_score += 20
+
+        if abs(last["close"] - last["open"]) > (last["high"] - last["low"]) * 0.5:
+            trade_score += 20
+
+        if last["volume"] > df["volume"].rolling(5).mean().iloc[-1]:
+            trade_score += 20
+
+        if is_market_trending(CRUDE_TOKEN, df):
+            trade_score += 20
+
         if trade_score < 10:
-            print("Trade Score:", trade_score)
             continue
 
         # -----------------------------
-        # SESSION CONFIG
+        # CONFIDENCE
         # -----------------------------
         session_cfg = get_session_config("CRUDE")
-        if not session_cfg:
-            time.sleep(60)
-            continue
 
-        confidence = get_trade_confidence(CRUDE_TOKEN, signal, df, strong_trend)
-        confidence += 5
+        confidence = get_trade_confidence(
+            CRUDE_TOKEN,
+            signal,
+            df,
+            is_strong_trend_day(CRUDE_TOKEN)
+        )
 
-        # ✅ SIGNAL BOOST
-        if crude_sig == signal:
-            confidence += 10
-
-
-        if crude_sig != "HOLD" and crude_sig != signal:
-            print("⚠️ Signal conflict — allowing")
-
-
-        # ✅ RELAXED CONFIDENCE
-        if confidence < session_cfg["min_conf"] - 3:
-            print("Confidence:", confidence, "Required:", session_cfg["min_conf"])
-            
-            time.sleep(10)
-            continue
+        confidence += (probability - 50) * 0.3
 
         print(f"Confidence: {confidence}")
-
-        # -----------------------------
-        # FAST FILTERS
-        # -----------------------------
-        if signal == last_signal_crude:
-            continue
 
         if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
             continue
 
-        # ✅ SOFT CONFIRMATION (FIXED)
-        confirm = confirm_entry(CRUDE_TOKEN, signal, df)
-
-        if not confirm:
-            print("⚠️ Weak confirmation — allowing")
-
-
         # -----------------------------
-        # OPTION SELECTION
+        # OPTION
         # -----------------------------
-        print(f"""
-                DEBUG:
-                Signal: {signal}
-                ML: {ml_conf}
-                Score: {trade_score}
-                Confidence: {confidence}
-                """)
-        
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
-        print(f"Selected Option: {symbol}, Price: {price}, Lot: {lot}")
-
-        if not symbol or not price or lot is None:
-            print("Option:", symbol, price, lot)
+        if not symbol or not price:
+            print("❌ Option fail")
             continue
 
+        print("🏆 Selected:", symbol, price)
+
         # -----------------------------
-        # LOT SIZE
+        # LOT CALCULATION (ELITE)
         # -----------------------------
+        strong_trend = is_strong_trend_day(CRUDE_TOKEN)
+
         if not strong_trend:
             lot = 1
 
-        if strong_trend:
-            if confidence > 90:
-                lot = int(lot * 1.8)
-            elif confidence > 80:
-                lot = int(lot * 1.5)
-
         lot = int(lot * session_cfg["lot_mult"])
-        lot = min(lot, config.MAX_LOTS)
-        lot = max(1, lot)
         
-        # 🚀 Confidence-based lot boost
-        if ml_conf > 90:
-            lot = int(lot * 2)
-        elif ml_conf > 80:
-            lot = int(lot * 1.5)
-        
+       
 
-        if strong_trend and trade_score > 70:
-            lot = min(int(lot * 1.2), config.MAX_LOTS)
+        # ML scaling
+        if ml_conf > 85:
+            lot *= 1.5
+        elif ml_conf > 70:
+            lot *= 1.2
+        elif ml_conf < 40:
+            lot *= 0.7
+
+        # AI scaling
+        if probability > 80:
+            lot *= 1.5
+        elif probability > 70:
+            lot *= 1.2
+            
+        # 🔥 WIN STREAK BOOST
+        if win_streak >= 3:
+            print("🔥 Win streak boost applied")
+            lot = int(lot * 1.3)
+
+        lot = int(max(1, min(lot, config.MAX_LOTS)))
+        
+        if not confirm_entry(CRUDE_TOKEN, signal, df):
+            print("🚫 Weak entry")
+            
 
         # -----------------------------
-        # ENTRY TIMING
+        # ENTRY CHECK
         # -----------------------------
         ltp1 = safe_ltp(f"{exchange}:{symbol}")
         time.sleep(0.3)
         ltp2 = safe_ltp(f"{exchange}:{symbol}")
 
-        if ltp1 is None or ltp2 is None:
-            continue
-
-        if signal == "CALL" and ltp2 < ltp1:
-            continue
-
-        if signal == "PUT" and ltp2 > ltp1:
-            print("🚫 Weak PUT momentum")
+        if not ltp1 or not ltp2:
             continue
 
         # -----------------------------
         # ORDER
         # -----------------------------
-        print(f"🚀 Placing order: {symbol}, lot: {lot}")
+        print(f"🚀 CRUDE ORDER: {symbol} lot:{lot}")
+
+        crude_active = True
 
         filled_price = place_order(symbol, lot, exchange, "CRUDE")
 
         if filled_price:
+            last_executed_signal_crude = signal
             last_signal_crude = signal
             last_trade_time_crude = time.time()
 
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "CRUDE"),
+                args=(symbol, filled_price, lot, exchange, "CRUDE", signal, probability),
                 daemon=True
             ).start()
+        else:
+            crude_active = False
 
         time.sleep(1)
-        
-        print(f"""
-            DEBUG:
-            Signal: {signal}
-            ML: {ml_conf}
-            Score: {trade_score}
-            Confidence: {confidence}
-            """)
+
 
         
 def get_strike_mode(token):
@@ -1730,31 +1738,7 @@ def get_strike_mode(token):
     except:
         return "ATM"
 
-def log_trade(symbol, entry, exit_price, pnl, instrument):
 
-    trade = {
-        "time": str(datetime.datetime.now()),
-        "symbol": symbol,
-        "entry": entry,
-        "exit": exit_price,
-        "pnl": pnl,
-        "instrument": instrument,
-        "session": get_market_session(instrument)
-    }
-
-    file = "trade_log.json"
-
-    if not os.path.exists(file):
-        with open(file, "w") as f:
-            json.dump([], f)
-
-    with open(file, "r") as f:
-        data = json.load(f)
-
-    data.append(trade)
-
-    with open(file, "w") as f:
-        json.dump(data, f, indent=4)
 
 
 def run_ml_server():
@@ -1826,7 +1810,15 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     risk_amount = balance * config.RISK_PER_TRADE
     
     if instrument == "CRUDE":
-        return 1
+        lot_size = 100
+        sl_points = price * 0.10
+        risk_per_lot = sl_points * lot_size
+
+        if risk_per_lot == 0:
+            return 1
+
+        lots = int(risk_amount / risk_per_lot)
+        return max(1, min(lots, config.MAX_LOTS))
 
     if exchange == "NFO":
         lot_size = 65
@@ -2260,6 +2252,8 @@ def multi_strategy_signal(token, instrument):
 
     try:
         data = get_ml_cached()
+        if not data:
+            ml_conf = 50
 
         if data:
             ml_signal = data.get("signal", "HOLD")
@@ -2282,71 +2276,25 @@ def multi_strategy_signal(token, instrument):
 
     return "HOLD", ml_conf
     
-def analyze_performance():
-
-    file = "trade_log.json"
-
-    if not os.path.exists(file):
-        return
-
-    with open(file, "r") as f:
-        data = json.load(f)
-
-    if len(data) < 10:
-        return
-
-    results = {
-        "NIFTY": {"win": 0, "loss": 0},
-        "CRUDE": {"win": 0, "loss": 0}
-    }
-
-    for t in data[-50:]:  # last 50 trades
-
-        inst = t["instrument"]
-
-        if t["pnl"] > 0:
-            results[inst]["win"] += 1
-        else:
-            results[inst]["loss"] += 1
-
-    print("📊 Performance:", results)
-
-    return results
     
 def adjust_strategy():
 
-    results = analyze_performance()
+    global SIGNAL_COOLDOWN
 
-    if not results:
+    result = analyze_performance()
+
+    if not result:
         return
 
-    for inst in ["NIFTY", "CRUDE"]:
+    win_rate, avg_profit, avg_loss = result
 
-        wins = results[inst]["win"]
-        losses = results[inst]["loss"]
+    if win_rate < 0.45:
+        SIGNAL_COOLDOWN += 10
+        print("⚠️ Low win rate → reducing trades")
 
-        total = wins + losses
-
-        if total == 0:
-            continue
-
-        win_rate = wins / total
-
-        print(f"{inst} Win Rate: {round(win_rate,2)}")
-
-        # -----------------------------
-        # ADJUST CONFIDENCE
-        # -----------------------------
-        if win_rate < 0.4:
-            config.MIN_CONFIDENCE += 5
-            print(f"🔒 Increasing confidence for {inst}")
-
-        elif win_rate > 0.6:
-            config.MIN_CONFIDENCE -= 5
-            print(f"🚀 Relaxing confidence for {inst}")
-
-        # safety limits
-        config.MIN_CONFIDENCE = max(50, min(80, config.MIN_CONFIDENCE))
+    elif win_rate > 0.60:
+        SIGNAL_COOLDOWN = max(30, SIGNAL_COOLDOWN - 5)
+        print("🚀 High win rate → increasing trades")
         
         
 def save_best_settings(instrument, mode):
@@ -2519,57 +2467,56 @@ Total PnL: {round(total_pnl,2)}
 """)
     
 def send_daily_report():
+    
+    global report_sent_today
+    report_sent_today = True
 
     global portfolio_pnl, max_drawdown
 
-    file = "trade_log.json"
+    import pandas as pd
 
-    if not os.path.exists(file):
+    if not os.path.exists(TRADE_LOG_FILE):
         send_message("📊 No trades today")
         return
 
-    with open(file, "r") as f:
-        data = json.load(f)
+    try:
+        df = pd.read_csv(TRADE_LOG_FILE)
 
-    today = datetime.date.today()
+        if df.empty:
+            send_message("📊 No trades today")
+            return
 
-    wins = 0
-    losses = 0
-    total_trades = 0
+        df["time"] = pd.to_datetime(df["time"])
+        today = datetime.date.today()
 
-    for t in data:
-        trade_date = datetime.datetime.fromisoformat(t["time"]).date()
+        today_df = df[df["time"].dt.date == today]
 
-        if trade_date == today:
+        if today_df.empty:
+            send_message("📊 No trades today")
+            return
 
-            # Ignore partial logs if needed
-            if "_PARTIAL" in t["instrument"]:
-                continue
+        wins = (today_df["pnl"] > 0).sum()
+        losses = (today_df["pnl"] <= 0).sum()
+        total_trades = len(today_df)
 
-            total_trades += 1
+        win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
 
-            if t["pnl"] > 0:
-                wins += 1
-            else:
-                losses += 1
+        report = f"""
+                📊 DAILY REPORT
 
-    win_rate = 0
-    if total_trades > 0:
-        win_rate = (wins / total_trades) * 100
+                💰 Total PnL: ₹{round(portfolio_pnl,2)}
+                📈 Trades: {total_trades}
+                ✅ Wins: {wins}
+                ❌ Losses: {losses}
+                🎯 Win Rate: {round(win_rate,2)}%
 
-    report = f"""
-📊 DAILY REPORT
+                📉 Max Drawdown: ₹{round(max_drawdown,2)}
+                """
 
-💰 Total PnL: ₹{round(portfolio_pnl,2)}
-📈 Trades: {total_trades}
-✅ Wins: {wins}
-❌ Losses: {losses}
-🎯 Win Rate: {round(win_rate,2)}%
+        send_message(report)
 
-📉 Max Drawdown: ₹{round(max_drawdown,2)}
-"""
-
-    send_message(report)
+    except Exception as e:
+        print("Report error:", e)
 # -----------------------------
 # MAIN
 # -----------------------------
@@ -2583,7 +2530,6 @@ if __name__ == "__main__":
     # -----------------------------
     # 🎯 TOKEN INITIALIZATION (FIXED)
     # -----------------------------
-    NIFTY_TOKEN = 256265  # Index (always safe)
 
     CRUDE_TOKEN = get_latest_fut_token("CRUDEOIL", "MCX")
     NIFTY_FUT_TOKEN = get_nifty_fut_token()
@@ -2656,7 +2602,11 @@ if __name__ == "__main__":
     # 🔁 DAILY TOKEN REFRESH (PRO)
     # -----------------------------
     def refresh_tokens():
+        data_cache.clear()
+        ltp_cache.clear()
         global CRUDE_TOKEN, NIFTY_FUT_TOKEN
+        global CRUDE_SYMBOL
+        CRUDE_SYMBOL = None
 
         while True:
             now = datetime.datetime.now()

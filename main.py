@@ -90,6 +90,7 @@ CRUDE_SYMBOL = None
 pyramid_done = False
 
 TRADE_LOG_FILE = "trade_log.csv"
+last_executed_signal_crude = None
 
 
 def log_trade_full(symbol, entry, exit_price, pnl, instrument, signal, probability):

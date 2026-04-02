@@ -371,15 +371,54 @@ def get_crude_signal(token):
         breakout_up = last["close"] > prev["high"]
         breakout_down = last["close"] < prev["low"]
 
-        if breakout_up and above_vwap and vol_spike and strong:
+        # -----------------------------
+        # 🎯 MAIN LOGIC (SCORING)
+        # -----------------------------
+        score = 0
+
+        if breakout_up:
+            score += 1
+        if above_vwap:
+            score += 1
+        if vol_spike:
+            score += 1
+        if strong:
+            score += 1
+
+        if score >= 3:
             return "CALL"
 
-        if breakout_down and below_vwap and vol_spike and strong:
+
+        score = 0
+
+        if breakout_down:
+            score += 1
+        if below_vwap:
+            score += 1
+        if vol_spike:
+            score += 1
+        if strong:
+            score += 1
+
+        if score >= 3:
             return "PUT"
 
-        return "HOLD"
 
-    except:
+        # -----------------------------
+        # ⚡ OPTIONAL BOOST (ADD HERE)
+        # -----------------------------
+        if strong and above_vwap:
+            print("⚡ Momentum fallback CALL")
+            return "CALL"
+
+        if strong and below_vwap:
+            print("⚡ Momentum fallback PUT")
+            return "PUT"
+
+
+        # -----------------------------
+        # DEFAULT
+        # -----------------------------
         return "HOLD"
         
         

@@ -409,12 +409,10 @@ def get_crude_signal(token):
         # -----------------------------
         # ⚡ OPTIONAL BOOST (ADD HERE)
         # -----------------------------
-        if strong and above_vwap:
-            print("⚡ Momentum fallback CALL")
+        if strong and above_vwap and last["close"] > prev["close"]:
             return "CALL"
 
-        if strong and below_vwap:
-            print("⚡ Momentum fallback PUT")
+        if strong and below_vwap and last["close"] < prev["close"]:
             return "PUT"
 
 
@@ -1557,11 +1555,14 @@ def crude_loop():
         # -----------------------------
         # DATA
         # -----------------------------
-        df = get_cached_data(CRUDE_TOKEN, "5minute", 20)
+        
         if not CRUDE_TOKEN:
             print("❌ CRUDE TOKEN MISSING")
             time.sleep(10)
             continue
+            
+        df = get_cached_data(CRUDE_TOKEN, "5minute", 20)
+        
 
         if df is None or len(df) < 5:
             time.sleep(5)
@@ -1597,9 +1598,12 @@ def crude_loop():
 
         # ML confirmation
         ml_data = get_ml_cached()
-        ml_conf = ml_data.get("confidence", 50) if ml_data else 50
+        if not ml_data:
+            print("⚠️ ML fallback used")
+            ml_conf = 50
+        else:
+            ml_conf = ml_data.get("confidence", 50)
 
-        print(f"🎯 CRUDE Signal: {signal}, ML: {ml_conf}")
 
         if signal == "HOLD":
             continue
@@ -1725,6 +1729,7 @@ def crude_loop():
         
         if not confirm_entry(CRUDE_TOKEN, signal, df):
             print("🚫 Weak entry")
+            continue
             
 
         # -----------------------------

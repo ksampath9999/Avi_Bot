@@ -10,6 +10,7 @@ from telegram_bot import send_message
 import csv
 import os
 import json
+import pandas as pd
 
 
 
@@ -91,6 +92,7 @@ pyramid_done = False
 
 TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
+CRUDE_TOKEN = config.CRUDE_TOKEN
 
 
 def log_trade_full(symbol, entry, exit_price, pnl, instrument, signal, probability):
@@ -229,7 +231,8 @@ def is_market_trending(token, df=None):
     try:
         # ✅ Use passed data (FAST)
         if df is None:
-            df = get_cached_data(token, "5minute", 20)
+            df = get_cached_data(token, "5minute", 200)
+            
 
         if df is None or len(df) < 10:
             return False
@@ -299,7 +302,9 @@ def can_trade():
 def pivot_signal(token):
     try:
         now = datetime.datetime.now()
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return "HOLD"
 
@@ -317,7 +322,9 @@ def pivot_signal(token):
 def momentum_signal(token):
     try:
         now = datetime.datetime.now()
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return "HOLD"
 
@@ -343,7 +350,8 @@ def get_crude_signal(token):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
 
         if len(df) < 20:
             return "HOLD"
@@ -376,43 +384,41 @@ def get_crude_signal(token):
         # -----------------------------
         # 🎯 MAIN LOGIC (SCORING)
         # -----------------------------
-        score = 0
+        call_score = 0
+        put_score = 0
 
         if breakout_up:
-            score += 1
+            call_score += 1
         if above_vwap:
-            score += 1
+            call_score += 1
         if vol_spike:
-            score += 1
+            call_score += 1
         if strong:
-            score += 1
-
-        if score >= 3:
-            return "CALL"
-
-
-        score = 0
+            call_score += 1
 
         if breakout_down:
-            score += 1
+            put_score += 1
         if below_vwap:
-            score += 1
+            put_score += 1
         if vol_spike:
-            score += 1
+            put_score += 1
         if strong:
-            score += 1
+            put_score += 1
 
-        if score >= 3:
+        if call_score >= 3 and call_score > put_score:
+            return "CALL"
+
+        if put_score >= 3 and put_score > call_score:
             return "PUT"
 
 
         # -----------------------------
         # ⚡ OPTIONAL BOOST (ADD HERE)
         # -----------------------------
-        if strong and above_vwap and last["close"] > prev["close"]:
+        if strong and above_vwap and last["close"] > prev["close"] and vol_spike:
             return "CALL"
 
-        if strong and below_vwap and last["close"] < prev["close"]:
+        if strong and below_vwap and last["close"] < prev["close"] and vol_spike:
             return "PUT"
 
 
@@ -480,7 +486,8 @@ def is_liquid_option(symbol, exchange):
 def score_option(symbol, exchange, token, signal, df=None):
 
     if df is None:
-        df = get_cached_data(token, "5minute", 15)
+        df = get_cached_data(token, "5minute", 150)
+        
 
     try:
         full_symbol = f"{exchange}:{symbol}"
@@ -654,7 +661,9 @@ def find_option(signal, instrument):
     # -----------------------------
     # FETCH DATA (SAFE)
     # -----------------------------
-    df = get_cached_data(token, "5minute", 15)
+    df = get_cached_data(token, "5minute", 150)
+    
+    
     if df is None or df.empty:
         print("❌ No data for option scoring")
         return None, None, None, None
@@ -958,7 +967,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
     remaining_qty = actual_qty
 
     pyramid_count = 0
-    MAX_PYRAMID = 2
+    MAX_PYRAMID = 0
 
     df = get_cached_data(
         config.NIFTY_TOKEN if instrument == "NIFTY" else CRUDE_TOKEN,
@@ -980,7 +989,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
         else:
             sl = entry - atr * 0.8
     else:
-        sl = entry * 0.90
+        sl = entry - (entry * 0.15)
 
     risk = entry - sl
     rr = 3 if is_strong_trend_day(config.NIFTY_TOKEN) else 2
@@ -1338,6 +1347,8 @@ def nifty_loop():
         if df is None or len(df) < 5:
             time.sleep(5)
             continue
+            
+      
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
@@ -1364,7 +1375,9 @@ def nifty_loop():
         # -----------------------------
         # SIGNAL
         # -----------------------------
-        signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+        #signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+        signal = elite_signal(df)
+        ml_conf = 50   # temporary fixed
 
         print(f"🎯 Signal: {signal}, ML: {ml_conf}")
 
@@ -1382,6 +1395,11 @@ def nifty_loop():
                 print("⚡ Allowing ML-supported trade")
             else:
                 continue
+                
+        if is_low_range_market(config.NIFTY_TOKEN):
+           print("⚠️ Sideways market — reducing confidence")
+           continue
+           
 
         #if not ai_trade_filter(config.NIFTY_TOKEN, signal, df):
         #    continue
@@ -1447,6 +1465,11 @@ def nifty_loop():
         # -----------------------------
         # OPTION SELECTION
         # -----------------------------
+        
+        if not confirm_entry(config.NIFTY_TOKEN, signal, df):
+            print("🚫 Weak entry")
+            continue
+        
         print("🔍 Finding option...")
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
@@ -1464,34 +1487,8 @@ def nifty_loop():
         if not strong_trend:
             lot = 1
 
-        lot = int(lot * session_cfg["lot_mult"])
+        lot = 1
         
-        
-
-        # ML scaling
-        if ml_conf > 85:
-            lot *= 1.5
-        elif ml_conf > 70:
-            lot *= 1.2
-        elif ml_conf < 40:
-            lot *= 0.7
-
-        # AI scaling
-        if probability > 80:
-            lot *= 1.5
-        elif probability > 70:
-            lot *= 1.2
-            
-        # 🔥 WIN STREAK BOOST
-        if win_streak >= 3:
-            print("🔥 Win streak boost applied")
-            lot = int(lot * 1.3)
-
-        lot = int(max(1, min(lot, config.MAX_LOTS)))
-        
-        if not confirm_entry(config.NIFTY_TOKEN, signal, df):
-            print("🚫 Weak entry")
-            continue
 
         # -----------------------------
         # ENTRY CHECK
@@ -1508,7 +1505,8 @@ def nifty_loop():
         # -----------------------------
         
 
-        nifty_active = True
+        with lock:
+            nifty_active = True
 
         filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
@@ -1567,6 +1565,8 @@ def crude_loop():
         if df is None or len(df) < 5:
             time.sleep(5)
             continue
+            
+       
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
@@ -1594,15 +1594,9 @@ def crude_loop():
         # -----------------------------
         # SIGNAL
         # -----------------------------
-        signal = get_crude_signal(CRUDE_TOKEN)
-
-        # ML confirmation
-        ml_data = get_ml_cached()
-        if not ml_data:
-            print("⚠️ ML fallback used")
-            ml_conf = 50
-        else:
-            ml_conf = ml_data.get("confidence", 50)
+        #signal, ml_conf = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
+        signal = elite_signal(df)
+        ml_conf = 50   # temporary fixed
 
 
         if signal == "HOLD":
@@ -1621,12 +1615,15 @@ def crude_loop():
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
         print(f"🧠 Probability: {probability}")
         
-        if probability < 40:
+        if probability < 50:
             if ml_conf >= 55:
                 print("⚡ ML override — allowing trade")
             else:
                 continue
-
+        
+        if is_low_range_market(CRUDE_TOKEN):
+           print("⚠️ Sideways market — reducing confidence")
+           continue
 
         #if not ai_trade_filter(CRUDE_TOKEN, signal, df):
         #    continue
@@ -1686,6 +1683,10 @@ def crude_loop():
         # -----------------------------
         # OPTION
         # -----------------------------
+        if not confirm_entry(CRUDE_TOKEN, signal, df):
+            print("🚫 Weak entry")
+            continue
+            
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
         if not symbol or not price:
@@ -1702,34 +1703,9 @@ def crude_loop():
         if not strong_trend:
             lot = 1
 
-        lot = int(lot * session_cfg["lot_mult"])
+        lot = 1
         
-       
-
-        # ML scaling
-        if ml_conf > 85:
-            lot *= 1.5
-        elif ml_conf > 70:
-            lot *= 1.2
-        elif ml_conf < 40:
-            lot *= 0.7
-
-        # AI scaling
-        if probability > 80:
-            lot *= 1.5
-        elif probability > 70:
-            lot *= 1.2
-            
-        # 🔥 WIN STREAK BOOST
-        if win_streak >= 3:
-            print("🔥 Win streak boost applied")
-            lot = int(lot * 1.3)
-
-        lot = int(max(1, min(lot, config.MAX_LOTS)))
         
-        if not confirm_entry(CRUDE_TOKEN, signal, df):
-            print("🚫 Weak entry")
-            continue
             
 
         # -----------------------------
@@ -1773,7 +1749,8 @@ def get_strike_mode(token):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
 
         if len(df) < 20:
             return "ATM"
@@ -1834,7 +1811,8 @@ def confirm_entry(token, signal, df=None):
 
     try:
         if df is None:
-            df = get_cached_data(token, "5minute", 20)
+            df = get_cached_data(token, "5minute", 200)
+            
 
         if df is None or len(df) < 10:
             return False
@@ -1916,14 +1894,14 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     # -----------------------------
 
     # 🚀 Increase after wins
-    if win_streak >= 2:
-        print("🚀 Winning streak → increasing lot")
-        lots = int(lots * 1.5)
+    #if win_streak >= 2:
+    #    print("🚀 Winning streak → increasing lot")
+    #    lots = 1
 
     # 🛑 Reduce after losses
-    if loss_streak >= 2:
-        print("⚠️ Losing streak → reducing lot")
-        lots = max(1, int(lots * 0.5))
+    #if loss_streak >= 2:
+    #    print("⚠️ Losing streak → reducing lot")
+    #    lots = 1
 
     # -----------------------------
     # 🔥 TREND BOOSTER (already added)
@@ -1941,7 +1919,8 @@ def is_strong_trend_day(token, df=None):
 
     try:
         if df is None:
-            df = get_cached_data(token, "5minute", 20)
+            df = get_cached_data(token, "5minute", 200)
+            
 
         if df is None or len(df) < 10:
             return False
@@ -1958,7 +1937,9 @@ def is_reversal_trap(token, signal):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return False
 
@@ -2006,7 +1987,9 @@ def is_news_volatility(token):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return False
 
@@ -2078,7 +2061,8 @@ def get_trade_confidence(token, signal, df=None, strong_trend=False):
 
     try:
         if df is None:
-            df = get_cached_data(token, "5minute", 30)
+            df = get_cached_data(token, "5minute", 20)
+            
 
         if df is None or len(df) < 10:
             return 0
@@ -2130,7 +2114,9 @@ def is_false_breakout(token, signal):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return False
             
@@ -2236,7 +2222,9 @@ def vwap_signal(token):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return "HOLD"
             
@@ -2259,7 +2247,9 @@ def breakout_signal(token):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return "HOLD"
 
@@ -2281,7 +2271,9 @@ def pullback_signal(token):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return "HOLD"
 
@@ -2315,6 +2307,41 @@ def get_ml_cached():
     except:
         return None
         
+        
+# -----------------------------
+# ELITE SIGNAL (NEW)
+# -----------------------------
+def elite_signal(df):
+    df = df.copy()
+    df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+    df["vol_ma"] = df["volume"].rolling(5).mean()
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    body = abs(last["close"] - last["open"])
+    rng = last["high"] - last["low"]
+
+    # CALL
+    if (
+        last["close"] > prev["high"] and
+        last["close"] > last["vwap"] and
+        last["volume"] > last["vol_ma"] * 1.3 and
+        body > rng * 0.5
+    ):
+        return "CALL"
+
+    # PUT
+    if (
+        last["close"] < prev["low"] and
+        last["close"] < last["vwap"] and
+        last["volume"] > last["vol_ma"] * 1.3 and
+        body > rng * 0.5
+    ):
+        return "PUT"
+
+    return "HOLD"
+        
 
         
 def multi_strategy_signal(token, instrument):
@@ -2335,7 +2362,7 @@ def multi_strategy_signal(token, instrument):
             ml_signal = data.get("signal", "HOLD")
             ml_conf = data.get("confidence", 50)
 
-            if ml_conf > 60:
+            if ml_conf > 50:
                 signals.append(ml_signal)
 
     except:
@@ -2344,12 +2371,29 @@ def multi_strategy_signal(token, instrument):
     call_count = signals.count("CALL")
     put_count = signals.count("PUT")
 
+    # -----------------------------
+    # PRIMARY LOGIC
+    # -----------------------------
     if call_count >= 2:
         return "CALL", ml_conf
 
     if put_count >= 2:
         return "PUT", ml_conf
 
+    # -----------------------------
+    # ⚡ OPTIONAL FIX (BALANCED MODE)
+    # -----------------------------
+    if ml_conf >= 60:
+        if signals.count("CALL") >= 1:
+            print("⚡ ML override CALL")
+            return "CALL", ml_conf
+        elif signals.count("PUT") >= 1:
+            print("⚡ ML override PUT")
+            return "PUT", ml_conf
+
+    # -----------------------------
+    # DEFAULT
+    # -----------------------------
     return "HOLD", ml_conf
     
     
@@ -2423,14 +2467,19 @@ def is_low_range_market(token):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 30)
+        df = get_cached_data(token, "5minute", 20)
+        
+        
         if df is None or len(df) < 10:
             return True
 
         day_range = df["high"].max() - df["low"].min()
 
         # Tune for instruments
-        if day_range < 60:   # NIFTY
+        last_price = df["close"].iloc[-1]
+        day_range = df["high"].max() - df["low"].min()
+
+        if day_range < last_price * 0.003:
             return True
 
         return False
@@ -2476,7 +2525,7 @@ def get_cached_data(token, interval, duration):
 
 
         
-def backtest(token, instrument, days=5):
+def backtest_full(token, instrument, days=5):
 
     print(f"📊 Running backtest for {instrument}")
 
@@ -2508,7 +2557,7 @@ def backtest(token, instrument, days=5):
             continue
 
         entry = current_price
-        sl = entry * 0.90
+        sl = entry - (entry * 0.15)
         target = entry * 1.20
 
         future = df.iloc[i:i+10]
@@ -2593,6 +2642,63 @@ def send_daily_report():
 
     except Exception as e:
         print("Report error:", e)
+        
+        
+
+def backtest_df(df):
+    capital = 10000
+    position = None
+    entry_price = 0
+    trades = []
+
+    for i in range(20, len(df)):
+        window = df.iloc[:i]
+        last = window.iloc[-1]
+
+        # Simple breakout logic
+        prev = window.iloc[-2]
+
+        if last["close"] > prev["high"]:
+            signal = "CALL"
+        elif last["close"] < prev["low"]:
+            signal = "PUT"
+        else:
+            signal = "HOLD"
+
+        if signal == "HOLD":
+            continue
+
+        prob = get_trade_probability(None, signal, window)
+
+        if prob < 55:
+            continue
+
+        if not confirm_entry(None, signal, window):
+            continue
+
+        entry = last["close"]
+        sl = entry * 0.85
+        target = entry * 1.2
+
+        # simulate next candles
+        for j in range(i+1, len(df)):
+            price = df.iloc[j]["close"]
+
+            if price <= sl:
+                trades.append(-1)
+                break
+
+            if price >= target:
+                trades.append(2)
+                break
+
+    win_rate = sum(1 for t in trades if t > 0) / len(trades) if trades else 0
+
+    print("Trades:", len(trades))
+    print("Win rate:", win_rate)      
+        
+        
+  
 # -----------------------------
 # MAIN
 # -----------------------------

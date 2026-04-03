@@ -865,11 +865,16 @@ def place_order(symbol, qty, exchange, instrument):
             return None
 
         expected_price = ltp
-        
-        # 🔥 SMART LIMIT PRICE (ADD HERE)
 
-        spread_buffer = 0.003 if exchange == "NFO" else 0.005
-        price = round(ltp * (1 + spread_buffer), 1)
+        # 🔥 SMART PRICE FROM ORDER BOOK
+        quote = get_quote(full_symbol)
+
+        if quote and "depth" in quote and quote["depth"]["sell"]:
+            best_ask = quote["depth"]["sell"][0]["price"]
+            price = best_ask
+        else:
+            spread_buffer = 0.003 if exchange == "NFO" else 0.005
+            price = round(ltp * (1 + spread_buffer), 1)
         
         print("➡️ Sending order to Zerodha...")
 
@@ -901,8 +906,8 @@ def place_order(symbol, qty, exchange, instrument):
             if filled_price:
                 break
 
-            # small adjustment
-            price = round(price * 1.002, 1)
+            # 🔥 Controlled increase (avoid chasing too much)
+            price = round(min(price * 1.001, expected_price * 1.02), 1)
 
             kite.modify_order(
                 variety="regular",
@@ -916,10 +921,11 @@ def place_order(symbol, qty, exchange, instrument):
             return None
 
         slippage = round(filled_price - expected_price, 2)
-        
-        # 🚫 SLIPPAGE PROTECTION (ADD HERE)
-        if abs(slippage) > expected_price * 0.02:
-            send_message(f"⚠️ High slippage — continue with caution\n{symbol}")
+
+        if abs(slippage) > expected_price * 0.015:
+            send_message(f"❌ Trade rejected (high slippage)\n{symbol}")
+            kite.cancel_order(variety="regular", order_id=order_id)
+            return None
 
         return filled_price
 
@@ -1339,176 +1345,104 @@ def nifty_loop():
             send_message("🚨 HARD STOP — Trading stopped (NIFTY)")
             break
 
-        # -----------------------------
-        # FETCH DATA
-        # -----------------------------
-        df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
-
-        if df is None or len(df) < 5:
-            time.sleep(5)
-            continue
-            
-      
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        # -----------------------------
-        # TIME FILTER
-        # -----------------------------
-        
-            
-        # 📊 SEND DAILY REPORT AFTER MARKET CLOSE
+        # 📊 REPORT
         if now.hour >= 15 and now.minute >= 30 and not report_sent_today:
             send_daily_report()
             report_sent_today = True
-            
+
+        # ⏰ TIME FILTER
         if 12 <= now.hour < 13 or (now.hour == 9 and now.minute < 20) or (now.hour == 15 and now.minute > 25):
             time.sleep(60)
             continue
 
         if nifty_active or not can_trade() or risk_off:
-            print("⛔ Trade already running")
             time.sleep(5)
             continue
 
-        # -----------------------------
-        # SIGNAL
-        # -----------------------------
-        #signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+        # 📊 DATA
+        df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
+        if df is None or len(df) < 5:
+            time.sleep(5)
+            continue
+
+        # 🎯 SIGNAL
         signal = elite_signal(df)
-        ml_conf = 50   # temporary fixed
+        
+        if signal == "HOLD":
+            continue
+        
+            
+        trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
 
-        print(f"🎯 Signal: {signal}, ML: {ml_conf}")
-
+        if trend_strength < df.iloc[-1]["close"] * 0.0012:
+            print("🚫 Weak trend — skip")
+            continue
+        
         if signal == "HOLD":
             continue
 
-        # -----------------------------
-        # AI EDGE
-        # -----------------------------
+        print(f"🎯 Signal: {signal}")
+
+        # 🧠 PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
-        print(f"🧠 AI Probability: {probability}")
-        
-        if probability < 50:
-            if signal == "CALL" and ml_conf >= 55:
-                print("⚡ Allowing ML-supported trade")
-            else:
-                continue
-                
-        if is_low_range_market(config.NIFTY_TOKEN):
-           print("⚠️ Sideways market — reducing confidence")
-           continue
-           
+        print(f"🧠 Probability: {probability}")
 
-        #if not ai_trade_filter(config.NIFTY_TOKEN, signal, df):
-        #    continue
-
-        # -----------------------------
-        # DUPLICATE + REENTRY
-        # -----------------------------
-        if last_executed_signal_nifty and signal != last_executed_signal_nifty:
-            print("🔄 New signal")
-            last_executed_signal_nifty = None
-
-        if signal == last_executed_signal_nifty:
-            if time.time() - last_exit_time_nifty < REENTRY_COOLDOWN:
-                print("🚫 Duplicate blocked")
-                continue
-            else:
-                print("🔁 Re-entry allowed")
-
-        # -----------------------------
-        # SCORE
-        # -----------------------------
-        trade_score = 0
-
-        if abs(last["close"] - prev["close"]) > last["close"] * 0.003:
-            trade_score += 20
-
-        if abs(last["close"] - last["open"]) > (last["high"] - last["low"]) * 0.5:
-            trade_score += 20
-
-        if last["volume"] > df["volume"].rolling(5).mean().iloc[-1]:
-            trade_score += 20
-
-        if is_market_trending(config.NIFTY_TOKEN, df):
-            trade_score += 20
-
-        print("🎯 Score:", trade_score)
-
-        if trade_score < 10:
+        if probability < 55:
             continue
 
-        # -----------------------------
-        # CONFIDENCE
-        # -----------------------------
-        session_cfg = get_session_config("NIFTY")
+        # 🚫 SIDEWAYS
+        if is_low_range_market(config.NIFTY_TOKEN):
+            print("🚫 No trade zone")
+            continue
 
-        confidence = get_trade_confidence(
-            config.NIFTY_TOKEN,
-            signal,
-            df,
-            is_strong_trend_day(config.NIFTY_TOKEN)
-        )
+        # 🔁 DUPLICATE CONTROL
+        if signal == last_executed_signal_nifty:
+            if time.time() - last_exit_time_nifty < REENTRY_COOLDOWN:
+                continue
 
-        confidence += (probability - 50) * 0.3
+        # 📈 ENTRY CONFIRM
+        if not confirm_entry(config.NIFTY_TOKEN, signal, df):
+            continue
 
-        print(f"Confidence: {confidence}")
+        # 🔍 OPTION
+        symbol, price, lot, exchange = find_option(signal, "NIFTY")
+        if not symbol or not price:
+            continue
 
-        # -----------------------------
-        # COOLDOWN
-        # -----------------------------
+        # 📊 PRICE CHECK
+        ltp_check = safe_ltp(f"{exchange}:{symbol}")
+        if not ltp_check:
+            continue
+
+        if price > ltp_check * 1.03:
+            print("🚫 Price too high")
+            continue
+
+        if signal == "CALL" and ltp_check > price * 1.02:
+            continue
+
+        if signal == "PUT" and ltp_check < price * 0.98:
+            continue
+
+        print(f"🏆 {symbol} @ {price}")
+
+        # 🔒 LOT
+        lot = 1
+
+        # ⏳ COOLDOWN
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
             continue
 
-        # -----------------------------
-        # OPTION SELECTION
-        # -----------------------------
-        
-        if not confirm_entry(config.NIFTY_TOKEN, signal, df):
-            print("🚫 Weak entry")
-            continue
-        
-        print("🔍 Finding option...")
-        symbol, price, lot, exchange = find_option(signal, "NIFTY")
-
-        if not symbol or not price:
-            print("❌ Option fail")
-            continue
-
-        print("🏆 Selected:", symbol, price)
-
-        # -----------------------------
-        # LOT CALCULATION (FINAL CORRECT PLACE)
-        # -----------------------------
-        strong_trend = is_strong_trend_day(config.NIFTY_TOKEN)
-
-        if not strong_trend:
-            lot = 1
-
-        lot = 1
-        
-
-        # -----------------------------
-        # ENTRY CHECK
-        # -----------------------------
-        ltp1 = safe_ltp(f"{exchange}:{symbol}")
-        time.sleep(0.3)
-        ltp2 = safe_ltp(f"{exchange}:{symbol}")
-
-        if not ltp1 or not ltp2:
-            continue
-
-        # -----------------------------
-        # ORDER
-        # -----------------------------
-        
-
+        # 🚀 ORDER
         with lock:
             nifty_active = True
 
-        filled_price = place_order(symbol, lot, exchange, "NIFTY")
+        filled_price = None
+        for _ in range(2):
+            filled_price = place_order(symbol, lot, exchange, "NIFTY")
+            if filled_price:
+                break
+            time.sleep(1)
 
         if filled_price:
             last_executed_signal_nifty = signal
@@ -1524,7 +1458,6 @@ def nifty_loop():
             nifty_active = False
 
         time.sleep(1)
-
 
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
@@ -1550,38 +1483,10 @@ def crude_loop():
             send_message("🚨 HARD STOP — CRUDE")
             break
 
-        # -----------------------------
-        # DATA
-        # -----------------------------
-        
-        if not CRUDE_TOKEN:
-            print("❌ CRUDE TOKEN MISSING")
-            time.sleep(10)
-            continue
-            
-        df = get_cached_data(CRUDE_TOKEN, "5minute", 20)
-        
-
-        if df is None or len(df) < 5:
-            time.sleep(5)
-            continue
-            
-       
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        # -----------------------------
-        # TIME FILTER
-        # -----------------------------
+        # ⏰ TIME FILTER
         if not (9 <= now.hour <= 23):
             time.sleep(60)
             continue
-            
-        # 📊 SEND DAILY REPORT AFTER MARKET CLOSE
-        if now.hour >= 23 and now.minute >= 30 and not report_sent_today:
-            send_daily_report()
-            report_sent_today = True
 
         if 12 <= now.hour < 13:
             time.sleep(60)
@@ -1591,141 +1496,93 @@ def crude_loop():
             time.sleep(5)
             continue
 
-        # -----------------------------
-        # SIGNAL
-        # -----------------------------
-        #signal, ml_conf = multi_strategy_signal(CRUDE_TOKEN, "CRUDE")
+        # 📊 DATA
+        if not CRUDE_TOKEN:
+            time.sleep(10)
+            continue
+
+        df = get_cached_data(CRUDE_TOKEN, "5minute", 20)
+        if df is None or len(df) < 5:
+            time.sleep(5)
+            continue
+
+        # 🎯 SIGNAL
         signal = elite_signal(df)
-        ml_conf = 50   # temporary fixed
-
-
+        
         if signal == "HOLD":
             continue
+            
+        trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
 
-        print(f"🎯 CRUDE Signal: {signal}, ML: {ml_conf}")
+        if trend_strength < df.iloc[-1]["close"] * 0.0012:
+            print("🚫 Weak trend — skip")
+            continue
         
         
+
+        print(f"🎯 CRUDE Signal: {signal}")
+
+        # 📈 TREND FILTER
         if not is_market_trending(CRUDE_TOKEN, df):
-            print("⚠️ No trend — skipping")
             continue
 
-        # -----------------------------
-        # 🧠 AI EDGE
-        # -----------------------------
+        # 🧠 PROBABILITY
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
         print(f"🧠 Probability: {probability}")
-        
-        if probability < 50:
-            if ml_conf >= 55:
-                print("⚡ ML override — allowing trade")
-            else:
-                continue
-        
-        if is_low_range_market(CRUDE_TOKEN):
-           print("⚠️ Sideways market — reducing confidence")
-           continue
 
-        #if not ai_trade_filter(CRUDE_TOKEN, signal, df):
-        #    continue
-
-        # -----------------------------
-        # DUPLICATE + REENTRY
-        # -----------------------------
-        if last_executed_signal_crude and signal != last_executed_signal_crude:
-            last_executed_signal_crude = None
-
-        if signal == last_executed_signal_crude:
-            if time.time() - last_exit_time_crude < REENTRY_COOLDOWN:
-                print("🚫 Duplicate blocked")
-                continue
-            else:
-                print("🔁 Re-entry allowed")
-
-        # -----------------------------
-        # SCORE
-        # -----------------------------
-        trade_score = 0
-
-        if abs(last["close"] - prev["close"]) > last["close"] * 0.003:
-            trade_score += 20
-
-        if abs(last["close"] - last["open"]) > (last["high"] - last["low"]) * 0.5:
-            trade_score += 20
-
-        if last["volume"] > df["volume"].rolling(5).mean().iloc[-1]:
-            trade_score += 20
-
-        if is_market_trending(CRUDE_TOKEN, df):
-            trade_score += 20
-
-        if trade_score < 10:
+        if probability < 55:
             continue
 
-        # -----------------------------
-        # CONFIDENCE
-        # -----------------------------
-        session_cfg = get_session_config("CRUDE")
+        # 🚫 SIDEWAYS
+        if is_low_range_market(CRUDE_TOKEN):
+            continue
 
-        confidence = get_trade_confidence(
-            CRUDE_TOKEN,
-            signal,
-            df,
-            is_strong_trend_day(CRUDE_TOKEN)
-        )
+        # 🔁 DUPLICATE CONTROL
+        if signal == last_executed_signal_crude:
+            if time.time() - last_exit_time_crude < REENTRY_COOLDOWN:
+                continue
 
-        confidence += (probability - 50) * 0.3
+        # 📈 ENTRY
+        if not confirm_entry(CRUDE_TOKEN, signal, df):
+            continue
 
-        print(f"Confidence: {confidence}")
+        # 🔍 OPTION
+        symbol, price, lot, exchange = find_option(signal, "CRUDE")
+        if not symbol or not price:
+            continue
 
+        # 📊 PRICE CHECK
+        ltp_check = safe_ltp(f"{exchange}:{symbol}")
+        if not ltp_check:
+            continue
+
+        if price > ltp_check * 1.03:
+            continue
+
+        if signal == "CALL" and ltp_check > price * 1.02:
+            continue
+
+        if signal == "PUT" and ltp_check < price * 0.98:
+            continue
+
+        print(f"🏆 {symbol} @ {price}")
+
+        # 🔒 LOT
+        lot = 1
+
+        # ⏳ COOLDOWN
         if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
             continue
 
-        # -----------------------------
-        # OPTION
-        # -----------------------------
-        if not confirm_entry(CRUDE_TOKEN, signal, df):
-            print("🚫 Weak entry")
-            continue
-            
-        symbol, price, lot, exchange = find_option(signal, "CRUDE")
-
-        if not symbol or not price:
-            print("❌ Option fail")
-            continue
-
-        print("🏆 Selected:", symbol, price)
-
-        # -----------------------------
-        # LOT CALCULATION (ELITE)
-        # -----------------------------
-        strong_trend = is_strong_trend_day(CRUDE_TOKEN)
-
-        if not strong_trend:
-            lot = 1
-
-        lot = 1
-        
-        
-            
-
-        # -----------------------------
-        # ENTRY CHECK
-        # -----------------------------
-        ltp1 = safe_ltp(f"{exchange}:{symbol}")
-        time.sleep(0.3)
-        ltp2 = safe_ltp(f"{exchange}:{symbol}")
-
-        if not ltp1 or not ltp2:
-            continue
-
-        # -----------------------------
-        # ORDER
-        # -----------------------------
-        print(f"🚀 CRUDE ORDER: {symbol} lot:{lot}")
-
+        # 🚀 ORDER
         crude_active = True
 
-        filled_price = place_order(symbol, lot, exchange, "CRUDE")
+        filled_price = None
+        for _ in range(2):
+            filled_price = place_order(symbol, lot, exchange, "CRUDE")
+            if filled_price:
+                break
+            time.sleep(1)
 
         if filled_price:
             last_executed_signal_crude = signal
@@ -1741,8 +1598,6 @@ def crude_loop():
             crude_active = False
 
         time.sleep(1)
-
-
         
 def get_strike_mode(token):
 

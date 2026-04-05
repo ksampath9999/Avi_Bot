@@ -10,7 +10,6 @@ from telegram_bot import send_message
 import csv
 import os
 import json
-import pandas as pd
 
 
 
@@ -21,7 +20,6 @@ kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
-last_analysis_time = 0
 
 # -----------------------------
 # STATES
@@ -94,6 +92,60 @@ TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
 
+
+
+performance_log = []
+
+adaptive_config = {
+    "prob_threshold": 55,
+    "trend_threshold": 0.0015,
+    "risk_multiplier": 1.0
+}
+
+strategy_log = {
+    "TREND": [],
+    "SIDEWAYS": [],
+    "VOLATILE": [],
+    "NORMAL": []
+}
+
+strategy_status = {
+    "TREND": True,
+    "SIDEWAYS": True,
+    "VOLATILE": True,
+    "NORMAL": True
+}
+
+strategy_weights = {
+    "TREND": 1.0,
+    "SIDEWAYS": 0.6,
+    "VOLATILE": 0.8,
+    "NORMAL": 0.9
+}
+
+def evaluate_strategies():
+
+    print("📊 Evaluating strategies...")
+
+    for strat, results in strategy_log.items():
+
+        if len(results) < 5:
+            continue  # not enough data
+
+        wins = sum(1 for p in results if p > 0)
+        win_rate = wins / len(results)
+        avg_pnl = sum(results) / len(results)
+
+        print(f"{strat} → WinRate: {win_rate:.2f}, AvgPnL: {avg_pnl:.2f}")
+
+        # 🎯 Adjust weights instead of disabling
+        if win_rate < 0.4 or avg_pnl < 0:
+            strategy_weights[strat] = max(0.2, strategy_weights[strat] - 0.2)
+            print(f"⚠️ Reducing weight for {strat}")
+
+        elif win_rate > 0.6 and avg_pnl > 0:
+            strategy_weights[strat] = min(1.5, strategy_weights[strat] + 0.2)
+            print(f"🚀 Increasing weight for {strat}")
 
 def log_trade_full(symbol, entry, exit_price, pnl, instrument, signal, probability):
 
@@ -351,9 +403,8 @@ def get_crude_signal(token):
         now = datetime.datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
-        
 
-        if len(df) < 20:
+        if df is None or len(df) < 20:
             return "HOLD"
             
         df = df.copy()
@@ -486,7 +537,12 @@ def is_liquid_option(symbol, exchange):
 def score_option(symbol, exchange, token, signal, df=None):
 
     if df is None:
-        df = get_cached_data(token, "5minute", 150)
+        df = get_cached_data(token, "5minute", 50)
+
+    if df is None:
+        return 0
+
+    df = df.copy()   # ALWAYS COPY
         
 
     try:
@@ -789,10 +845,9 @@ def find_option(signal, instrument):
     # -----------------------------
     if candidates:
         best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
-
         print(f"🏆 Selected: {best['symbol']} @ {best['price']}")
-
-        lot = calculate_lots(best["price"], exchange, instrument, strong_trend=False)
+        strong_trend = is_market_trending(token, df)
+        lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
 
         return best["symbol"], best["price"], lot, exchange
 
@@ -836,8 +891,8 @@ def find_option(signal, instrument):
 
     if best:
         print(f"✅ Fallback selected: {best} @ {best_price}")
-
-        lot = calculate_lots(best_price, exchange, instrument, strong_trend=False)
+        strong_trend = is_market_trending(token, df)
+        lot = calculate_lots(best_price, exchange, instrument, strong_trend)
 
         return best, best_price, lot, exchange
 
@@ -958,12 +1013,13 @@ def update_exit_time(instrument):
 # -----------------------------
 # TRADE MGMT
 # -----------------------------
-def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
+def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, market_type):
 
     global daily_pnl, trade_count, last_loss_time
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio, risk_off
     global max_drawdown, last_exit_time_nifty, last_exit_time_crude
+    
 
     with lock:
         trade_count += 1
@@ -985,6 +1041,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
     # SL CALCULATION
     # -----------------------------
     if df is not None and len(df) > 10:
+        df = df.copy()
         df["range"] = df["high"] - df["low"]
         atr = df["range"].rolling(10).mean().iloc[-1]
 
@@ -999,12 +1056,15 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
 
     risk = entry - sl
     rr = 3 if is_strong_trend_day(config.NIFTY_TOKEN) else 2
-    target = entry + risk * rr
+    # 🎯 BASE TARGET
+    base_target = entry + risk * rr
+    target = base_target
 
     trailing_sl = sl
     highest_price = entry
     entry_time = time.time()
     partial_booked = False
+    boost_applied = False
 
     send_message(f"🚀 ELITE TRADE\n{symbol} @ {entry}")
 
@@ -1077,14 +1137,28 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
 
                 update_exit_time(instrument)
                 log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+                # 📊 LOG PERFORMANCE
+                # always append
+                performance_log.append({
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "pnl": pnl,
+                    "time": time.time()
+                })
+
+                # limit size
+                if len(performance_log) > 100:
+                    performance_log.pop(0)
+
+                if market_type in strategy_log:
+                    strategy_log[market_type].append(pnl)
                 break
 
             # -----------------------------
             # QUICK SL
             # -----------------------------
-            if profit < -entry * 0.05:
+            if profit < -entry * 0.08:
                 pnl = (ltp - entry) * remaining_qty
-                send_message(f"🚫 Quick SL\n{symbol}")
+                send_message(f"🚨 HARD SL\n{symbol}")
 
                 with lock:
                     portfolio_pnl += pnl
@@ -1101,6 +1175,19 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
 
                 update_exit_time(instrument)
                 log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+
+                performance_log.append({
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "pnl": pnl,
+                    "time": time.time()
+                })
+                
+                if len(performance_log) > 100:
+                    performance_log.pop(0)
+
+                if market_type in strategy_log:
+                    strategy_log[market_type].append(pnl)
+
                 break
 
             # -----------------------------
@@ -1109,10 +1196,30 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
             if ltp > highest_price:
                 highest_price = ltp
 
+            # 🔒 NEVER REDUCE TARGET
+            target = max(target, base_target)
+
+            # 🚀 DYNAMIC TARGET SYSTEM
+            move_pct = (ltp - entry) / entry
+
+            if move_pct > 0.05:
+                target = max(target, entry * 1.10)
+
+            if move_pct > 0.10:
+                target = max(target, entry * 1.25)
+
+            if move_pct > 0.15:
+                target = max(target, entry * 1.40)
+
+            # 🚀 STRONG MOMENTUM HOLD (SAFE VERSION)
+            if profit > entry * 0.12 and not boost_applied:
+                target = entry + (entry * 0.5)
+                boost_applied = True
+
             # -----------------------------
             # PARTIAL
             # -----------------------------
-            if not partial_booked and profit > entry * 0.10:
+            if not partial_booked and profit > entry * 0.07:
                 half = remaining_qty // 2
 
                 if half > 0:
@@ -1123,10 +1230,18 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
             # -----------------------------
             # TRAILING
             # -----------------------------
+            # 🔥 EARLY PROFIT LOCK
+            if profit > entry * 0.03:
+                trailing_sl = max(trailing_sl, entry * 1.01)
+
             if profit > entry * 0.05:
                 trailing_sl = max(trailing_sl, entry * 1.03)
 
-            trailing_sl = max(trailing_sl, ltp * 0.97)
+            # 🔥 SMART TRAILING
+            if profit > entry * 0.08:
+                trailing_sl = max(trailing_sl, ltp * 0.985)
+            else:
+                trailing_sl = max(trailing_sl, ltp * 0.97)
 
             if ltp <= trailing_sl:
                 pnl = (ltp - entry) * remaining_qty
@@ -1147,6 +1262,18 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
 
                 update_exit_time(instrument)
                 log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+                # 📊 LOG PERFORMANCE
+                performance_log.append({
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "pnl": pnl,
+                    "time": time.time()
+                })
+                
+                if len(performance_log) > 100:
+                    performance_log.pop(0)
+
+                if market_type in strategy_log:
+                    strategy_log[market_type].append(pnl)
                 break
 
             # -----------------------------
@@ -1171,12 +1298,25 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
 
                 update_exit_time(instrument)
                 log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+                # 📊 LOG PERFORMANCE
+                performance_log.append({
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "pnl": pnl,
+                    "time": time.time()
+                })
+                
+                if len(performance_log) > 100:
+                    performance_log.pop(0)
+
+                if market_type in strategy_log:
+                    strategy_log[market_type].append(pnl)
                 break
 
             # -----------------------------
             # TIME EXIT
             # -----------------------------
-            if time.time() - entry_time > 900:
+            # ⏱ Smart time exit
+            if time.time() - entry_time > 600 and profit < entry * 0.02:
                 pnl = (ltp - entry) * remaining_qty
                 send_message(f"⏱ Time exit\n{symbol}")
 
@@ -1195,6 +1335,20 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
 
                 update_exit_time(instrument)
                 log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+                # 📊 LOG PERFORMANCE
+                performance_log.append({
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                    "pnl": pnl,
+                    "time": time.time()
+                })
+                
+                if len(performance_log) > 100:
+                    performance_log.pop(0)
+
+                if market_type in strategy_log:
+                    strategy_log[market_type].append(pnl)
+               
+                    
                 break
 
             time.sleep(1)
@@ -1203,25 +1357,73 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability):
             print("Trade error:", e)
             break            
             
+  
+
+def tune_strategy():
+    global adaptive_config
+
+    if len(performance_log) < 10:
+        return
+
+    last_trades = performance_log[-10:]
+    wins = sum(1 for t in last_trades if t["result"] == "WIN")
+    win_rate = wins / len(last_trades)
+
+    print(f"📊 Adaptive Check → Win rate: {win_rate:.2f}")
+
+    # -----------------------------
+    # 🔧 ADJUST PROBABILITY
+    # -----------------------------
+    if win_rate < 0.5:
+        adaptive_config["prob_threshold"] = min(65, adaptive_config["prob_threshold"] + 2)
+        print("⚠️ Increasing probability threshold")
+
+    elif win_rate > 0.65:
+        adaptive_config["prob_threshold"] = max(50, adaptive_config["prob_threshold"] - 2)
+        print("🚀 Lowering threshold (more trades)")
+
+    # -----------------------------
+    # 🔧 ADJUST TREND FILTER
+    # -----------------------------
+    if win_rate < 0.5:
+        adaptive_config["trend_threshold"] = min(0.002, adaptive_config["trend_threshold"] + 0.0002)
+
+    elif win_rate > 0.65:
+        adaptive_config["trend_threshold"] = max(0.001, adaptive_config["trend_threshold"] - 0.0002)
+
+    # -----------------------------
+    # 🔧 ADJUST RISK
+    # -----------------------------
+    if win_rate < 0.45:
+        adaptive_config["risk_multiplier"] = 0.8
+        print("🛑 Reducing risk")
+
+    elif win_rate > 0.7:
+        adaptive_config["risk_multiplier"] = 1.2
+        print("📈 Increasing risk")
+
+    print(f"⚙️ New Config: {adaptive_config}")  
+    
             
-def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probability):
+def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probability, market_type):
     global nifty_active, crude_active
 
     # ✅ SET ACTIVE FLAG
-    if instrument == "NIFTY":
-        nifty_active = True
-    else:
-        crude_active = True
+    with lock:
+        if instrument == "NIFTY":
+            nifty_active = True
+        else:
+            crude_active = True
 
     try:
-        manage_trade(symbol, price, lot, exchange, instrument, signal, probability)
+        manage_trade(symbol, price, lot, exchange, instrument, signal, probability, market_type)
 
     finally:
-        # ✅ RESET ONLY AFTER TRADE COMPLETES
-        if instrument == "NIFTY":
-            nifty_active = False
-        else:
-            crude_active = False
+        with lock:
+            if instrument == "NIFTY":
+                nifty_active = False
+            else:
+                crude_active = False
             
             
 def analyze_performance():
@@ -1235,8 +1437,8 @@ def analyze_performance():
             return
 
         win_rate = (df["pnl"] > 0).mean()
-        avg_profit = df[df["pnl"] > 0]["pnl"].mean()
-        avg_loss = df[df["pnl"] <= 0]["pnl"].mean()
+        avg_profit = df[df["pnl"] > 0]["pnl"].mean() or 0
+        avg_loss = df[df["pnl"] <= 0]["pnl"].mean() or 0
 
         print(f"""
         📊 PERFORMANCE:
@@ -1256,7 +1458,7 @@ def get_trade_probability(token, signal, df):
 
     try:
         score = 0
-
+        df = df.copy()  # ✅ BEFORE vwap
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
@@ -1366,15 +1568,20 @@ def nifty_loop():
             continue
 
         # 🎯 SIGNAL
-        signal = elite_signal(df)
+        #signal = elite_signal(df)
+        signal, market_type = choose_best_strategy(df, config.NIFTY_TOKEN)
         
-        if signal == "HOLD":
-            continue
-        
+        weight = strategy_weights.get(market_type, 1.0)
+
+        # 🎯 PROBABILITY GATE BASED ON WEIGHT
+        adjusted_threshold = adaptive_config["prob_threshold"] * (1.2 - weight)
+
+        print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
+       
             
         trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
 
-        if trend_strength < df.iloc[-1]["close"] * 0.0012:
+        if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
             print("🚫 Weak trend — skip")
             continue
         
@@ -1387,13 +1594,11 @@ def nifty_loop():
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
         print(f"🧠 Probability: {probability}")
 
-        if probability < 55:
+
+        if probability < adjusted_threshold:
+            print("🚫 Skipped due to weighted threshold")
             continue
 
-        # 🚫 SIDEWAYS
-        if is_low_range_market(config.NIFTY_TOKEN):
-            print("🚫 No trade zone")
-            continue
 
         # 🔁 DUPLICATE CONTROL
         if signal == last_executed_signal_nifty:
@@ -1427,7 +1632,10 @@ def nifty_loop():
         print(f"🏆 {symbol} @ {price}")
 
         # 🔒 LOT
-        lot = 1
+        #lot = 1
+        # use calculated lot
+        # (already returned from find_option)
+        # DO NOT override
 
         # ⏳ COOLDOWN
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
@@ -1451,11 +1659,17 @@ def nifty_loop():
 
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, probability),
+                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, probability,market_type),
                 daemon=True
             ).start()
         else:
             nifty_active = False
+            
+        if len(performance_log) >= 5 and len(performance_log) % 5 == 0:
+            tune_strategy()
+            
+        if len(performance_log) % 10 == 0:
+            evaluate_strategies()
 
         time.sleep(1)
 
@@ -1507,35 +1721,39 @@ def crude_loop():
             continue
 
         # 🎯 SIGNAL
-        signal = elite_signal(df)
+        #signal = elite_signal(df)
+        signal, market_type = choose_best_strategy(df, CRUDE_TOKEN)
+        
+        weight = strategy_weights.get(market_type, 1.0)
+
+        # 🎯 PROBABILITY GATE BASED ON WEIGHT
+        adjusted_threshold = adaptive_config["prob_threshold"] * (1.2 - weight)
+
+        print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
         
         if signal == "HOLD":
             continue
             
         trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
 
-        if trend_strength < df.iloc[-1]["close"] * 0.0012:
+        if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
             print("🚫 Weak trend — skip")
             continue
-        
         
 
         print(f"🎯 CRUDE Signal: {signal}")
 
-        # 📈 TREND FILTER
-        if not is_market_trending(CRUDE_TOKEN, df):
-            continue
 
         # 🧠 PROBABILITY
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
         print(f"🧠 Probability: {probability}")
 
-        if probability < 55:
+
+        if probability < adjusted_threshold:
+            print("🚫 Skipped due to weighted threshold")
             continue
 
-        # 🚫 SIDEWAYS
-        if is_low_range_market(CRUDE_TOKEN):
-            continue
+       
 
         # 🔁 DUPLICATE CONTROL
         if signal == last_executed_signal_crude:
@@ -1568,14 +1786,18 @@ def crude_loop():
         print(f"🏆 {symbol} @ {price}")
 
         # 🔒 LOT
-        lot = 1
+        #lot = 1
+        # use calculated lot
+        # (already returned from find_option)
+        # DO NOT override
 
         # ⏳ COOLDOWN
         if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
             continue
 
         # 🚀 ORDER
-        crude_active = True
+        with lock:
+            crude_active = True
 
         filled_price = None
         for _ in range(2):
@@ -1591,11 +1813,19 @@ def crude_loop():
 
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "CRUDE", signal, probability),
+                args=(symbol, filled_price, lot, exchange, "CRUDE", signal, probability,market_type),
                 daemon=True
             ).start()
         else:
             crude_active = False
+            
+        
+        if len(performance_log) >= 5 and len(performance_log) % 5 == 0:
+            tune_strategy()
+            
+        if len(performance_log) % 10 == 0:
+            evaluate_strategies()
+         
 
         time.sleep(1)
         
@@ -1605,10 +1835,11 @@ def get_strike_mode(token):
         now = datetime.datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
-        
 
-        if len(df) < 20:
+        if df is None or len(df) < 20:
             return "ATM"
+
+        df = df.copy()
 
         # -----------------------------
         # VWAP
@@ -1711,30 +1942,22 @@ def get_balance():
     except:
         return 0
         
+        
 def calculate_lots(price, exchange, instrument, strong_trend=False):
 
     global win_streak, loss_streak
+    global portfolio_pnl, peak_portfolio
 
     balance = get_balance() or 10000
-    risk_amount = balance * config.RISK_PER_TRADE
-    
+    risk_amount = balance * config.RISK_PER_TRADE * adaptive_config["risk_multiplier"]
+
+    # -----------------------------
+    # LOT SIZE BASE
+    # -----------------------------
     if instrument == "CRUDE":
         lot_size = 100
-        sl_points = price * 0.10
-        risk_per_lot = sl_points * lot_size
-
-        if risk_per_lot == 0:
-            return 1
-
-        lots = int(risk_amount / risk_per_lot)
-        return max(1, min(lots, config.MAX_LOTS))
-
-    if exchange == "NFO":
-        lot_size = 65
-        token = config.NIFTY_TOKEN
     else:
-        lot_size = 100
-        token = CRUDE_TOKEN
+        lot_size = 65 if exchange == "NFO" else 100
 
     sl_points = price * 0.10
     risk_per_lot = sl_points * lot_size
@@ -1745,26 +1968,47 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     lots = int(risk_amount / risk_per_lot)
 
     # -----------------------------
-    # 🔥 ADAPTIVE RISK LOGIC
+    # 🔥 AUTO SCALE ENGINE
     # -----------------------------
 
-    # 🚀 Increase after wins
-    #if win_streak >= 2:
-    #    print("🚀 Winning streak → increasing lot")
-    #    lots = 1
+    # 🟢 Minimum safety
+    lots = max(1, lots)
 
-    # 🛑 Reduce after losses
-    #if loss_streak >= 2:
-    #    print("⚠️ Losing streak → reducing lot")
-    #    lots = 1
+    # 🚀 Win streak scaling
+    if win_streak >= 2:
+        print("🚀 Scaling up (win streak)")
+        lots = int(lots * 1.4)
+
+    # 🛑 Loss streak protection
+    if loss_streak >= 2:
+        print("⚠️ Scaling down (loss streak)")
+        lots = max(1, int(lots * 0.6))
+
+    # 🛑 Drawdown protection
+    drawdown = peak_portfolio - portfolio_pnl
+    if drawdown > abs(config.MAX_DRAWDOWN) * 0.5:
+        print("🚫 Drawdown protection active")
+        lots = 1
 
     # -----------------------------
-    # 🔥 TREND BOOSTER (already added)
+    # 📈 TREND BOOST (CONTROLLED)
     # -----------------------------
     if strong_trend and win_streak >= 1:
-        lots = int(lots * 1.5)
+        print("📈 Trend boost")
+        lots = int(lots * 1.2)
 
-    # Safety
+    # -----------------------------
+    # 💰 CAPITAL SCALING
+    # -----------------------------
+    if balance > 20000:
+        lots = int(lots * 1.2)
+
+    if balance > 50000:
+        lots = int(lots * 1.4)
+
+    # -----------------------------
+    # FINAL SAFETY
+    # -----------------------------
     lots = max(1, lots)
     lots = min(lots, config.MAX_LOTS)
 
@@ -2127,10 +2371,11 @@ def pullback_signal(token):
         now = datetime.datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
-        
-        
+
         if df is None or len(df) < 10:
             return "HOLD"
+
+        df = df.copy()
 
         df["ema"] = df["close"].ewm(span=9).mean()
 
@@ -2342,6 +2587,76 @@ def is_low_range_market(token):
     except:
         return True
         
+        
+def detect_market_type(df):
+    last = df.iloc[-1]
+    recent = df.iloc[-10:]
+
+    range_ = recent["high"].max() - recent["low"].min()
+    avg_candle = (recent["high"] - recent["low"]).mean()
+
+    trend = abs(last["close"] - recent["close"].iloc[0])
+
+    # 📊 Classify
+    if trend > last["close"] * 0.004:
+        return "TREND"
+
+    elif range_ < last["close"] * 0.002:
+        return "SIDEWAYS"
+
+    elif avg_candle > last["close"] * 0.003:
+        return "VOLATILE"
+
+    else:
+        return "NORMAL"
+        
+        
+def choose_best_strategy(df, token):
+    market_type = detect_market_type(df)
+
+    print(f"🧠 Market Type: {market_type}")
+
+    # 🚫 Strategy disabled → fallback
+    if strategy_weights.get(market_type, 1.0) < 0.3:
+        return "HOLD", market_type
+
+    # -----------------------------
+    # TREND
+    # -----------------------------
+    if market_type == "TREND":
+        signal = elite_signal(df)
+
+    # -----------------------------
+    # SIDEWAYS
+    # -----------------------------
+    elif market_type == "SIDEWAYS":
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        if last["close"] < prev["low"]:
+            signal = "CALL"
+        elif last["close"] > prev["high"]:
+            signal = "PUT"
+        else:
+            signal = "HOLD"
+
+    # -----------------------------
+    # VOLATILE
+    # -----------------------------
+    elif market_type == "VOLATILE":
+        last = df.iloc[-1]
+
+        if last["close"] > last["open"]:
+            signal = "CALL"
+        elif last["close"] < last["open"]:
+            signal = "PUT"
+        else:
+            signal = "HOLD"
+
+    else:
+        signal = elite_signal(df)
+
+    return signal, market_type        
         
 def get_cached_data(token, interval, duration):
 

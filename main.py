@@ -50,7 +50,7 @@ last_signal_crude = None
 last_trade_time_nifty = 0
 last_trade_time_crude = 0
 
-SIGNAL_COOLDOWN = 120  
+SIGNAL_COOLDOWN = 90  
 alert_sent = False
 last_analysis_time = 0
 
@@ -59,7 +59,7 @@ peak_portfolio = 0
 risk_off = False
 
 data_cache = {}
-CACHE_TTL = 15  # seconds
+CACHE_TTL = 20  # seconds
 
 report_sent_today = False
 max_drawdown = 0
@@ -74,10 +74,10 @@ trade_alert_sent = {
 instrument_cache = {}
 
 ltp_cache = {}
-LTP_TTL = 2  # seconds
+LTP_TTL = 3  # seconds
 
 quote_cache = {}
-QUOTE_TTL = 2
+QUOTE_TTL = 3
 
 CRUDE_TOKEN = None
 NIFTY_FUT_TOKEN = None
@@ -297,7 +297,7 @@ def is_market_trending(token, df=None):
         last = df.iloc[-1]
 
         # Example logic (keep your existing if different)
-        vwap = df["close"].mean()
+        vwap = df.iloc[-1]["vwap"]
         atr = (df["high"] - df["low"]).rolling(5).mean().iloc[-1]
 
         print(f"🔥 Trend Check → VWAP Dist: {abs(last['close'] - vwap)}, ATR: {atr}")
@@ -461,10 +461,10 @@ def get_crude_signal(token):
         if strong:
             put_score += 1
 
-        if call_score >= 3 and call_score > put_score:
+        if call_score >= 2 and call_score > put_score:
             return "CALL"
 
-        if put_score >= 3 and put_score > call_score:
+        if put_score >= 2 and put_score > call_score:
             return "PUT"
 
 
@@ -477,7 +477,12 @@ def get_crude_signal(token):
         if strong and below_vwap and last["close"] < prev["close"] and vol_spike:
             return "PUT"
 
-
+        # 🔥 FALLBACK SIGNAL (VERY IMPORTANT)
+        if last["close"] > prev["close"]:
+            return "CALL"
+        elif last["close"] < prev["close"]:
+            return "PUT"
+            
         # -----------------------------
         # DEFAULT
         # -----------------------------
@@ -903,9 +908,9 @@ def place_order(symbol, qty, exchange, instrument):
     
     print(f"🚀 PLACE ORDER CALLED: {symbol}, lot: {qty}, exchange: {exchange}")
 
-    #if not is_good_spread(symbol, exchange):
-    #    print("🚫 Spread too high — skipping")
-    #    return None
+    if not is_good_spread(symbol, exchange):
+        print("🚫 Spread too high — skipping")
+        return None
 
     try:
         full_symbol = f"{exchange}:{symbol}"
@@ -1069,7 +1074,6 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
     while True:
         try:
-            ltp = safe_ltp(full_symbol)
             retry = 0
 
             while True:
@@ -1080,7 +1084,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     if retry > 5:
                         print("❌ LTP failed — exiting trade")
                         return   # ✅ EXIT FUNCTION COMPLETELY
-                    time.sleep(1)
+                    time.sleep(3)
                     continue
 
                 break
@@ -1116,7 +1120,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # -----------------------------
             # ⚡ EARLY EXIT
             # -----------------------------
-            if profit > 0 and ltp < highest_price * 0.985:
+            if profit > entry * 0.03 and ltp < highest_price * 0.98:
                 pnl = (ltp - entry) * remaining_qty
                 send_message(f"⚡ Weakness exit\n{symbol}")
 
@@ -1202,23 +1206,23 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             move_pct = (ltp - entry) / entry
 
             if move_pct > 0.05:
-                target = max(target, entry * 1.10)
+                target = max(target, entry * 1.15)
 
             if move_pct > 0.10:
-                target = max(target, entry * 1.25)
+                target = max(target, entry * 1.35)
 
             if move_pct > 0.15:
-                target = max(target, entry * 1.40)
+                target = max(target, entry * 1.60)
 
             # 🚀 STRONG MOMENTUM HOLD (SAFE VERSION)
             if profit > entry * 0.12 and not boost_applied:
-                target = entry + (entry * 0.5)
+                target = entry + (entry * 0.8)
                 boost_applied = True
 
             # -----------------------------
             # PARTIAL
             # -----------------------------
-            if not partial_booked and profit > entry * 0.07:
+            if not partial_booked and profit > entry * 0.10:
                 half = remaining_qty // 2
 
                 if half > 0:
@@ -1237,10 +1241,10 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 trailing_sl = max(trailing_sl, entry * 1.03)
 
             # 🔥 SMART TRAILING
-            if profit > entry * 0.08:
-                trailing_sl = max(trailing_sl, ltp * 0.985)
+            if profit > entry * 0.10:
+                trailing_sl = max(trailing_sl, ltp * 0.98)
             else:
-                trailing_sl = max(trailing_sl, ltp * 0.97)
+                trailing_sl = max(trailing_sl, ltp * 0.96)
 
             if ltp <= trailing_sl:
                 pnl = (ltp - entry) * remaining_qty
@@ -1350,7 +1354,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     
                 break
 
-            time.sleep(1)
+            time.sleep(2)
 
         except Exception as e:
             print("Trade error:", e)
@@ -1457,12 +1461,11 @@ def get_trade_probability(token, signal, df):
 
     try:
         score = 0
-        df = df.copy()  # ✅ BEFORE vwap
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
         # VWAP alignment
-        vwap = df["close"].mean()
+        vwap = df.iloc[-1]["vwap"]
         if signal == "CALL" and last["close"] > vwap:
             score += 20
         elif signal == "PUT" and last["close"] < vwap:
@@ -1494,7 +1497,7 @@ def get_trade_probability(token, signal, df):
             score += 15
 
         # 🔥 BOOST BASE PROBABILITY
-        base = 30
+        base = 20
 
         final_score = base + score
 
@@ -1544,6 +1547,9 @@ def nifty_loop():
 
     while True:
         now = datetime.datetime.now()
+        
+        if int(time.time()) % 30 == 0:
+            print("💓 NIFTY LOOP RUNNING")
 
         # 🚨 HARD STOP
         if portfolio_pnl < HARD_STOP_LOSS:
@@ -1570,55 +1576,65 @@ def nifty_loop():
         if df is None or len(df) < 5:
             time.sleep(5)
             continue
+            
+        df = df.copy()
+
+        # 🔥 Compute once
+        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
         # 🎯 SIGNAL
-        #signal = elite_signal(df)
-        signal, market_type = choose_best_strategy(df, config.NIFTY_TOKEN)
-        
+        signal = elite_signal(df)
+        market_type = "NORMAL"
+        #signal, market_type = choose_best_strategy(df, config.NIFTY_TOKEN)
+        print(f"🎯 NIFTY Signal: {signal}")
         weight = strategy_weights.get(market_type, 1.0)
 
         # 🎯 PROBABILITY GATE BASED ON WEIGHT
-        adjusted_threshold = adaptive_config["prob_threshold"] * (1.0 - (weight - 0.8))
-
-        print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
+        #adjusted_threshold = adaptive_config["prob_threshold"] * (1.0 - (weight - 0.8))
+        #print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
        
             
         # 🔥 RELAXED TREND FILTER
-        trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
+        #trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
 
-        if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
-            print("⚠️ Weak trend — allowing with low confidence")
-            # continue   ❌ REMOVE THIS
+        #if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
+        #    print("🚫 Weak trend — skipping")
+        #    continue
         
-        if signal == "HOLD":
+        if not signal or signal == "HOLD":
             continue
 
         print(f"🎯 Signal: {signal}")
+        
+        # 🚫 Avoid small candles (noise)
+        #last = df.iloc[-1]
+        #rng = last["high"] - last["low"]
+
+        #if rng < last["close"] * 0.001:
+        #    print("🚫 Small candle — skip")
+        #    continue
 
         # 🧠 PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
-        # 🚀 SIGNAL BOOST
-        probability += 10
-        
-        
-        # 🔥 MINIMUM FLOOR (VERY IMPORTANT)
-        if probability < 40:
-            probability = 40
-            print(f"🧠 Probability: {probability}")
+       
+        print(f"🧠 Probability: {probability}")
 
-        if probability < adjusted_threshold:
-            if probability < 35:
-                print("🚫 Very low probability — skip")
-                continue
-            else:
-                print("⚡ Allowing medium confidence trade")
+        if probability < adaptive_config["prob_threshold"]:
+            print("🚫 Below probability threshold")
+            continue
+            
+        # 🔥 Momentum confirmation (VERY POWERFUL)
+        #last = df.iloc[-1]
+        #prev = df.iloc[-2]
 
+        #if signal == "CALL" and last["close"] <= prev["close"]:
+        #    print("🚫 No upward momentum")
+        #    continue
 
-        # 🔁 DUPLICATE CONTROL
-        if signal == last_executed_signal_nifty:
-            if time.time() - last_exit_time_nifty < REENTRY_COOLDOWN:
-                if probability < 60:
-                    continue
+        #if signal == "PUT" and last["close"] >= prev["close"]:
+        #    print("🚫 No downward momentum")
+        #    continue
+
 
         # 📈 ENTRY CONFIRM
         #if not confirm_entry(config.NIFTY_TOKEN, signal, df):
@@ -1701,7 +1717,8 @@ def crude_loop():
     while True:
         now = datetime.datetime.now(IST)
 
-        print("💓 CRUDE LOOP RUNNING")
+        if int(time.time()) % 30 == 0:
+            print("💓 CRUDE LOOP RUNNING")
 
         # 🚨 HARD STOP
         if portfolio_pnl < HARD_STOP_LOSS:
@@ -1730,58 +1747,64 @@ def crude_loop():
         if df is None or len(df) < 5:
             time.sleep(5)
             continue
+            
+        df = df.copy()
+
+        # 🔥 Compute once
+        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
         # 🎯 SIGNAL
+        signal = get_crude_signal(CRUDE_TOKEN)
         #signal = elite_signal(df)
-        signal, market_type = choose_best_strategy(df, CRUDE_TOKEN)
-        
+        market_type = "NORMAL"
+        #signal, market_type = choose_best_strategy(df, CRUDE_TOKEN)
+        print(f"🎯 CRUDE Signal: {signal}")
         weight = strategy_weights.get(market_type, 1.0)
 
         # 🎯 PROBABILITY GATE BASED ON WEIGHT
-        adjusted_threshold = adaptive_config["prob_threshold"] * (1.0 - (weight - 0.8))
-
-        print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
+        #adjusted_threshold = adaptive_config["prob_threshold"] * (1.0 - (weight - 0.8))
+        #print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
         
-        if signal == "HOLD":
+        if not signal or signal == "HOLD":
             continue
             
         # 🔥 RELAXED TREND FILTER
-        trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
+        #trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
 
-        if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
-            print("⚠️ Weak trend — allowing with low confidence")
-            # continue   ❌ REMOVE THIS
+        #if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
+        #    print("🚫 Weak trend — skipping")
+        #    continue
         
 
         print(f"🎯 CRUDE Signal: {signal}")
+        
+        # 🚫 Avoid small candles (noise)
+        #last = df.iloc[-1]
+        #rng = last["high"] - last["low"]
 
+        #if rng < last["close"] * 0.001:
+        #    print("🚫 Small candle — skip")
+        #    continue
 
-        # 🧠 PROBABILITY
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
-        # 🚀 SIGNAL BOOST
-        probability += 10
+
+        print(f"🧠 Probability: {probability}")
+
+        if probability < adaptive_config["prob_threshold"]:
+            print("🚫 Below probability threshold")
+            continue
         
-        
-        # 🔥 MINIMUM FLOOR (VERY IMPORTANT)
-        if probability < 40:
-            probability = 40
-            print(f"🧠 Probability: {probability}")
+        # 🔥 Momentum confirmation (VERY POWERFUL)
+        #last = df.iloc[-1]
+        #prev = df.iloc[-2]
 
+        #if signal == "CALL" and last["close"] <= prev["close"]:
+        #    print("🚫 No upward momentum")
+        #    continue
 
-        if probability < adjusted_threshold:
-            if probability < 35:
-                print("🚫 Very low probability — skip")
-                continue
-            else:
-                print("⚡ Allowing medium confidence trade")
-
-       
-
-        # 🔁 DUPLICATE CONTROL
-        if signal == last_executed_signal_crude:
-            if time.time() - last_exit_time_crude < REENTRY_COOLDOWN:
-                if probability < 60:
-                    continue
+        #if signal == "PUT" and last["close"] >= prev["close"]:
+        #    print("🚫 No downward momentum")
+        #    continue
 
         # 📈 ENTRY
         #if not confirm_entry(CRUDE_TOKEN, signal, df):
@@ -1923,9 +1946,6 @@ def confirm_entry(token, signal, df=None):
         if df is None or len(df) < 10:
             return False
             
-            
-        df = df.copy()
-        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
@@ -2435,7 +2455,6 @@ def get_ml_cached():
 # -----------------------------
 def elite_signal(df):
     df = df.copy()
-    df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
     df["vol_ma"] = df["volume"].rolling(5).mean()
 
     last = df.iloc[-1]
@@ -2444,23 +2463,22 @@ def elite_signal(df):
     body = abs(last["close"] - last["open"])
     rng = last["high"] - last["low"]
 
-    # CALL
-    if (
-        last["close"] > prev["high"] and
-        last["close"] > last["vwap"] and
-        last["volume"] > last["vol_ma"] * 1.3 and
-        body > rng * 0.5
-    ):
+    # keep breakout as primary
+    if last["close"] > prev["high"] and last["close"] > last["vwap"]:
         return "CALL"
 
-    # PUT
-    if (
-        last["close"] < prev["low"] and
-        last["close"] < last["vwap"] and
-        last["volume"] > last["vol_ma"] * 1.3 and
-        body > rng * 0.5
-    ):
+    if last["close"] < prev["low"] and last["close"] < last["vwap"]:
         return "PUT"
+
+    # 🔥 fallback ONLY if candle is strong
+    body = abs(last["close"] - last["open"])
+    rng = last["high"] - last["low"]
+
+    if rng > 0 and body > rng * 0.5:
+        if last["close"] > last["vwap"]:
+            return "CALL"
+        elif last["close"] < last["vwap"]:
+            return "PUT"
 
     return "HOLD"
         

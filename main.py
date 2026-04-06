@@ -1547,7 +1547,7 @@ def nifty_loop():
 
     while True:
         now = datetime.datetime.now()
-        
+
         if int(time.time()) % 30 == 0:
             print("💓 NIFTY LOOP RUNNING")
 
@@ -1567,6 +1567,7 @@ def nifty_loop():
             time.sleep(60)
             continue
 
+        # 🚫 STATE CHECK
         if nifty_active or not can_trade() or risk_off:
             time.sleep(5)
             continue
@@ -1576,77 +1577,57 @@ def nifty_loop():
         if df is None or len(df) < 5:
             time.sleep(5)
             continue
-            
+
         df = df.copy()
 
-        # 🔥 Compute once
+        # 🔥 VWAP (compute once)
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
         # 🎯 SIGNAL
         signal = elite_signal(df)
         market_type = "NORMAL"
-        #signal, market_type = choose_best_strategy(df, config.NIFTY_TOKEN)
+
         print(f"🎯 NIFTY Signal: {signal}")
-        weight = strategy_weights.get(market_type, 1.0)
 
-        # 🎯 PROBABILITY GATE BASED ON WEIGHT
-        #adjusted_threshold = adaptive_config["prob_threshold"] * (1.0 - (weight - 0.8))
-        #print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
-       
-            
-        # 🔥 RELAXED TREND FILTER
-        #trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
-
-        #if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
-        #    print("🚫 Weak trend — skipping")
-        #    continue
-        
+        # 🚫 Skip HOLD
         if not signal or signal == "HOLD":
             continue
 
-        print(f"🎯 Signal: {signal}")
-        
-        # 🚫 Avoid small candles (noise)
-        #last = df.iloc[-1]
-        #rng = last["high"] - last["low"]
-
-        #if rng < last["close"] * 0.001:
-        #    print("🚫 Small candle — skip")
-        #    continue
-
-        # 🧠 PROBABILITY
+        # 🧠 BASE PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
-       
-        print(f"🧠 Probability: {probability}")
 
+        # 🔥 MULTI-STRATEGY
+        multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+
+        # 🎯 CONFIDENCE ADJUSTMENT
+        if signal == multi_signal and signal != "HOLD":
+            probability += 10
+        elif signal != multi_signal:
+            probability -= 5
+
+        # 🤖 ML CONFIDENCE BOOST
+        if ml_conf >= 65:
+            probability += 5
+        elif ml_conf < 50:
+            probability -= 5
+
+        # 🔒 Clamp
+        probability = max(0, min(probability, 100))
+
+        print(f"🧠 Final Probability: {probability}")
+
+        # 🚫 Threshold
         if probability < adaptive_config["prob_threshold"]:
             print("🚫 Below probability threshold")
             continue
-            
-        # 🔥 Momentum confirmation (VERY POWERFUL)
-        #last = df.iloc[-1]
-        #prev = df.iloc[-2]
 
-        #if signal == "CALL" and last["close"] <= prev["close"]:
-        #    print("🚫 No upward momentum")
-        #    continue
-
-        #if signal == "PUT" and last["close"] >= prev["close"]:
-        #    print("🚫 No downward momentum")
-        #    continue
-
-
-        # 📈 ENTRY CONFIRM
-        #if not confirm_entry(config.NIFTY_TOKEN, signal, df):
-        #    continue
-
-        # 🔍 OPTION
+        # 🔍 OPTION SELECTION
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
         if not symbol or not price or price <= 0:
             print("❌ Skipped: Invalid option price")
             continue
 
-        # 📊 PRICE CHECK
+        # 📊 PRICE VALIDATION
         ltp_check = safe_ltp(f"{exchange}:{symbol}")
         if not ltp_check:
             continue
@@ -1654,15 +1635,7 @@ def nifty_loop():
         if price > ltp_check * 1.08:
             print("⚠️ Slightly high price — allowed")
 
-
         print(f"🏆 {symbol} @ {price}")
-
-        # 🔒 LOT
-        #lot = 1
-        
-        # use calculated lot
-        # (already returned from find_option)
-        # DO NOT override
 
         # ⏳ COOLDOWN
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
@@ -1686,19 +1659,20 @@ def nifty_loop():
 
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, probability,market_type),
+                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, probability, market_type),
                 daemon=True
             ).start()
         else:
             nifty_active = False
-            
+
+        # 📊 ADAPTIVE TUNING
         if len(performance_log) >= 5 and len(performance_log) % 5 == 0:
             tune_strategy()
-            
+
         if len(performance_log) % 10 == 0:
             evaluate_strategies()
 
-        time.sleep(1)
+        time.sleep(1.5)
 
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
@@ -1757,6 +1731,9 @@ def crude_loop():
         signal = get_crude_signal(CRUDE_TOKEN)
         #signal = elite_signal(df)
         market_type = "NORMAL"
+      
+        
+        
         #signal, market_type = choose_best_strategy(df, CRUDE_TOKEN)
         print(f"🎯 CRUDE Signal: {signal}")
         weight = strategy_weights.get(market_type, 1.0)

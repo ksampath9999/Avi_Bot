@@ -2479,6 +2479,13 @@ def elite_signal(df):
             return "CALL"
         elif last["close"] < last["vwap"]:
             return "PUT"
+            
+    # 🔥 SMART FALLBACK (controlled entry)
+    if last["close"] > prev["close"] and last["close"] > last["vwap"]:
+        return "CALL"
+
+    if last["close"] < prev["close"] and last["close"] < last["vwap"]:
+        return "PUT"
 
     return "HOLD"
         

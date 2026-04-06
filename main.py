@@ -687,13 +687,11 @@ def find_option(signal, instrument):
     price = None
     lot = None
     exchange = None
-    
+
     global CRUDE_SYMBOL
 
     if CRUDE_SYMBOL is None:
         CRUDE_SYMBOL = get_crude_fut_symbol()
-
-    
 
     # -----------------------------
     # CONFIG
@@ -712,50 +710,44 @@ def find_option(signal, instrument):
         token = CRUDE_TOKEN
         token_symbol = CRUDE_SYMBOL
         lot_size = 100
-        
-    print("DEBUG CRUDE SYMBOL:", token_symbol)
-    
+
+    print("DEBUG TOKEN SYMBOL:", token_symbol)
+
     if instrument == "CRUDE" and not token_symbol:
         print("❌ CRUDE symbol is None")
         return None, None, None, None
 
     # -----------------------------
-    # FETCH DATA (SAFE)
+    # FETCH DATA
     # -----------------------------
     df = get_cached_data(token, "5minute", 150)
-    
-    
+
     if df is None or df.empty:
         print("❌ No data for option scoring")
         return None, None, None, None
 
     # -----------------------------
-    # LTP (FINAL FIX)
+    # LTP SAFE
     # -----------------------------
-
     if not token_symbol or ":" not in token_symbol:
         print("❌ Invalid token symbol")
         return None, None, None, None
 
     ltp = safe_ltp(token_symbol)
 
-    if ltp is None:
-        print("❌ LTP fetch failed:", token_symbol)
+    if ltp is None or ltp <= 0:
+        print("❌ LTP fetch failed:", token_symbol, ltp)
         return None, None, None, None
 
+    # -----------------------------
+    # ATM
+    # -----------------------------
     if instrument == "CRUDE":
-        atm = int(round(ltp / 100) * 100)   # 🔥 FORCE 100 STRIKE
+        atm = int(round(ltp / 100) * 100)
     else:
         atm = round(ltp / step) * step
 
-    # -----------------------------
-    # MODE
-    # -----------------------------
-    saved_mode = load_best_settings(instrument)
-    ai_mode = get_strike_mode(token)
-    mode = saved_mode if saved_mode else ai_mode
-
-    print(f"{instrument} LTP: {ltp} | Mode: {mode}")
+    print(f"{instrument} LTP: {ltp} | ATM: {atm}")
 
     # -----------------------------
     # CAPITAL
@@ -767,15 +759,9 @@ def find_option(signal, instrument):
     # STRIKES
     # -----------------------------
     if instrument == "CRUDE":
-        if signal == "CALL":
-            strikes = [atm, atm + 100, atm - 100]
-        else:
-            strikes = [atm, atm - 100, atm + 100]
+        strikes = [atm, atm + 100, atm - 100] if signal == "CALL" else [atm, atm - 100, atm + 100]
     else:
-        if signal == "CALL":
-            strikes = [atm, atm + step, atm - step]
-        else:
-            strikes = [atm, atm - step, atm + step]
+        strikes = [atm, atm + step, atm - step] if signal == "CALL" else [atm, atm - step, atm + step]
 
     instruments = get_instruments_cached(exchange)
     today = datetime.datetime.now().date()
@@ -798,14 +784,13 @@ def find_option(signal, instrument):
     opt_type = "CE" if signal == "CALL" else "PE"
 
     candidates = []
-    
+
     print(f"ATM: {atm}, Strikes: {strikes}, Expiry: {expiry}")
 
     # -----------------------------
     # MAIN SELECTION
     # -----------------------------
     for strike in strikes:
-
         for i in opts:
 
             if i["expiry"] != expiry or i["instrument_type"] != opt_type:
@@ -825,11 +810,10 @@ def find_option(signal, instrument):
             sym = f"{exchange}:{i['tradingsymbol']}"
             p = safe_ltp(sym)
 
-            if p is None:
+            # 🔴 FIX: skip invalid price
+            if p is None or p <= 0:
+                print(f"❌ Invalid price for {sym}: {p}")
                 continue
-
-            #if not is_liquid_option(i["tradingsymbol"], exchange):
-            #    continue
 
             trade_value = p * lot_size
             limit = max_trade_value * (5 if instrument == "CRUDE" else 3)
@@ -850,9 +834,16 @@ def find_option(signal, instrument):
     # -----------------------------
     if candidates:
         best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
+
         print(f"🏆 Selected: {best['symbol']} @ {best['price']}")
+
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
+
+        # 🔴 FINAL SAFETY
+        if best["price"] <= 0:
+            print("❌ Final price invalid — skipping")
+            return None, None, None, None
 
         return best["symbol"], best["price"], lot, exchange
 
@@ -882,20 +873,19 @@ def find_option(signal, instrument):
             sym = f"{exchange}:{i['tradingsymbol']}"
             p = safe_ltp(sym)
 
-            if p is None:
+            if p is None or p <= 0:
                 continue
 
-            #if not is_liquid_option(i["tradingsymbol"], exchange):
-            #    continue
-
             trade_value = p * lot_size
+
             if trade_value <= max_trade_value * 3:
                 min_diff = diff
                 best = i["tradingsymbol"]
                 best_price = p
 
-    if best:
+    if best and best_price > 0:
         print(f"✅ Fallback selected: {best} @ {best_price}")
+
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best_price, exchange, instrument, strong_trend)
 
@@ -937,6 +927,10 @@ def place_order(symbol, qty, exchange, instrument):
             price = round(ltp * (1 + spread_buffer), 1)
         
         print("➡️ Sending order to Zerodha...")
+        
+        if price <= 0:
+            print(f"❌ Order blocked: Invalid price {price}")
+            return None
 
         order_id = kite.place_order(
             variety="regular",
@@ -1616,7 +1610,8 @@ def nifty_loop():
 
         # 🔍 OPTION
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
-        if not symbol or not price:
+        if not symbol or not price or price <= 0:
+            print("❌ Skipped: Invalid option price")
             continue
 
         # 📊 PRICE CHECK
@@ -1771,7 +1766,8 @@ def crude_loop():
 
         # 🔍 OPTION
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
-        if not symbol or not price:
+        if not symbol or not price or price <= 0:
+            print("❌ Skipped: Invalid option price")
             continue
 
         # 📊 PRICE CHECK

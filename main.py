@@ -12,6 +12,11 @@ import os
 import json
 
 
+if not os.path.exists("trade_log.csv"):
+    with open("trade_log.csv", "w") as f:
+        f.write("time,symbol,entry,exit,pnl\n")
+
+
 
 bot_started = False
 lock = threading.Lock()
@@ -97,7 +102,7 @@ CRUDE_TOKEN = config.CRUDE_TOKEN
 performance_log = []
 
 adaptive_config = {
-    "prob_threshold": 55,
+    "prob_threshold": 45,
     "trend_threshold": 0.0015,
     "risk_multiplier": 1.0
 }
@@ -1606,8 +1611,8 @@ def nifty_loop():
                 continue
 
         # 📈 ENTRY CONFIRM
-        if not confirm_entry(config.NIFTY_TOKEN, signal, df):
-            continue
+        #if not confirm_entry(config.NIFTY_TOKEN, signal, df):
+        #    continue
 
         # 🔍 OPTION
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
@@ -1761,8 +1766,8 @@ def crude_loop():
                 continue
 
         # 📈 ENTRY
-        if not confirm_entry(CRUDE_TOKEN, signal, df):
-            continue
+        #if not confirm_entry(CRUDE_TOKEN, signal, df):
+        #    continue
 
         # 🔍 OPTION
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
@@ -2447,33 +2452,43 @@ def elite_signal(df):
 def multi_strategy_signal(token, instrument):
 
     signals = []
-    ml_conf = 50
+    ml_conf = 50  # default safe fallback
 
+    # -----------------------------
+    # CORE STRATEGIES
+    # -----------------------------
     signals.append(vwap_signal(token))
     signals.append(breakout_signal(token))
     signals.append(pullback_signal(token))
 
+    # -----------------------------
+    # ML (SAFE HANDLING)
+    # -----------------------------
     try:
         data = get_ml_cached()
-        if not data:
-            ml_conf = 50
 
-        if data:
+        # ✅ only use ML if VALID
+        if isinstance(data, dict):
             ml_signal = data.get("signal", "HOLD")
             ml_conf = data.get("confidence", 50)
 
-            if ml_conf > 50:
+            # only trust ML if strong
+            if ml_conf >= 60:
                 signals.append(ml_signal)
 
-    except:
-        pass
+        else:
+            ml_conf = 50  # fallback
 
-    call_count = signals.count("CALL")
-    put_count = signals.count("PUT")
+    except Exception as e:
+        print(f"⚠️ ML error: {e}")
+        ml_conf = 50  # fallback
 
     # -----------------------------
     # PRIMARY LOGIC
     # -----------------------------
+    call_count = signals.count("CALL")
+    put_count = signals.count("PUT")
+
     if call_count >= 2:
         return "CALL", ml_conf
 
@@ -2481,14 +2496,14 @@ def multi_strategy_signal(token, instrument):
         return "PUT", ml_conf
 
     # -----------------------------
-    # ⚡ OPTIONAL FIX (BALANCED MODE)
+    # ⚡ BALANCED MODE (SAFE OVERRIDE)
     # -----------------------------
-    if ml_conf >= 60:
-        if signals.count("CALL") >= 1:
-            print("⚡ ML override CALL")
+    if ml_conf >= 65:   # slightly stricter
+        if call_count >= 1:
+            print("⚡ ML assisted CALL")
             return "CALL", ml_conf
-        elif signals.count("PUT") >= 1:
-            print("⚡ ML override PUT")
+        elif put_count >= 1:
+            print("⚡ ML assisted PUT")
             return "PUT", ml_conf
 
     # -----------------------------
@@ -2880,9 +2895,15 @@ if __name__ == "__main__":
     import threading
 
     # -----------------------------
-    # 🎯 TOKEN INITIALIZATION (FIXED)
+    # 📄 CREATE TRADE LOG FILE (FIX)
     # -----------------------------
+    if not os.path.exists("trade_log.csv"):
+        with open("trade_log.csv", "w") as f:
+            f.write("time,symbol,entry,exit,pnl\n")
 
+    # -----------------------------
+    # 🎯 TOKEN INITIALIZATION
+    # -----------------------------
     CRUDE_TOKEN = get_latest_fut_token("CRUDEOIL", "MCX")
     NIFTY_FUT_TOKEN = get_nifty_fut_token()
 
@@ -2921,19 +2942,10 @@ if __name__ == "__main__":
     atexit.register(remove_lock)
 
     # -----------------------------
-    # 🚀 START ML SERVER
-    # -----------------------------
-    threading.Thread(target=run_ml_server, daemon=True).start()
-    print("✅ ML thread started")
-
-    time.sleep(2)
-
-    # -----------------------------
     # 🚀 START TRADING LOOPS
     # -----------------------------
     threading.Thread(target=nifty_loop, daemon=True).start()
 
-    # ✅ Start CRUDE only if token valid
     if CRUDE_TOKEN:
         threading.Thread(target=crude_loop, daemon=True).start()
     else:
@@ -2951,7 +2963,7 @@ if __name__ == "__main__":
         pass
 
     # -----------------------------
-    # 🔁 DAILY TOKEN REFRESH (PRO)
+    # 🔁 DAILY TOKEN REFRESH
     # -----------------------------
     def refresh_tokens():
         data_cache.clear()

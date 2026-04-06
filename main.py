@@ -1493,7 +1493,12 @@ def get_trade_probability(token, signal, df):
         if rng > 0 and body > rng * 0.6:
             score += 15
 
-        return min(score, 100)
+        # 🔥 BOOST BASE PROBABILITY
+        base = 30
+
+        final_score = base + score
+
+        return min(final_score, 100)
 
     except:
         return 0
@@ -1531,7 +1536,7 @@ def nifty_loop():
     print("🔥 NIFTY LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
-        adjust_strategy()
+        tune_strategy()
         last_analysis_time = time.time()
 
     if last_reset_date != datetime.date.today():
@@ -1573,16 +1578,17 @@ def nifty_loop():
         weight = strategy_weights.get(market_type, 1.0)
 
         # 🎯 PROBABILITY GATE BASED ON WEIGHT
-        adjusted_threshold = adaptive_config["prob_threshold"] * (1.2 - weight)
+        adjusted_threshold = adaptive_config["prob_threshold"] * (1.0 - (weight - 0.8))
 
         print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
        
             
+        # 🔥 RELAXED TREND FILTER
         trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
 
         if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
-            print("🚫 Weak trend — skip")
-            continue
+            print("⚠️ Weak trend — allowing with low confidence")
+            # continue   ❌ REMOVE THIS
         
         if signal == "HOLD":
             continue
@@ -1591,18 +1597,28 @@ def nifty_loop():
 
         # 🧠 PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
-        print(f"🧠 Probability: {probability}")
-
+        # 🚀 SIGNAL BOOST
+        probability += 10
+        
+        
+        # 🔥 MINIMUM FLOOR (VERY IMPORTANT)
+        if probability < 40:
+            probability = 40
+            print(f"🧠 Probability: {probability}")
 
         if probability < adjusted_threshold:
-            print("🚫 Skipped due to weighted threshold")
-            continue
+            if probability < 35:
+                print("🚫 Very low probability — skip")
+                continue
+            else:
+                print("⚡ Allowing medium confidence trade")
 
 
         # 🔁 DUPLICATE CONTROL
         if signal == last_executed_signal_nifty:
             if time.time() - last_exit_time_nifty < REENTRY_COOLDOWN:
-                continue
+                if probability < 60:
+                    continue
 
         # 📈 ENTRY CONFIRM
         #if not confirm_entry(config.NIFTY_TOKEN, signal, df):
@@ -1619,20 +1635,15 @@ def nifty_loop():
         if not ltp_check:
             continue
 
-        if price > ltp_check * 1.03:
-            print("🚫 Price too high")
-            continue
+        if price > ltp_check * 1.08:
+            print("⚠️ Slightly high price — allowed")
 
-        if signal == "CALL" and ltp_check > price * 1.02:
-            continue
-
-        if signal == "PUT" and ltp_check < price * 0.98:
-            continue
 
         print(f"🏆 {symbol} @ {price}")
 
         # 🔒 LOT
         #lot = 1
+        
         # use calculated lot
         # (already returned from find_option)
         # DO NOT override
@@ -1681,7 +1692,7 @@ def crude_loop():
     print("🔥 CRUDE LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
-        adjust_strategy()
+        tune_strategy()
         last_analysis_time = time.time()
 
     if last_reset_date != datetime.date.today():
@@ -1727,18 +1738,19 @@ def crude_loop():
         weight = strategy_weights.get(market_type, 1.0)
 
         # 🎯 PROBABILITY GATE BASED ON WEIGHT
-        adjusted_threshold = adaptive_config["prob_threshold"] * (1.2 - weight)
+        adjusted_threshold = adaptive_config["prob_threshold"] * (1.0 - (weight - 0.8))
 
         print(f"⚖️ Strategy weight: {weight:.2f} | Adjusted threshold: {adjusted_threshold:.2f}")
         
         if signal == "HOLD":
             continue
             
+        # 🔥 RELAXED TREND FILTER
         trend_strength = abs(df.iloc[-1]["close"] - df.iloc[-5]["close"])
 
         if trend_strength < df.iloc[-1]["close"] * adaptive_config["trend_threshold"]:
-            print("🚫 Weak trend — skip")
-            continue
+            print("⚠️ Weak trend — allowing with low confidence")
+            # continue   ❌ REMOVE THIS
         
 
         print(f"🎯 CRUDE Signal: {signal}")
@@ -1746,19 +1758,30 @@ def crude_loop():
 
         # 🧠 PROBABILITY
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
-        print(f"🧠 Probability: {probability}")
+        # 🚀 SIGNAL BOOST
+        probability += 10
+        
+        
+        # 🔥 MINIMUM FLOOR (VERY IMPORTANT)
+        if probability < 40:
+            probability = 40
+            print(f"🧠 Probability: {probability}")
 
 
         if probability < adjusted_threshold:
-            print("🚫 Skipped due to weighted threshold")
-            continue
+            if probability < 35:
+                print("🚫 Very low probability — skip")
+                continue
+            else:
+                print("⚡ Allowing medium confidence trade")
 
        
 
         # 🔁 DUPLICATE CONTROL
         if signal == last_executed_signal_crude:
             if time.time() - last_exit_time_crude < REENTRY_COOLDOWN:
-                continue
+                if probability < 60:
+                    continue
 
         # 📈 ENTRY
         #if not confirm_entry(CRUDE_TOKEN, signal, df):
@@ -1775,19 +1798,15 @@ def crude_loop():
         if not ltp_check:
             continue
 
-        if price > ltp_check * 1.03:
-            continue
+        if price > ltp_check * 1.08:
+            print("⚠️ Slightly high price — allowed")
 
-        if signal == "CALL" and ltp_check > price * 1.02:
-            continue
-
-        if signal == "PUT" and ltp_check < price * 0.98:
-            continue
 
         print(f"🏆 {symbol} @ {price}")
 
         # 🔒 LOT
         #lot = 1
+        
         # use calculated lot
         # (already returned from find_option)
         # DO NOT override
@@ -1945,6 +1964,8 @@ def get_balance():
         
         
 def calculate_lots(price, exchange, instrument, strong_trend=False):
+    #comment if want to auto lot selection
+    return 1 
 
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio
@@ -2736,6 +2757,7 @@ def backtest_full(token, instrument, days=5):
         if signal == "HOLD":
             print("Backtest Signal:", signal)
             continue
+            
 
         entry = current_price
         sl = entry - (entry * 0.15)

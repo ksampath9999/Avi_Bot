@@ -13,6 +13,7 @@ import joblib
 from kiteconnect import KiteConnect
 import config
 import time
+import gdown
 
 
 last_fetch_time = 0
@@ -29,8 +30,11 @@ kite.set_access_token(config.ACCESS_TOKEN)
 # -----------------------------
 # MODEL CONFIG
 # -----------------------------
+#MODEL_PATH = "ml_model.pkl"
+#MODEL_URL = "https://drive.google.com/uc?export=download&id=1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc"   # <-- paste your Google Drive direct link
+
 MODEL_PATH = "ml_model.pkl"
-MODEL_URL = "https://drive.google.com/uc?export=download&id=1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc"   # <-- paste your Google Drive direct link
+MODEL_FILE_ID = "1VHtGkihPhZys4cWtTHzHPdPwVhK_2LXc"
 
     
 def get_data():
@@ -57,37 +61,24 @@ def get_data():
 # DOWNLOAD MODEL
 # -----------------------------
 def download_model():
-    import requests
-    URL = MODEL_URL
-    
     if os.path.exists(MODEL_PATH):
-        print("✅ Model already exists — skipping download")
+        print("✅ Model already exists")
         return True
 
     try:
-        session = requests.Session()
-        response = session.get(URL, stream=True, timeout=10)
+        url = f"https://drive.google.com/uc?id={MODEL_FILE_ID}"
+        print("⬇️ Downloading model via gdown...")
+        gdown.download(url, MODEL_PATH, quiet=False)
 
-        for key, value in response.cookies.items():
-            if key.startswith("download_warning"):
-                URL = URL + "&confirm=" + value
-
-        response = session.get(URL, stream=True)
-
-        if "text/html" in response.headers.get("Content-Type", ""):
-            print("❌ Invalid file (HTML)")
+        if not os.path.exists(MODEL_PATH):
+            print("❌ Download failed — file missing")
             return False
 
-        with open(MODEL_PATH, "wb") as f:
-            for chunk in response.iter_content(1024):
-                if chunk:
-                    f.write(chunk)
-
-        print("✅ Model downloaded")
+        print("✅ Model downloaded successfully")
         return True
 
     except Exception as e:
-        print("❌ Download error:", e)
+        print("❌ gdown error:", e)
         return False
 
 
@@ -101,11 +92,23 @@ try:
     # 🔥 RETRY DOWNLOAD (PRO TIP ADDED HERE)
     success = False
 
-    for _ in range(3):
+    model = None
+    MODEL_LOADED = False
+
+    try:
         if download_model():
-            success = True
-            break
-        time.sleep(2)
+            model = joblib.load(MODEL_PATH)
+            MODEL_LOADED = True
+            print("✅ Model loaded successfully")
+
+            # 🔍 DEBUG CHECK (ADD HERE)
+            print("🔍 Model type:", type(model))
+
+        else:
+            print("⚠️ Model download failed")
+
+    except Exception as e:
+        print("❌ Model load failed:", e)
 
     if not success:
         print("⚠️ Model download failed after retries")
@@ -199,7 +202,7 @@ def get_signal():
         # 🚫 LOW VOLATILITY FILTER (ADD HERE)
         rng = last["high"] - last["low"]
 
-        if rng < last["close"] * 0.001:
+        if rng < last["close"] * 0.0005:
             print("⚠️ Low volatility market")
 
             return jsonify({
@@ -236,14 +239,13 @@ def get_signal():
 
                 # 🚫 LOW CONFIDENCE FILTER (ADD HERE)
                 # 🚀 COMBINED SMART FILTER
-                if confidence < 60:
-                    if rng < last["close"] * 0.002:
-                        print("⚠️ Weak ML + low volatility")
-                        return jsonify({
-                            "signal": "HOLD",
-                            "confidence": round(confidence, 2),
-                            "reason": "Weak setup"
-                        })
+                if confidence < 52:
+                    print(f"⚠️ Weak ML: {confidence}")
+                    return jsonify({
+                        "signal": signal,   # ✅ DO NOT FORCE HOLD
+                        "confidence": round(confidence, 2),
+                        "reason": "Weak ML but allowed"
+                    })
 
                     print(f"⚠️ Low confidence: {confidence}")
                     return jsonify({
@@ -251,6 +253,8 @@ def get_signal():
                         "confidence": round(confidence, 2),
                         "reason": "Low ML confidence"
                     })
+                    
+                print(f"🤖 ML Output → {signal} | Confidence: {confidence}")    
 
                 return jsonify({
                     "signal": signal,

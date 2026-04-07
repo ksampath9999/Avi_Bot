@@ -1631,6 +1631,10 @@ def nifty_loop():
         df["volume"] = df["volume"].replace(0, 1)
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
         df["vwap"] = df["vwap"].fillna(df["close"])
+        
+        # 🔥 ADD EMA (VERY IMPORTANT)
+        df["ema9"] = df["close"].ewm(span=9).mean()
+        df["ema20"] = df["close"].ewm(span=20).mean()
 
         # 🎯 SIGNAL
         signal = elite_signal(df)
@@ -2514,10 +2518,18 @@ def get_ml_cached():
 def elite_signal(df):
     import pandas as pd
 
+    # 🔒 BASIC SAFETY
+    if df is None or len(df) < 2:
+        return "HOLD"
+
+    # 🔒 EMA SAFETY (MUST BE FIRST)
+    if "ema9" not in df.columns or "ema20" not in df.columns:
+        return "HOLD"
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 🔒 Safety
+    # 🔒 VWAP safety
     if pd.isna(last.get("vwap", None)):
         last["vwap"] = last["close"]
 
@@ -2547,19 +2559,17 @@ def elite_signal(df):
     )
 
     # -----------------------------
-    # 🧠 BREAKOUT + RETEST (PRO EDGE)
+    # 🧠 BREAKOUT + RETEST
     # -----------------------------
     if len(df) >= 5:
         recent_high = df["high"].iloc[-5:-1].max()
         recent_low = df["low"].iloc[-5:-1].min()
 
-        # CALL → breakout + pullback
         if bullish_trend and last["close"] > recent_high:
             if prev["close"] > recent_high and last["close"] < prev["close"]:
                 if volume_ok:
                     return "CALL"
 
-        # PUT → breakdown + bounce
         if bearish_trend and last["close"] < recent_low:
             if prev["close"] < recent_low and last["close"] > prev["close"]:
                 if volume_ok:
@@ -2586,7 +2596,7 @@ def elite_signal(df):
         return "PUT"
 
     # -----------------------------
-    # 🥉 PULLBACK ENTRY (VERY POWERFUL)
+    # 🥉 PULLBACK ENTRY
     # -----------------------------
     if bullish_trend and last["close"] < prev["close"]:
         return "CALL"
@@ -2595,7 +2605,7 @@ def elite_signal(df):
         return "PUT"
 
     # -----------------------------
-    # ⚡ MICRO MOMENTUM (LAST OPTION)
+    # ⚡ MICRO MOMENTUM
     # -----------------------------
     if move > threshold:
         if last["close"] > prev["close"]:

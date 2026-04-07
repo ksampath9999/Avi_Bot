@@ -1596,20 +1596,23 @@ def nifty_loop():
         # 🧠 BASE PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
 
-        # 🔥 MULTI-STRATEGY
         multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
 
-        # 🎯 CONFIDENCE ADJUSTMENT
+        print(f"🤖 ML Signal: {multi_signal}, Confidence: {ml_conf}")
+
+        # 🎯 Multi-strategy boost
         if signal == multi_signal and signal != "HOLD":
             probability += 10
         elif signal != multi_signal:
             probability -= 5
 
-        # 🤖 ML CONFIDENCE BOOST
-        if ml_conf >= 65:
+        # 🤖 ML confidence impact
+        if ml_conf >= 60:
             probability += 5
-        elif ml_conf < 50:
-            probability -= 5
+        elif ml_conf >= 50:
+            probability += 2
+        else:
+            probability -= 3
 
         # 🔒 Clamp
         probability = max(0, min(probability, 100))
@@ -2431,38 +2434,31 @@ def get_ml_cached():
 # ELITE SIGNAL (NEW)
 # -----------------------------
 def elite_signal(df):
-    df = df.copy()
-    df["vol_ma"] = df["volume"].rolling(5).mean()
-
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    body = abs(last["close"] - last["open"])
-    rng = last["high"] - last["low"]
-
-    # keep breakout as primary
+    # 🔥 PRIMARY: breakout
     if last["close"] > prev["high"] and last["close"] > last["vwap"]:
         return "CALL"
 
     if last["close"] < prev["low"] and last["close"] < last["vwap"]:
         return "PUT"
 
-    # 🔥 fallback ONLY if candle is strong
-    body = abs(last["close"] - last["open"])
-    rng = last["high"] - last["low"]
-
-    if rng > 0 and body > rng * 0.5:
-        if last["close"] > last["vwap"]:
-            return "CALL"
-        elif last["close"] < last["vwap"]:
-            return "PUT"
-            
-    # 🔥 SMART FALLBACK (controlled entry)
-    if last["close"] > prev["close"] and last["close"] > last["vwap"]:
+    # 🔥 SECONDARY: trend continuation
+    if last["close"] > last["vwap"] and last["close"] > prev["close"]:
         return "CALL"
 
-    if last["close"] < prev["close"] and last["close"] < last["vwap"]:
+    if last["close"] < last["vwap"] and last["close"] < prev["close"]:
         return "PUT"
+
+    # 🔥 FINAL: micro momentum (VERY IMPORTANT)
+    if last["close"] > prev["close"]:
+        return "CALL"
+
+    if last["close"] < prev["close"]:
+        return "PUT"
+        
+    print(f"📊 Close: {last['close']}, Prev Close: {prev['close']}, VWAP: {last['vwap']}")
 
     return "HOLD"
         

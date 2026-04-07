@@ -1648,6 +1648,8 @@ def nifty_loop():
         # 🧠 BASE PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
 
+        # 🔥 SMALL BOOST (ADD HERE)
+        probability += 3
 
         multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
 
@@ -2505,32 +2507,49 @@ def get_ml_cached():
 def elite_signal(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    
+
+    # 🔒 Safety
     if pd.isna(last["vwap"]):
         last["vwap"] = last["close"]
 
-    # 🔥 PRIMARY: breakout
+    move = abs(last["close"] - prev["close"])
+    threshold = last["close"] * 0.0003   # 🔥 tuned
+
+    # -----------------------------
+    # 🥇 1. STRONG BREAKOUT
+    # -----------------------------
     if last["close"] > prev["high"] and last["close"] > last["vwap"]:
         return "CALL"
 
     if last["close"] < prev["low"] and last["close"] < last["vwap"]:
         return "PUT"
 
-    # 🔥 SECONDARY: trend continuation
+    # -----------------------------
+    # 🥈 2. TREND CONTINUATION
+    # -----------------------------
     if last["close"] > last["vwap"] and last["close"] > prev["close"]:
         return "CALL"
 
     if last["close"] < last["vwap"] and last["close"] < prev["close"]:
         return "PUT"
 
-    # 🔥 FINAL: micro momentum (VERY IMPORTANT)
-    if last["close"] > prev["close"] and abs(last["close"] - prev["close"]) > last["close"] * 0.0005:
+    # -----------------------------
+    # 🥉 3. PULLBACK ENTRY (🔥 KEY ADDITION)
+    # -----------------------------
+    if last["close"] > last["vwap"] and last["close"] < prev["close"]:
         return "CALL"
 
-    if last["close"] < prev["close"] and abs(last["close"] - prev["close"]) > last["close"] * 0.0005:
+    if last["close"] < last["vwap"] and last["close"] > prev["close"]:
         return "PUT"
-        
-    print(f"📊 Close: {last['close']}, Prev: {prev['close']}, VWAP: {last['vwap']:.2f}")
+
+    # -----------------------------
+    # ⚡ 4. MICRO MOMENTUM
+    # -----------------------------
+    if move > threshold:
+        if last["close"] > prev["close"]:
+            return "CALL"
+        elif last["close"] < prev["close"]:
+            return "PUT"
 
     return "HOLD"
         

@@ -353,6 +353,11 @@ def is_market_trending(token, df=None):
         # 🔥 CRITICAL FIX
         df = prepare_indicators(df)
 
+        # 🔒 SAFETY CHECK (ADD THIS)
+        if "vwap" not in df.columns:
+            print("⚠️ VWAP missing — skipping trend check")
+            return False
+
         last = df.iloc[-1]
 
         vwap = last["vwap"]
@@ -1135,9 +1140,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
     entry_time = time.time()
     partial_booked = False
-
+    pnl = 0  # 🔒 safety init (VERY IMPORTANT)
     # 🔥 CORE RISK MODEL
-    risk = entry * 0.25
+    risk = entry * 0.20
 
     if signal == "CALL":
         sl = entry - risk
@@ -1170,7 +1175,11 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🚨 HARD STOP LOSS
             # -----------------------------
             if profit < -risk:
-                pnl = (ltp - entry) * remaining_qty
+                if signal == "CALL":
+                    pnl = (ltp - entry) * remaining_qty
+                else:
+                    pnl = (entry - ltp) * remaining_qty
+
                 send_message(f"🚨 HARD SL\n{symbol}")
                 break
 
@@ -1184,6 +1193,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     remaining_qty -= half
                     partial_booked = True
                     send_message(f"💰 Partial booked\n{symbol}")
+                    
+                    
+            
 
             # -----------------------------
             # 🔒 MOVE SL TO COST
@@ -1199,22 +1211,33 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     sl = entry + risk * 0.5
                 else:
                     sl = entry - risk * 0.5
-
+                    
             # -----------------------------
             # 🚀 TRAILING SL (CORE ENGINE)
             # -----------------------------
-            trail_gap = risk * 0.7
+            trail_gap = risk * 0.5
 
             if signal == "CALL":
                 sl = max(sl, peak - trail_gap)
             else:
                 sl = min(sl, peak + trail_gap)
 
+            # 🔥 RUNNER MODE (FINAL CONTROL)
+            if partial_booked:
+                if signal == "CALL":
+                    sl = max(sl, peak - (risk * 0.3))
+                else:
+                    sl = min(sl, peak + (risk * 0.3))
+
             # -----------------------------
             # 🚪 EXIT CONDITION
             # -----------------------------
             if (signal == "CALL" and ltp <= sl) or (signal == "PUT" and ltp >= sl):
-                pnl = (ltp - entry) * remaining_qty
+                if signal == "CALL":
+                    pnl = (ltp - entry) * remaining_qty
+                else:
+                    pnl = (entry - ltp) * remaining_qty
+
                 send_message(f"🛑 Exit\n{symbol}")
                 break
 
@@ -1222,7 +1245,11 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # ⏱ TIME EXIT
             # -----------------------------
             if time.time() - entry_time > 600 and profit < risk * 0.5:
-                pnl = (ltp - entry) * remaining_qty
+                if signal == "CALL":
+                    pnl = (ltp - entry) * remaining_qty
+                else:
+                    pnl = (entry - ltp) * remaining_qty
+
                 send_message(f"⏱ Time exit\n{symbol}")
                 break
 
@@ -1528,8 +1555,18 @@ def nifty_loop():
         # -----------------------------
         # 🎯 ADAPTIVE PROBABILITY
         # -----------------------------
+        # 🎯 ADAPTIVE PROBABILITY
         if market_type == "TREND":
             probability += 5
+
+            # 🔥 TREND STRENGTH BOOST
+            last = df.iloc[-1]
+            prev = df.iloc[-3]
+
+            trend_strength = abs(last["close"] - prev["close"]) / last["close"]
+
+            if trend_strength > 0.004:
+                probability += 5
         elif market_type == "SIDEWAYS":
             probability -= 5
         elif market_type == "VOLATILE":
@@ -1558,14 +1595,20 @@ def nifty_loop():
         probability = min(probability, 100)
 
         print(f"🧠 Final Probability: {probability}")
+        
+        # 🔥 HIGH QUALITY TRADE ONLY (PROFIT MODE)
+        if probability < 40:
+            print("🚫 Low quality trade skipped (profit mode)")
+            continue
 
         # 🚫 Threshold
         threshold = adaptive_config["prob_threshold"] - 5
-
-        # 🚫 Sideways strict filter
-        if market_type == "SIDEWAYS" and probability < threshold + 5:
-            print("🚫 Sideways strict filter")
+        
+        # 🔥 SKIP SIDEWAYS (PROFIT MODE)
+        if market_type == "SIDEWAYS" and probability < 50:
+            print("🚫 Weak sideways avoided")
             continue
+
 
         if probability < threshold:
             print("🚫 Below probability threshold (NIFTY)")
@@ -1587,6 +1630,23 @@ def nifty_loop():
             print("⚠️ Slightly high price — allowed")
 
         print(f"🏆 {symbol} @ {price}")
+        
+        if not is_market_trending(config.NIFTY_TOKEN, df) and probability < 55:
+            print("🚫 Weak trend skipped")
+            continue
+        
+        # 🔥 ENTRY MOMENTUM CONFIRMATION (SMART)
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        if probability < 60:
+            if signal == "CALL" and last["close"] <= prev["close"]:
+                print("🚫 Weak CALL momentum skipped")
+                continue
+
+            if signal == "PUT" and last["close"] >= prev["close"]:
+                print("🚫 Weak PUT momentum skipped")
+                continue
 
         # ⏳ COOLDOWN
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:

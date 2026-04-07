@@ -934,8 +934,8 @@ def find_option(signal, instrument):
 
     print("❌ No valid option found")
     
-    if i["instrument_type"] not in ["CE", "PE"]:
-        continue
+    #if i["instrument_type"] not in ["CE", "PE"]:
+    #    continue
     
     if "CE" not in best["symbol"] and "PE" not in best["symbol"]:
         print("❌ Invalid option type — skipping")

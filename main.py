@@ -478,7 +478,7 @@ def get_crude_signal(token):
             return "PUT"
 
         # 🔥 FALLBACK SIGNAL (VERY IMPORTANT)
-        if last["close"] > prev["close"]:
+        if last["close"] > prev["close"] and abs(last["close"] - prev["close"]) > last["close"] * 0.0005:
             return "CALL"
         elif last["close"] < prev["close"]:
             return "PUT"
@@ -559,7 +559,12 @@ def score_option(symbol, exchange, token, signal, df=None):
         full_symbol = f"{exchange}:{symbol}"
 
         price = safe_ltp(full_symbol)
-        if price is None or price < 10 or price > 500:
+        # 🔥 RELAXED FILTER
+        if price is None or price <= 0:
+            return 0
+
+        # allow wider range
+        if price < 5 or price > 1000:
             return 0
 
         # -----------------------------
@@ -814,6 +819,7 @@ def find_option(signal, instrument):
 
             sym = f"{exchange}:{i['tradingsymbol']}"
             p = safe_ltp(sym)
+            print(f"🔍 Checking: {sym}, Price: {p}")
 
             # 🔴 FIX: skip invalid price
             if p is None or p <= 0:
@@ -821,9 +827,13 @@ def find_option(signal, instrument):
                 continue
 
             trade_value = p * lot_size
-            limit = max_trade_value * (5 if instrument == "CRUDE" else 3)
+            #limit = max_trade_value * (5 if instrument == "CRUDE" else 3)
+
+            # 🔥 RELAX LIMIT
+            limit = max_trade_value * 10
 
             if trade_value > limit:
+                print(f"⚠️ Skipped (value too high): {trade_value}")
                 continue
 
             score = score_option(i["tradingsymbol"], exchange, token, signal, df)
@@ -852,7 +862,33 @@ def find_option(signal, instrument):
 
         return best["symbol"], best["price"], lot, exchange
 
-    print("🚫 No candidates — fallback")
+    print("🚫 No candidates — forcing ATM")
+
+    try:
+        opt_type = "CE" if signal == "CALL" else "PE"
+
+        atm_symbol = None
+
+        for i in opts:
+            if i["expiry"] == expiry and i["instrument_type"] == opt_type:
+                if int(i["strike"]) == atm:
+                    atm_symbol = i["tradingsymbol"]
+                    break
+
+        if atm_symbol:
+            sym = f"{exchange}:{atm_symbol}"
+            p = safe_ltp(sym)
+
+            if p and p > 0:
+                print(f"⚡ Forced ATM: {atm_symbol} @ {p}")
+
+                strong_trend = is_market_trending(token, df)
+                lot = calculate_lots(p, exchange, instrument, strong_trend)
+
+                return atm_symbol, p, lot, exchange
+
+    except Exception as e:
+        print("❌ ATM fallback error:", e)
 
     # -----------------------------
     # FALLBACK
@@ -883,7 +919,7 @@ def find_option(signal, instrument):
 
             trade_value = p * lot_size
 
-            if trade_value <= max_trade_value * 3:
+            if trade_value <= max_trade_value * 10:
                 min_diff = diff
                 best = i["tradingsymbol"]
                 best_price = p
@@ -908,9 +944,9 @@ def place_order(symbol, qty, exchange, instrument):
     
     print(f"🚀 PLACE ORDER CALLED: {symbol}, lot: {qty}, exchange: {exchange}")
 
-    if not is_good_spread(symbol, exchange):
-        print("🚫 Spread too high — skipping")
-        return None
+    #if not is_good_spread(symbol, exchange):
+    #    print("🚫 Spread too high — skipping")
+    #    return None
 
     try:
         full_symbol = f"{exchange}:{symbol}"
@@ -1059,7 +1095,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         sl = entry - (entry * 0.15)
 
     risk = entry - sl
-    rr = 3 if is_strong_trend_day(config.NIFTY_TOKEN) else 2
+    rr = 4 if is_strong_trend_day(config.NIFTY_TOKEN) else 2.5
     # 🎯 BASE TARGET
     base_target = entry + risk * rr
     target = base_target
@@ -1597,7 +1633,7 @@ def nifty_loop():
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
 
 
-        multi_signal, ml_conf = multi_strategy_signal(...)
+        multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
 
         print(f"🤖 ML Signal: {multi_signal}, Confidence: {ml_conf}")
 
@@ -1625,8 +1661,10 @@ def nifty_loop():
         print(f"🧠 Final Probability: {probability}")
 
         # 🚫 Threshold
-        if probability < adaptive_config["prob_threshold"]:
-            print("🚫 Below probability threshold")
+        threshold = adaptive_config["prob_threshold"] - 5  # 🔥 relaxed for crude
+
+        if probability < threshold:
+            print("🚫 Below probability threshold (Nifty)")
             continue
 
         # 🔍 OPTION SELECTION
@@ -1712,9 +1750,7 @@ def crude_loop():
             time.sleep(60)
             continue
 
-        if 12 <= now.hour < 13:
-            time.sleep(60)
-            continue
+        
 
         if crude_active or not can_trade() or risk_off:
             time.sleep(5)
@@ -1761,7 +1797,6 @@ def crude_loop():
         #    continue
         
 
-        print(f"🎯 CRUDE Signal: {signal}")
         
         # 🚫 Avoid small candles (noise)
         #last = df.iloc[-1]
@@ -1772,11 +1807,13 @@ def crude_loop():
         #    continue
 
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
-
         print(f"🧠 Probability: {probability}")
 
         if probability < adaptive_config["prob_threshold"]:
             print("🚫 Below probability threshold")
+            continue
+            
+        if 12 <= now.hour < 13 and probability < 60:
             continue
         
         # 🔥 Momentum confirmation (VERY POWERFUL)
@@ -2457,10 +2494,10 @@ def elite_signal(df):
         return "PUT"
 
     # 🔥 FINAL: micro momentum (VERY IMPORTANT)
-    if last["close"] > prev["close"]:
+    if last["close"] > prev["close"] and abs(last["close"] - prev["close"]) > last["close"] * 0.0005:
         return "CALL"
 
-    if last["close"] < prev["close"]:
+    if last["close"] < prev["close"] and abs(last["close"] - prev["close"]) > last["close"] * 0.0005:
         return "PUT"
         
     print(f"📊 Close: {last['close']}, Prev Close: {prev['close']}, VWAP: {last['vwap']}")
@@ -2486,6 +2523,9 @@ def multi_strategy_signal(token, instrument):
     # -----------------------------
     try:
         data = get_ml_cached()
+        
+        if not data:
+            print("⚠️ ML API failed — using fallback")
 
         # ✅ only use ML if VALID
         if isinstance(data, dict):
@@ -2493,7 +2533,7 @@ def multi_strategy_signal(token, instrument):
             ml_conf = data.get("confidence", 50)
 
             # only trust ML if strong
-            if ml_conf >= 60:
+            if ml_conf >= 55:
                 signals.append(ml_signal)
 
         else:

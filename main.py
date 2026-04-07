@@ -1627,12 +1627,9 @@ def nifty_loop():
 
         df = df.copy()
 
-        # 🔥 VWAP (compute once)
         # 🔥 SAFE VWAP
-        df["volume"] = df["volume"].replace(0, 1)  # prevent division by zero
+        df["volume"] = df["volume"].replace(0, 1)
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
-
-        # fill NaN if still any
         df["vwap"] = df["vwap"].fillna(df["close"])
 
         # 🎯 SIGNAL
@@ -1645,25 +1642,30 @@ def nifty_loop():
         if not signal or signal == "HOLD":
             continue
 
+        # 🚫 SAME SIGNAL BLOCK
+        if last_executed_signal_nifty == signal:
+            print("⚠️ Same signal already executed — skipping")
+            continue
+
         # 🧠 BASE PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
 
-        # 🔥 SMALL BOOST (ADD HERE)
+        # 🔥 SMALL BOOST
         probability += 3
 
+        # 🤖 ML SIGNAL
         multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
-
         print(f"🤖 ML Signal: {multi_signal}, Confidence: {ml_conf}")
 
-        # 🎯 Multi-strategy
+        # 🎯 Multi-strategy adjustment
         if signal == multi_signal and signal != "HOLD":
             probability += 10
         elif multi_signal == "HOLD":
             probability += 0
-        elif signal != multi_signal:
+        else:
             probability -= 3
 
-        # 🤖 ML confidence
+        # 🤖 ML confidence boost
         if ml_conf >= 60:
             probability += 5
         elif ml_conf >= 50:
@@ -1671,22 +1673,22 @@ def nifty_loop():
         else:
             probability -= 2
 
-        # 🔒 Floor + Clamp
+        # 🔒 Clamp
         probability = max(probability, 30)
         probability = min(probability, 100)
-
 
         print(f"🧠 Final Probability: {probability}")
 
         # 🚫 Threshold
-        threshold = adaptive_config["prob_threshold"] - 5  # 🔥 relaxed for crude
+        threshold = adaptive_config["prob_threshold"] - 5
 
         if probability < threshold:
-            print("🚫 Below probability threshold (Nifty)")
+            print("🚫 Below probability threshold (NIFTY)")
             continue
 
         # 🔍 OPTION SELECTION
         symbol, price, lot, exchange = find_option(signal, "NIFTY")
+
         if not symbol or not price or price <= 0:
             print("❌ Skipped: Invalid option price")
             continue
@@ -1705,10 +1707,14 @@ def nifty_loop():
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
             continue
 
-        # 🚀 ORDER
+        # 🔒 LOCK + DUPLICATE PROTECTION (CRITICAL)
         with lock:
+            if nifty_active:
+                print("⚠️ Duplicate prevented")
+                continue
             nifty_active = True
 
+        # 🚀 ORDER
         filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
         if filled_price:
@@ -1732,6 +1738,8 @@ def nifty_loop():
             evaluate_strategies()
 
         time.sleep(1.5)
+        
+        
 
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude

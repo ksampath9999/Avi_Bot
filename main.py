@@ -102,7 +102,7 @@ CRUDE_TOKEN = config.CRUDE_TOKEN
 performance_log = []
 
 adaptive_config = {
-    "prob_threshold": 45,
+    "prob_threshold": 35,
     "trend_threshold": 0.0015,
     "risk_multiplier": 1.0
 }
@@ -1497,7 +1497,7 @@ def get_trade_probability(token, signal, df):
             score += 15
 
         # 🔥 BOOST BASE PROBABILITY
-        base = 20
+        base = 40
 
         final_score = base + score
 
@@ -1596,26 +1596,31 @@ def nifty_loop():
         # 🧠 BASE PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
 
-        multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+
+        multi_signal, ml_conf = multi_strategy_signal(...)
 
         print(f"🤖 ML Signal: {multi_signal}, Confidence: {ml_conf}")
 
-        # 🎯 Multi-strategy boost
+        # 🎯 Multi-strategy
         if signal == multi_signal and signal != "HOLD":
             probability += 10
+        elif multi_signal == "HOLD":
+            probability += 0
         elif signal != multi_signal:
-            probability -= 5
+            probability -= 3
 
-        # 🤖 ML confidence impact
+        # 🤖 ML confidence
         if ml_conf >= 60:
             probability += 5
         elif ml_conf >= 50:
             probability += 2
         else:
-            probability -= 3
+            probability -= 2
 
-        # 🔒 Clamp
-        probability = max(0, min(probability, 100))
+        # 🔒 Floor + Clamp
+        probability = max(probability, 30)
+        probability = min(probability, 100)
+
 
         print(f"🧠 Final Probability: {probability}")
 

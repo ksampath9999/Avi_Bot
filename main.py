@@ -1652,6 +1652,10 @@ def nifty_loop():
 
         # 🔥 SMALL BOOST
         probability += 3
+        
+        # ⚖️ PUT BALANCE BOOST (ADD HERE)
+        if signal == "PUT":
+            probability += 2
 
         # 🤖 ML SIGNAL
         multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
@@ -2508,45 +2512,90 @@ def get_ml_cached():
 # ELITE SIGNAL (NEW)
 # -----------------------------
 def elite_signal(df):
+    import pandas as pd
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
     # 🔒 Safety
-    if pd.isna(last["vwap"]):
+    if pd.isna(last.get("vwap", None)):
         last["vwap"] = last["close"]
 
     move = abs(last["close"] - prev["close"])
-    threshold = last["close"] * 0.0003   # 🔥 tuned
+    threshold = last["close"] * 0.0003
 
     # -----------------------------
-    # 🥇 1. STRONG BREAKOUT
+    # 🔊 VOLUME CONFIRMATION
     # -----------------------------
-    if last["close"] > prev["high"] and last["close"] > last["vwap"]:
+    volume_ok = True
+    if "volume" in df.columns and len(df) >= 5:
+        vol_ma = df["volume"].rolling(5).mean().iloc[-1]
+        if pd.notna(vol_ma):
+            volume_ok = last["volume"] > vol_ma * 1.2
+
+    # -----------------------------
+    # 🧠 TREND FILTER (VWAP + EMA)
+    # -----------------------------
+    bullish_trend = (
+        last["close"] > last["vwap"] and
+        last["ema9"] > last["ema20"]
+    )
+
+    bearish_trend = (
+        last["close"] < last["vwap"] and
+        last["ema9"] < last["ema20"]
+    )
+
+    # -----------------------------
+    # 🧠 BREAKOUT + RETEST (PRO EDGE)
+    # -----------------------------
+    if len(df) >= 5:
+        recent_high = df["high"].iloc[-5:-1].max()
+        recent_low = df["low"].iloc[-5:-1].min()
+
+        # CALL → breakout + pullback
+        if bullish_trend and last["close"] > recent_high:
+            if prev["close"] > recent_high and last["close"] < prev["close"]:
+                if volume_ok:
+                    return "CALL"
+
+        # PUT → breakdown + bounce
+        if bearish_trend and last["close"] < recent_low:
+            if prev["close"] < recent_low and last["close"] > prev["close"]:
+                if volume_ok:
+                    return "PUT"
+
+    # -----------------------------
+    # 🥇 STRONG BREAKOUT
+    # -----------------------------
+    if bullish_trend and last["close"] > prev["high"]:
+        if volume_ok:
+            return "CALL"
+
+    if bearish_trend and last["close"] < prev["low"]:
+        if volume_ok:
+            return "PUT"
+
+    # -----------------------------
+    # 🥈 TREND CONTINUATION
+    # -----------------------------
+    if bullish_trend and last["close"] > prev["close"]:
         return "CALL"
 
-    if last["close"] < prev["low"] and last["close"] < last["vwap"]:
+    if bearish_trend and last["close"] < prev["close"]:
         return "PUT"
 
     # -----------------------------
-    # 🥈 2. TREND CONTINUATION
+    # 🥉 PULLBACK ENTRY (VERY POWERFUL)
     # -----------------------------
-    if last["close"] > last["vwap"] and last["close"] > prev["close"]:
+    if bullish_trend and last["close"] < prev["close"]:
         return "CALL"
 
-    if last["close"] < last["vwap"] and last["close"] < prev["close"]:
+    if bearish_trend and last["close"] > prev["close"]:
         return "PUT"
 
     # -----------------------------
-    # 🥉 3. PULLBACK ENTRY (🔥 KEY ADDITION)
-    # -----------------------------
-    if last["close"] > last["vwap"] and last["close"] < prev["close"]:
-        return "CALL"
-
-    if last["close"] < last["vwap"] and last["close"] > prev["close"]:
-        return "PUT"
-
-    # -----------------------------
-    # ⚡ 4. MICRO MOMENTUM
+    # ⚡ MICRO MOMENTUM (LAST OPTION)
     # -----------------------------
     if move > threshold:
         if last["close"] > prev["close"]:
@@ -2555,7 +2604,6 @@ def elite_signal(df):
             return "PUT"
 
     return "HOLD"
-        
 
         
 def multi_strategy_signal(token, instrument):

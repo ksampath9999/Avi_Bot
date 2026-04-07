@@ -933,6 +933,13 @@ def find_option(signal, instrument):
         return best, best_price, lot, exchange
 
     print("❌ No valid option found")
+    
+    if i["instrument_type"] not in ["CE", "PE"]:
+        continue
+    
+    if "CE" not in best["symbol"] and "PE" not in best["symbol"]:
+        print("❌ Invalid option type — skipping")
+        return None, None, None, None
 
     return None, None, None, None
 
@@ -943,6 +950,10 @@ def find_option(signal, instrument):
 def place_order(symbol, qty, exchange, instrument):
     
     print(f"🚀 PLACE ORDER CALLED: {symbol}, lot: {qty}, exchange: {exchange}")
+    
+    if "FUT" in symbol:
+        print("🚫 BLOCKED: Futures order detected!")
+        return None
 
     #if not is_good_spread(symbol, exchange):
     #    print("🚫 Spread too high — skipping")
@@ -1617,7 +1628,12 @@ def nifty_loop():
         df = df.copy()
 
         # 🔥 VWAP (compute once)
+        # 🔥 SAFE VWAP
+        df["volume"] = df["volume"].replace(0, 1)  # prevent division by zero
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
+        # fill NaN if still any
+        df["vwap"] = df["vwap"].fillna(df["close"])
 
         # 🎯 SIGNAL
         signal = elite_signal(df)
@@ -1775,7 +1791,12 @@ def crude_loop():
         df = df.copy()
 
         # 🔥 Compute once
+        # 🔥 SAFE VWAP
+        df["volume"] = df["volume"].replace(0, 1)  # prevent division by zero
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
+        # fill NaN if still any
+        df["vwap"] = df["vwap"].fillna(df["close"])
 
         # 🎯 SIGNAL
         signal = get_crude_signal(CRUDE_TOKEN)
@@ -2484,6 +2505,9 @@ def get_ml_cached():
 def elite_signal(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    
+    if pd.isna(last["vwap"]):
+        last["vwap"] = last["close"]
 
     # 🔥 PRIMARY: breakout
     if last["close"] > prev["high"] and last["close"] > last["vwap"]:
@@ -2506,7 +2530,7 @@ def elite_signal(df):
     if last["close"] < prev["close"] and abs(last["close"] - prev["close"]) > last["close"] * 0.0005:
         return "PUT"
         
-    print(f"📊 Close: {last['close']}, Prev Close: {prev['close']}, VWAP: {last['vwap']}")
+    print(f"📊 Close: {last['close']}, Prev: {prev['close']}, VWAP: {last['vwap']:.2f}")
 
     return "HOLD"
         

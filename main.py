@@ -97,7 +97,7 @@ TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
 ENABLE_CRUDE = False
-
+trade_in_progress = False
 
 performance_log = []
 
@@ -129,6 +129,19 @@ strategy_weights = {
 }
 
 
+def is_trading_time():
+    now = datetime.datetime.now(IST)
+
+    # Start at 9:00 AM
+    if now.hour < 9:
+        return False
+
+    # Stop at 11:00 PM
+    if now.hour >= 23:
+        return False
+
+    return True
+
 def prepare_indicators(df):
     if df is None or len(df) < 2:
         return df
@@ -145,6 +158,66 @@ def prepare_indicators(df):
     df["ema20"] = df["close"].ewm(span=20).mean()
 
     return df
+    
+   
+def halftrend_entry(df, amplitude=2):
+
+    try:
+        if df is None or len(df) < 100:
+            return "HOLD"
+
+        df = df.copy()
+
+        high = df["high"].values
+        low = df["low"].values
+        close = df["close"].values
+
+        trend = 0
+        nextTrend = 0
+
+        maxLowPrice = low[0]
+        minHighPrice = high[0]
+
+        prev_trend = 0
+
+        for i in range(2, len(df)):
+
+            highPrice = max(high[i-amplitude:i+1])
+            lowPrice = min(low[i-amplitude:i+1])
+
+            highma = df["high"].iloc[i-amplitude:i+1].mean()
+            lowma = df["low"].iloc[i-amplitude:i+1].mean()
+
+            prev_trend = trend
+
+            if nextTrend == 1:
+                maxLowPrice = max(lowPrice, maxLowPrice)
+
+                if highma < maxLowPrice and close[i] < low[i-1]:
+                    trend = 1
+                    nextTrend = 0
+                    minHighPrice = highPrice
+
+            else:
+                minHighPrice = min(highPrice, minHighPrice)
+
+                if lowma > minHighPrice and close[i] > high[i-1]:
+                    trend = 0
+                    nextTrend = 1
+                    maxLowPrice = lowPrice
+
+            # 🎯 ENTRY SIGNAL
+            if trend == 0 and prev_trend == 1:
+                return "CALL"
+
+            if trend == 1 and prev_trend == 0:
+                return "PUT"
+
+        return "HOLD"
+
+    except Exception as e:
+        print("HalfTrend error:", e)
+        return "HOLD"
     
     
     
@@ -394,7 +467,9 @@ def can_trade():
         return False
 
     # 🎯 Profit lock
-    if daily_pnl > config.DAILY_TARGET:
+    # 🎯 DAILY PROFIT LOCK
+    if daily_pnl >= 10000:
+        print("🎯 Target reached — stopping trading")
         return False
 
     # 🚫 Max trades
@@ -954,6 +1029,15 @@ def find_option(signal, instrument):
         if best["price"] <= 0:
             print("❌ Final price invalid — skipping")
             return None, None, None, None
+            
+        # 🚫 FINAL INSTRUMENT SAFETY
+        if instrument == "CRUDE" and not best["symbol"].startswith("CRUDEOIL"):
+            print("❌ WRONG CRUDE OPTION — BLOCKED")
+            return None, None, None, None
+
+        if instrument == "NIFTY" and not best["symbol"].startswith("NIFTY"):
+            print("❌ WRONG NIFTY OPTION — BLOCKED")
+            return None, None, None, None
 
         return best["symbol"], best["price"], lot, exchange
 
@@ -1042,6 +1126,12 @@ def find_option(signal, instrument):
 def place_order(symbol, qty, exchange, instrument):
 
     print(f"🚀 PLACE ORDER: {symbol}, lot: {qty}, exchange: {exchange}")
+    
+    now = datetime.datetime.now(IST)
+
+    if exchange == "NFO" and not (9 <= now.hour < 15):
+        print("🚫 Market closed — skipping order")
+        return None
 
     # 🚫 STRICT OPTION ONLY (REPLACE THIS BLOCK)
     if not symbol.endswith(("CE", "PE")):
@@ -1196,7 +1286,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     entry_time = time.time()
     partial_booked = False
     pnl = 0
-    ltp = entry  # 🔥 safety init
+    ltp = entry
 
     # 🔥 CORE RISK MODEL
     risk = entry * 0.20
@@ -1218,6 +1308,10 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 time.sleep(2)
                 continue
 
+            # ===============================
+            # 🔥 ULTRA PRO EXIT SYSTEM
+            # ===============================
+
             # 📊 PROFIT
             if signal == "CALL":
                 profit = ltp - entry
@@ -1226,44 +1320,93 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 profit = entry - ltp
                 peak = min(peak, ltp)
 
+            current_pnl = profit * remaining_qty
+
+            # ===============================
+            # 🧠 ATR BASED TRAILING
+            # ===============================
+            try:
+                df_trail = get_cached_data(
+                    CRUDE_TOKEN if instrument == "CRUDE" else config.NIFTY_TOKEN,
+                    "5minute",
+                    50
+                )
+
+                atr = df_trail["high"].rolling(14).max() - df_trail["low"].rolling(14).min()
+                atr_value = atr.iloc[-1] if atr is not None else entry * 0.02
+
+            except:
+                atr_value = entry * 0.02
+
+            # ===============================
+            # 💰 DYNAMIC PROFIT LOCK
+            # ===============================
+            if current_pnl >= 1500:
+
+                lock_ratio = 0.70
+                lock_pnl = current_pnl * lock_ratio
+                lock_price_move = lock_pnl / remaining_qty
+
+                print(f"💰 Lock → PnL: {current_pnl:.0f}, Locked: {lock_pnl:.0f}")
+
+                if signal == "CALL":
+                    sl = max(sl, entry + lock_price_move)
+                else:
+                    sl = min(sl, entry - lock_price_move)
+
+            # ===============================
+            # 🚀 ATR TRAILING (ADAPTIVE)
+            # ===============================
+            trail_multiplier = 1.2
+
+            if signal == "CALL":
+                sl = max(sl, peak - (atr_value * trail_multiplier))
+            else:
+                sl = min(sl, peak + (atr_value * trail_multiplier))
+
+            # ===============================
+            # 🔥 STRONG TREND MODE (LET PROFITS RUN)
+            # ===============================
+            if current_pnl >= 3000:
+                if signal == "CALL":
+                    sl = max(sl, peak - (atr_value * 0.8))
+                else:
+                    sl = min(sl, peak + (atr_value * 0.8))
+
+            # ===============================
+            # 🔄 HALF TREND EXIT (CONFIRMED)
+            # ===============================
+            try:
+                df_ht_exit = get_cached_data(
+                    CRUDE_TOKEN if instrument == "CRUDE" else config.NIFTY_TOKEN,
+                    "15minute",
+                    120
+                )
+
+                ht1 = halftrend_trend(df_ht_exit.iloc[:-1])
+                ht2 = halftrend_trend(df_ht_exit)
+
+                if ht1 == ht2:
+                    if signal == "CALL" and ht2 == "PUT":
+                        print("🔄 Confirmed HalfTrend Exit")
+                        pnl = current_pnl
+                        break
+
+                    if signal == "PUT" and ht2 == "CALL":
+                        print("🔄 Confirmed HalfTrend Exit")
+                        pnl = current_pnl
+                        break
+
+            except Exception as e:
+                print("HT exit error:", e)
+
             # 🚨 HARD SL
             if profit < -risk:
                 pnl = profit * remaining_qty
                 send_message(f"🚨 HARD SL\n{symbol}")
                 break
 
-            # 💰 PARTIAL
-            if not partial_booked and profit >= risk:
-                half = remaining_qty // 2
-                if half > 0:
-                    remaining_qty -= half
-                    partial_booked = True
-                    send_message(f"💰 Partial booked\n{symbol}")
-
-            # 🔒 SL to cost
-            if profit >= risk:
-                sl = entry
-
-            # 🔥 Lock profit
-            if profit >= risk * 1.5:
-                if signal == "CALL":
-                    sl = entry + risk * 0.5
-                else:
-                    sl = entry - risk * 0.5
-
-            # 🚀 TRAIL
-            trail_gap = risk * 0.5
-            if signal == "CALL":
-                sl = max(sl, peak - trail_gap)
-            else:
-                sl = min(sl, peak + trail_gap)
-
-            # 🔥 Runner tighten
-            if partial_booked:
-                if signal == "CALL":
-                    sl = max(sl, peak - (risk * 0.3))
-                else:
-                    sl = min(sl, peak + (risk * 0.3))
+            
 
             # 🚪 EXIT
             if (signal == "CALL" and ltp <= sl) or (signal == "PUT" and ltp >= sl):
@@ -1293,31 +1436,35 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             update_streak(pnl)
             update_exit_time(instrument)
 
-            # ✅ CORRECT (NO NESTED LOCK)
+            # 🔓 RELEASE LOCK
+            global trade_in_progress
+
             if instrument == "NIFTY":
                 nifty_active = False
             else:
                 crude_active = False
+
+            trade_in_progress = False
 
             print(f"✅ {instrument} trade closed — ready for next")
 
             log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
 
             trade_count += 1
-            
-        with lock:
+
+            # ✅ THREAD SAFE PERFORMANCE LOG
             performance_log.append({
                 "result": "WIN" if pnl > 0 else "LOSS",
                 "pnl": pnl,
                 "time": time.time()
             })
 
-        if len(performance_log) > 100:
-            performance_log.pop(0)
+            if len(performance_log) > 100:
+                performance_log.pop(0)
 
+        # 📊 STRATEGY LOG (OUTSIDE LOCK OK)
         if market_type in strategy_log:
-            strategy_log[market_type].append(pnl)
-  
+            strategy_log[market_type].append(pnl)  
 
 def tune_strategy():
     global adaptive_config
@@ -1477,6 +1624,55 @@ def ai_trade_filter(token, signal, df):
         return False
 
     return True
+    
+    
+def halftrend_trend(df, amplitude=2):
+
+    try:
+        if df is None or len(df) < 100:
+            return "HOLD"
+
+        df = df.copy()
+
+        high = df["high"].values
+        low = df["low"].values
+        close = df["close"].values
+
+        trend = 0
+        nextTrend = 0
+
+        maxLowPrice = low[0]
+        minHighPrice = high[0]
+
+        for i in range(2, len(df)):
+
+            highPrice = max(high[i-amplitude:i+1])
+            lowPrice = min(low[i-amplitude:i+1])
+
+            highma = df["high"].iloc[i-amplitude:i+1].mean()
+            lowma = df["low"].iloc[i-amplitude:i+1].mean()
+
+            if nextTrend == 1:
+                maxLowPrice = max(lowPrice, maxLowPrice)
+
+                if highma < maxLowPrice and close[i] < low[i-1]:
+                    trend = 1
+                    nextTrend = 0
+                    minHighPrice = highPrice
+
+            else:
+                minHighPrice = min(highPrice, minHighPrice)
+
+                if lowma > minHighPrice and close[i] > high[i-1]:
+                    trend = 0
+                    nextTrend = 1
+                    maxLowPrice = lowPrice
+
+        # 🔥 RETURN CURRENT TREND (NOT ARROW)
+        return "CALL" if trend == 0 else "PUT"
+
+    except:
+        return "HOLD"
  
  
 # -----------------------------
@@ -1489,16 +1685,24 @@ def nifty_loop():
     global last_executed_signal_nifty, last_exit_time_nifty
 
     print("🔥 NIFTY LOOP STARTED")
+    
+    if datetime.date.today() != last_reset_date:
+        reset_daily_pnl()
+        last_executed_signal_nifty = None
+        last_executed_signal_crude = None
 
     if time.time() - last_analysis_time > 1800:
         tune_strategy()
         last_analysis_time = time.time()
 
-    if last_reset_date != datetime.date.today():
-        reset_daily_pnl()
 
     while True:
         now = datetime.datetime.now()
+        # ⏰ AUTO SLEEP MODE
+        if not is_trading_time():
+            print("🌙 Outside trading time — sleeping...")
+            time.sleep(60)
+            continue
 
         if int(time.time()) % 30 == 0:
             print("💓 NIFTY LOOP RUNNING")
@@ -1523,9 +1727,9 @@ def nifty_loop():
             time.sleep(5)
             continue
 
-        # 📊 DATA
-        df = get_cached_data(config.NIFTY_TOKEN, "5minute", 20)
-        if df is None or len(df) < 5:
+        # 📊 DATA (🔥 increased for HalfTrend)
+        df = get_cached_data(config.NIFTY_TOKEN, "5minute", 120)
+        if df is None or len(df) < 50:
             time.sleep(5)
             continue
 
@@ -1549,13 +1753,34 @@ def nifty_loop():
         if not signal or signal == "HOLD":
             continue
 
+        
+
+        # 📊 HALFTREND CONFIRMATION
+        # 📊 15 MIN HALFTREND
+        df_ht = get_cached_data(config.NIFTY_TOKEN, "15minute", 120)
+
+        if df_ht is None or len(df_ht) < 50:
+            continue
+
+        ht_trend = halftrend_trend(df_ht)
+
+        print(f"📊 NIFTY HT Trend (15m): {ht_trend}")
+        
+        # 🔒 TREND FILTER
+        if ht_trend != "HOLD" and signal != ht_trend:
+            print("🚫 HT trend mismatch — skipping")
+            continue
+
+
         # 🚫 Duplicate fast re-entry
-        if last_executed_signal_nifty is not None:
-            if time.time() - last_trade_time_nifty < 120:
+        if signal == last_executed_signal_nifty:
+            if time.time() - last_trade_time_nifty < 300:
+                print("⚠️ Same NIFTY signal — skipping")
                 continue
 
         # 🧠 PROBABILITY
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
+
 
         probability += 3
         probability += 2 if signal == "PUT" else 1
@@ -1587,10 +1812,10 @@ def nifty_loop():
 
         probability = max(30, min(probability, 100))
 
-        if probability < 40:
+        if probability < 35:
             continue
 
-        threshold = adaptive_config["prob_threshold"] - 5
+        threshold = adaptive_config["prob_threshold"] - 8
 
         if market_type == "SIDEWAYS" and probability < 50:
             continue
@@ -1606,15 +1831,13 @@ def nifty_loop():
         if time.time() - last_exit_time_nifty < 120:
             continue
 
-        # 🚫 SAME SIGNAL BLOCK
-        if signal == last_executed_signal_nifty:
-            continue
-
         # 🔒 LOCK
         with lock:
-            if nifty_active:
+            if nifty_active or trade_in_progress:
+                print("🚫 Trade blocked (NIFTY or GLOBAL active)")
                 continue
             nifty_active = True
+            trade_in_progress = True
 
         try:
             # 🔍 OPTION
@@ -1623,18 +1846,20 @@ def nifty_loop():
             if not symbol or not price or price <= 0:
                 with lock:
                     nifty_active = False
-                    continue
+                continue
 
             ltp_check = safe_ltp(f"{exchange}:{symbol}")
             if not ltp_check:
                 with lock:
                     nifty_active = False
-                    continue
+                continue
 
-            # 🔒 FINAL SAFETY CHECK (ANTI-RACE)
+            # 🔒 FINAL SAFETY CHECK
             with lock:
                 if not nifty_active:
                     continue
+                    
+            
 
             # 🚀 ORDER
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
@@ -1642,7 +1867,7 @@ def nifty_loop():
             if not filled_price:
                 with lock:
                     nifty_active = False
-                    continue
+                continue
 
             # ✅ SUCCESS
             last_executed_signal_nifty = signal
@@ -1675,6 +1900,11 @@ def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
     global last_analysis_time, report_sent_today
     global last_executed_signal_crude, last_exit_time_crude
+    
+    if datetime.date.today() != last_reset_date:
+        reset_daily_pnl()
+        last_executed_signal_nifty = None
+        last_executed_signal_crude = None
 
     if not ENABLE_CRUDE:
         print("🚫 CRUDE DISABLED")
@@ -1686,11 +1916,14 @@ def crude_loop():
         tune_strategy()
         last_analysis_time = time.time()
 
-    if last_reset_date != datetime.date.today():
-        reset_daily_pnl()
 
     while True:
         now = datetime.datetime.now(IST)
+        # ⏰ AUTO SLEEP MODE
+        if not is_trading_time():
+            print("🌙 Outside trading time — sleeping...")
+            time.sleep(60)
+            continue
 
         if int(time.time()) % 30 == 0:
             print("💓 CRUDE LOOP RUNNING")
@@ -1710,8 +1943,8 @@ def crude_loop():
             time.sleep(10)
             continue
 
-        df = get_cached_data(CRUDE_TOKEN, "5minute", 20)
-        if df is None or len(df) < 5:
+        df = get_cached_data(CRUDE_TOKEN, "5minute", 120)  # 🔥 IMPORTANT
+        if df is None or len(df) < 50:
             time.sleep(5)
             continue
 
@@ -1720,62 +1953,97 @@ def crude_loop():
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
         df["vwap"] = df["vwap"].fillna(df["close"])
 
-        # 🎯 SIGNAL
-        signal = get_crude_signal(CRUDE_TOKEN)
+        # 🔥 HALFTREND ENTRY (ONLY ARROW)
+        # 📊 15 MIN HALFTREND
+        # 🔥 ENTRY SIGNAL (5m)
+        signal = halftrend_entry(df)
+
+        if signal == "HOLD":
+            continue
+            
+        if signal == last_executed_signal_crude:
+            if time.time() - last_trade_time_crude < 300:
+                print("⚠️ Same signal — cooldown skip")
+                continue
+
+        # 📊 15 MIN TREND
+        df_ht = get_cached_data(CRUDE_TOKEN, "15minute", 120)
+
+        if df_ht is None or len(df_ht) < 50:
+            continue
+
+        ht_trend = halftrend_trend(df_ht)
+
+        print(f"📊 CRUDE HT Trend (15m): {ht_trend}")
+
+        # 🔒 TREND FILTER
+        if ht_trend != "HOLD" and signal != ht_trend:
+            print("🚫 HT trend mismatch — skipping")
+            continue
+        
+            
+      
+
         market_type = "NORMAL"
 
         print(f"🎯 CRUDE Signal: {signal}")
 
-        if not signal or signal == "HOLD":
-            continue
+        # 🔒 VWAP CONFIRMATION
+        last = df.iloc[-1]
 
+        # 🔥 SOFT VWAP FILTER (ALLOW NEAR VWAP)
+        vwap_diff = abs(last["close"] - last["vwap"]) / last["close"]
+
+        if vwap_diff > 0.003:  # far from VWAP → good
+            pass
+        else:
+            print("⚠️ Near VWAP — weak signal")
+
+        # 🧠 PROBABILITY FILTER
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
         print(f"🧠 Probability: {probability}")
 
         if probability < adaptive_config["prob_threshold"]:
             continue
 
+        # 🕛 LUNCH FILTER
         if 12 <= now.hour < 13 and probability < 60:
             continue
 
-        # 🔒 ===== LOCK AT CORRECT PLACE =====
+        # ⏳ COOLDOWN (BEFORE LOCK)
+        if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
+            print("⏳ Cooldown active")
+            continue
+
+        # 🔒 LOCK (ONLY HERE)
         with lock:
-            if crude_active:
-                print("🚫 CRUDE already running")
+            if crude_active or trade_in_progress:
+                print("🚫 Trade blocked (CRUDE or GLOBAL active)")
                 continue
             crude_active = True
+            trade_in_progress = True
 
-        # 🔍 OPTION
+        # 🔍 OPTION SELECTION
         symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
         if not symbol or not price or price <= 0:
             print("❌ Invalid option")
             with lock:
                 crude_active = False
-                continue
+            continue
 
-        # 📊 PRICE CHECK
+        # 📊 LTP VALIDATION
         ltp_check = safe_ltp(f"{exchange}:{symbol}")
         if not ltp_check:
             with lock:
-                crude_active = False # 🔥 FIXED
-                continue
+                crude_active = False
+            continue
 
         print(f"🏆 {symbol} @ {price}")
+        
+        
 
-        # ⏳ COOLDOWN
-        if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
-            with lock:
-                crude_active = False   # 🔥 FIXED
-                continue
-
-        # 🔒 FINAL SAFETY CHECK (ANTI-RACE)
-        with lock:
-            if not crude_active:
-                print("⚠️ Lost lock — skipping")
-                continue
-
-        # 🚀 ORDER
+        # 🚀 ORDER EXECUTION
         filled_price = None
         for _ in range(2):
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
@@ -1786,8 +2054,8 @@ def crude_loop():
         if not filled_price:
             print("❌ Order failed")
             with lock:
-                crude_active = False   # 🔥 MUST RESET
-                continue
+                crude_active = False
+            continue
 
         # ✅ SUCCESS
         last_executed_signal_crude = signal
@@ -1800,6 +2068,7 @@ def crude_loop():
             daemon=True
         ).start()
 
+        # 📊 STRATEGY ADJUSTMENTS
         if len(performance_log) >= 5 and len(performance_log) % 5 == 0:
             tune_strategy()
 
@@ -1807,7 +2076,6 @@ def crude_loop():
             evaluate_strategies()
 
         time.sleep(1)
-
         
 def get_strike_mode(token):
 

@@ -128,6 +128,24 @@ strategy_weights = {
     "NORMAL": 0.9
 }
 
+
+def prepare_indicators(df):
+    if df is None or len(df) < 2:
+        return df
+
+    df = df.copy()
+
+    # VWAP
+    df["volume"] = df["volume"].replace(0, 1)
+    df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+    df["vwap"] = df["vwap"].fillna(df["close"])
+
+    # EMA
+    df["ema9"] = df["close"].ewm(span=9).mean()
+    df["ema20"] = df["close"].ewm(span=20).mean()
+
+    return df
+
 def evaluate_strategies():
 
     print("📊 Evaluating strategies...")
@@ -1425,16 +1443,8 @@ def nifty_loop():
             time.sleep(5)
             continue
 
-        df = df.copy()
-
-        # 🔥 SAFE VWAP
-        df["volume"] = df["volume"].replace(0, 1)
-        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
-        df["vwap"] = df["vwap"].fillna(df["close"])
-        
-        # 🔥 ADD EMA (VERY IMPORTANT)
-        df["ema9"] = df["close"].ewm(span=9).mean()
-        df["ema20"] = df["close"].ewm(span=20).mean()
+        # 🔥 ALWAYS PREPARE INDICATORS
+        df = prepare_indicators(df)
 
         # 🎯 SIGNAL
         signal = elite_signal(df)
@@ -1462,7 +1472,7 @@ def nifty_loop():
             probability += 2
 
         # 🤖 ML SIGNAL
-        multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY")
+        multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY", df)
         print(f"🤖 ML Signal: {multi_signal}, Confidence: {ml_conf}")
 
         # 🎯 Multi-strategy adjustment
@@ -2322,6 +2332,9 @@ def get_ml_cached():
 # -----------------------------
 def elite_signal(df):
     import pandas as pd
+    
+    if "vwap" not in df.columns:
+        return "HOLD"
 
     # 🔒 BASIC SAFETY
     if df is None or len(df) < 2:
@@ -2403,7 +2416,12 @@ def elite_signal(df):
     return "HOLD"
 
         
-def multi_strategy_signal(token, instrument):
+def multi_strategy_signal(token, instrument, df=None):
+    
+    if df is None:
+        df = get_cached_data(token, "5minute", 20)
+
+    df = prepare_indicators(df)
 
     signals = []
     ml_conf = 50  # default safe fallback

@@ -1709,12 +1709,7 @@ def nifty_loop():
         with lock:
             nifty_active = True
 
-        filled_price = None
-        for _ in range(2):
-            filled_price = place_order(symbol, lot, exchange, "NIFTY")
-            if filled_price:
-                break
-            time.sleep(1)
+        filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
         if filled_price:
             last_executed_signal_nifty = signal

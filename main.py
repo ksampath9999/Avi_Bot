@@ -1731,7 +1731,7 @@ def crude_loop():
         print("🚫 CRUDE DISABLED")
         return
         
-     print("🔥 CRUDE LOOP STARTED")
+    print("🔥 CRUDE LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
         tune_strategy()

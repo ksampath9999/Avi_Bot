@@ -304,18 +304,18 @@ def safe_ltp(symbol):
 def is_market_trending(token, df=None):
 
     try:
-        # ✅ Use passed data (FAST)
         if df is None:
             df = get_cached_data(token, "5minute", 200)
-            
 
         if df is None or len(df) < 10:
             return False
 
+        # 🔥 CRITICAL FIX
+        df = prepare_indicators(df)
+
         last = df.iloc[-1]
 
-        # Example logic (keep your existing if different)
-        vwap = df.iloc[-1]["vwap"]
+        vwap = last["vwap"]
         atr = (df["high"] - df["low"]).rolling(5).mean().iloc[-1]
 
         print(f"🔥 Trend Check → VWAP Dist: {abs(last['close'] - vwap)}, ATR: {atr}")
@@ -432,7 +432,7 @@ def get_crude_signal(token):
             
         df = df.copy()
 
-        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        df = prepare_indicators(df)
         df["vol_ma"] = df["volume"].rolling(10).mean()
 
         last = df.iloc[-1]
@@ -955,9 +955,6 @@ def find_option(signal, instrument):
     #if i["instrument_type"] not in ["CE", "PE"]:
     #    continue
     
-    if "CE" not in best["symbol"] and "PE" not in best["symbol"]:
-        print("❌ Invalid option type — skipping")
-        return None, None, None, None
 
     return None, None, None, None
 
@@ -1323,7 +1320,7 @@ def analyze_performance():
             
             
 def get_trade_probability(token, signal, df):
-
+    df = prepare_indicators(df)
     try:
         score = 0
         last = df.iloc[-1]
@@ -1470,6 +1467,8 @@ def nifty_loop():
         # ⚖️ PUT BALANCE BOOST (ADD HERE)
         if signal == "PUT":
             probability += 2
+        elif signal == "CALL":
+            probability += 1
 
         # 🤖 ML SIGNAL
         multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY", df)
@@ -1814,7 +1813,7 @@ def performance_loop():
         time.sleep(1800)
         
 def confirm_entry(token, signal, df=None):
-
+    
     try:
         if df is None:
             df = get_cached_data(token, "5minute", 200)
@@ -1822,6 +1821,8 @@ def confirm_entry(token, signal, df=None):
 
         if df is None or len(df) < 10:
             return False
+            
+        df = prepare_indicators(df)
             
 
         last = df.iloc[-1]
@@ -2236,11 +2237,12 @@ def get_market_session(instrument):
             return "CLOSED"
             
 
-def vwap_signal(token):
+def vwap_signal(token, df=None):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 20)
+        if df is None:
+            df = get_cached_data(token, "5minute", 20)
         
         
         if df is None or len(df) < 10:
@@ -2261,11 +2263,12 @@ def vwap_signal(token):
     except:
         return "HOLD"
         
-def breakout_signal(token):
+def breakout_signal(token, df=None):
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 20)
+        if df is None:
+            df = get_cached_data(token, "5minute", 20)
         
         
         if df is None or len(df) < 10:
@@ -2284,12 +2287,13 @@ def breakout_signal(token):
     except:
         return "HOLD"
         
-def pullback_signal(token):
+def pullback_signal(token, df=None):
 
     try:
         now = datetime.datetime.now()
 
-        df = get_cached_data(token, "5minute", 20)
+        if df is None:
+            df = get_cached_data(token, "5minute", 20)
 
         if df is None or len(df) < 10:
             return "HOLD"
@@ -2334,14 +2338,14 @@ def elite_signal(df):
     import pandas as pd
     
     if "vwap" not in df.columns:
-        return "HOLD"
+        df = prepare_indicators(df)
 
     # 🔒 BASIC SAFETY
     if df is None or len(df) < 2:
         return "HOLD"
 
     if "ema9" not in df.columns or "ema20" not in df.columns:
-        return "HOLD"
+        df = prepare_indicators(df)
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -2429,9 +2433,9 @@ def multi_strategy_signal(token, instrument, df=None):
     # -----------------------------
     # CORE STRATEGIES
     # -----------------------------
-    signals.append(vwap_signal(token))
-    signals.append(breakout_signal(token))
-    signals.append(pullback_signal(token))
+    signals.append(vwap_signal(token, df))
+    signals.append(breakout_signal(token, df))
+    signals.append(pullback_signal(token, df))
 
     # -----------------------------
     # ML (SAFE HANDLING)

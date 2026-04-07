@@ -765,7 +765,7 @@ def find_option(signal, instrument):
     global CRUDE_SYMBOL
 
     if CRUDE_SYMBOL is None:
-        CRUDE_SYMBOL = get_crude_fut_symbol()
+        CRUDE_SYMBOL = "MCX:CRUDEOIL"
 
     # -----------------------------
     # CONFIG
@@ -866,6 +866,10 @@ def find_option(signal, instrument):
     # -----------------------------
     for strike in strikes:
         for i in opts:
+            
+            # 🚫 STRICT OPTION FILTER (ADD THIS)
+            if i["instrument_type"] not in ["CE", "PE"]:
+                continue
 
             if i["expiry"] != expiry or i["instrument_type"] != opt_type:
                 continue
@@ -913,6 +917,11 @@ def find_option(signal, instrument):
     # -----------------------------
     if candidates:
         best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
+        
+        # 🚫 FINAL SAFETY CHECK (ADD THIS)
+        if not best["symbol"].endswith(("CE", "PE")):
+            print("❌ Not CE/PE — blocked")
+            return None, None, None, None
 
         print(f"🏆 Selected: {best['symbol']} @ {best['price']}")
 
@@ -1012,9 +1021,9 @@ def place_order(symbol, qty, exchange, instrument):
 
     print(f"🚀 PLACE ORDER: {symbol}, lot: {qty}, exchange: {exchange}")
 
-    # 🚫 BLOCK FUTURES
-    if "FUT" in symbol:
-        print("🚫 BLOCKED: Futures order detected!")
+    # 🚫 STRICT OPTION ONLY (REPLACE THIS BLOCK)
+    if not symbol.endswith(("CE", "PE")):
+        print("🚫 BLOCKED: Only CE/PE options allowed")
         return None
 
     try:

@@ -764,8 +764,12 @@ def find_option(signal, instrument):
 
     global CRUDE_SYMBOL
 
-    if CRUDE_SYMBOL is None:
-        CRUDE_SYMBOL = "MCX:CRUDEOIL"
+    # ✅ ALWAYS ENSURE VALID FUT SYMBOL
+    if instrument == "CRUDE":
+        if CRUDE_SYMBOL is None or "CRUDEOIL" not in CRUDE_SYMBOL:
+            CRUDE_SYMBOL = get_crude_fut_symbol()
+
+        print("✅ CRUDE BASE SYMBOL:", CRUDE_SYMBOL)
 
     # -----------------------------
     # CONFIG
@@ -843,8 +847,8 @@ def find_option(signal, instrument):
     opts = [
         i for i in instruments
         if (
-            (instrument == "CRUDE" and "CRUDEOIL" in i["tradingsymbol"]) or
-            (instrument == "NIFTY" and name in i["name"])
+            (instrument == "CRUDE" and i["name"] == "CRUDEOIL") or
+            (instrument == "NIFTY" and i["name"] == "NIFTY")
         )
         and i["instrument_type"] in ["CE", "PE"]
         and i["expiry"] >= today
@@ -866,6 +870,13 @@ def find_option(signal, instrument):
     # -----------------------------
     for strike in strikes:
         for i in opts:
+            
+            # 🔒 EXTRA INSTRUMENT SAFETY
+            if instrument == "CRUDE" and i["name"] != "CRUDEOIL":
+                continue
+
+            if instrument == "NIFTY" and i["name"] != "NIFTY":
+                continue
             
             # 🚫 STRICT OPTION FILTER (ADD THIS)
             if i["instrument_type"] not in ["CE", "PE"]:
@@ -918,10 +929,21 @@ def find_option(signal, instrument):
     if candidates:
         best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
         
+        # 🚫 FINAL INSTRUMENT CHECK
+        if instrument == "CRUDE" and "CRUDEOIL" not in best["symbol"]:
+            print("❌ Wrong instrument selected (CRUDE)")
+            return None, None, None, None
+
+        if instrument == "NIFTY" and "NIFTY" not in best["symbol"]:
+            print("❌ Wrong instrument selected (NIFTY)")
+            return None, None, None, None
+        
         # 🚫 FINAL SAFETY CHECK (ADD THIS)
         if not best["symbol"].endswith(("CE", "PE")):
             print("❌ Not CE/PE — blocked")
             return None, None, None, None
+            
+        print(f"🔍 Instrument: {instrument} | Selected: {best['symbol']}")
 
         print(f"🏆 Selected: {best['symbol']} @ {best['price']}")
 

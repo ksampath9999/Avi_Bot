@@ -1070,7 +1070,6 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio, risk_off
     global max_drawdown, last_exit_time_nifty, last_exit_time_crude
-    
 
     with lock:
         trade_count += 1
@@ -1079,197 +1078,51 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     actual_qty = get_quantity(qty, exchange)
     remaining_qty = actual_qty
 
-    pyramid_count = 0
-    MAX_PYRAMID = 0
-
-    df = get_cached_data(
-        config.NIFTY_TOKEN if instrument == "NIFTY" else CRUDE_TOKEN,
-        "5minute",
-        30
-    )
-
-    # -----------------------------
-    # SL CALCULATION
-    # -----------------------------
-    if df is not None and len(df) > 10:
-        df = df.copy()
-        df["range"] = df["high"] - df["low"]
-        atr = df["range"].rolling(10).mean().iloc[-1]
-
-        strength = abs(df.iloc[-1]["close"] - df.iloc[0]["close"]) / df.iloc[-1]["close"]
-
-        if strength > 0.01:
-            sl = entry - atr * 1.5
-        else:
-            sl = entry - atr * 0.8
-    else:
-        sl = entry - (entry * 0.15)
-
-    risk = entry - sl
-    rr = 4 if is_strong_trend_day(config.NIFTY_TOKEN) else 2.5
-    # 🎯 BASE TARGET
-    base_target = entry + risk * rr
-    target = base_target
-
-    trailing_sl = sl
-    highest_price = entry
     entry_time = time.time()
     partial_booked = False
-    boost_applied = False
+
+    # 🔥 CORE RISK MODEL
+    risk = entry * 0.25
+
+    if signal == "CALL":
+        sl = entry - risk
+        peak = entry
+    else:
+        sl = entry + risk
+        peak = entry
 
     send_message(f"🚀 ELITE TRADE\n{symbol} @ {entry}")
 
     while True:
         try:
-            retry = 0
+            ltp = safe_ltp(full_symbol)
 
-            while True:
-                ltp = safe_ltp(full_symbol)
-
-                if ltp is None:
-                    retry += 1
-                    if retry > 5:
-                        print("❌ LTP failed — exiting trade")
-                        return   # ✅ EXIT FUNCTION COMPLETELY
-                    time.sleep(3)
-                    continue
-
-                break
-
-            profit = ltp - entry
+            if ltp is None:
+                time.sleep(2)
+                continue
 
             # -----------------------------
-            # PYRAMIDING
+            # 📊 PROFIT CALC
             # -----------------------------
-            if pyramid_count < MAX_PYRAMID:
-                trigger = 1.10 + (pyramid_count * 0.05)
-
-                if ltp > entry * trigger:
-                    extra_qty = max(1, actual_qty // (2 + pyramid_count))
-
-                    try:
-                        kite.place_order(
-                            variety="regular",
-                            exchange=exchange,
-                            tradingsymbol=symbol,
-                            transaction_type="BUY",
-                            quantity=extra_qty,
-                            order_type="MARKET",
-                            product="MIS" if exchange == "NFO" else "NRML"
-                        )
-
-                        pyramid_count += 1
-                        send_message(f"🚀 Pyramid {pyramid_count}\n{symbol}")
-
-                    except Exception as e:
-                        print("Pyramid error:", e)
+            if signal == "CALL":
+                profit = ltp - entry
+                peak = max(peak, ltp)
+            else:
+                profit = entry - ltp
+                peak = min(peak, ltp)
 
             # -----------------------------
-            # ⚡ EARLY EXIT
+            # 🚨 HARD STOP LOSS
             # -----------------------------
-            if profit > entry * 0.03 and ltp < highest_price * 0.98:
-                pnl = (ltp - entry) * remaining_qty
-                send_message(f"⚡ Weakness exit\n{symbol}")
-
-                # ✅ UPDATE SYSTEM
-                with lock:
-                    portfolio_pnl += pnl
-                    daily_pnl += pnl
-
-                    if peak_portfolio == 0:
-                        peak_portfolio = portfolio_pnl
-                    else:
-                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
-
-                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
-
-                    update_streak(pnl)
-
-                update_exit_time(instrument)
-                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
-                # 📊 LOG PERFORMANCE
-                # always append
-                performance_log.append({
-                    "result": "WIN" if pnl > 0 else "LOSS",
-                    "pnl": pnl,
-                    "time": time.time()
-                })
-
-                # limit size
-                if len(performance_log) > 100:
-                    performance_log.pop(0)
-
-                if market_type in strategy_log:
-                    strategy_log[market_type].append(pnl)
-                break
-
-            # -----------------------------
-            # QUICK SL
-            # -----------------------------
-            if profit < -entry * 0.08:
+            if profit < -risk:
                 pnl = (ltp - entry) * remaining_qty
                 send_message(f"🚨 HARD SL\n{symbol}")
-
-                with lock:
-                    portfolio_pnl += pnl
-                    daily_pnl += pnl
-
-                    if peak_portfolio == 0:
-                        peak_portfolio = portfolio_pnl
-                    else:
-                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
-
-                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
-
-                    update_streak(pnl)
-
-                update_exit_time(instrument)
-                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
-
-                performance_log.append({
-                    "result": "WIN" if pnl > 0 else "LOSS",
-                    "pnl": pnl,
-                    "time": time.time()
-                })
-                
-                if len(performance_log) > 100:
-                    performance_log.pop(0)
-
-                if market_type in strategy_log:
-                    strategy_log[market_type].append(pnl)
-
                 break
 
             # -----------------------------
-            # TRACK HIGH
+            # 💰 PARTIAL BOOKING
             # -----------------------------
-            if ltp > highest_price:
-                highest_price = ltp
-
-            # 🔒 NEVER REDUCE TARGET
-            target = max(target, base_target)
-
-            # 🚀 DYNAMIC TARGET SYSTEM
-            move_pct = (ltp - entry) / entry
-
-            if move_pct > 0.05:
-                target = max(target, entry * 1.15)
-
-            if move_pct > 0.10:
-                target = max(target, entry * 1.35)
-
-            if move_pct > 0.15:
-                target = max(target, entry * 1.60)
-
-            # 🚀 STRONG MOMENTUM HOLD (SAFE VERSION)
-            if profit > entry * 0.12 and not boost_applied:
-                target = entry + (entry * 0.8)
-                boost_applied = True
-
-            # -----------------------------
-            # PARTIAL
-            # -----------------------------
-            if not partial_booked and profit > entry * 0.10:
+            if not partial_booked and profit >= risk:
                 half = remaining_qty // 2
 
                 if half > 0:
@@ -1278,135 +1131,82 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     send_message(f"💰 Partial booked\n{symbol}")
 
             # -----------------------------
-            # TRAILING
+            # 🔒 MOVE SL TO COST
             # -----------------------------
-            # 🔥 EARLY PROFIT LOCK
-            if profit > entry * 0.03:
-                trailing_sl = max(trailing_sl, entry * 1.01)
+            if profit >= risk:
+                sl = entry
 
-            if profit > entry * 0.05:
-                trailing_sl = max(trailing_sl, entry * 1.03)
+            # -----------------------------
+            # 🔥 LOCK PROFIT
+            # -----------------------------
+            if profit >= risk * 1.5:
+                if signal == "CALL":
+                    sl = entry + risk * 0.5
+                else:
+                    sl = entry - risk * 0.5
 
-            # 🔥 SMART TRAILING
-            if profit > entry * 0.10:
-                trailing_sl = max(trailing_sl, ltp * 0.98)
+            # -----------------------------
+            # 🚀 TRAILING SL (CORE ENGINE)
+            # -----------------------------
+            trail_gap = risk * 0.7
+
+            if signal == "CALL":
+                sl = max(sl, peak - trail_gap)
             else:
-                trailing_sl = max(trailing_sl, ltp * 0.96)
+                sl = min(sl, peak + trail_gap)
 
-            if ltp <= trailing_sl:
+            # -----------------------------
+            # 🚪 EXIT CONDITION
+            # -----------------------------
+            if (signal == "CALL" and ltp <= sl) or (signal == "PUT" and ltp >= sl):
                 pnl = (ltp - entry) * remaining_qty
-                send_message(f"🛑 Trailing exit\n{symbol}")
-
-                with lock:
-                    portfolio_pnl += pnl
-                    daily_pnl += pnl
-
-                    if peak_portfolio == 0:
-                        peak_portfolio = portfolio_pnl
-                    else:
-                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
-
-                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
-
-                    update_streak(pnl)
-
-                update_exit_time(instrument)
-                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
-                # 📊 LOG PERFORMANCE
-                performance_log.append({
-                    "result": "WIN" if pnl > 0 else "LOSS",
-                    "pnl": pnl,
-                    "time": time.time()
-                })
-                
-                if len(performance_log) > 100:
-                    performance_log.pop(0)
-
-                if market_type in strategy_log:
-                    strategy_log[market_type].append(pnl)
+                send_message(f"🛑 Exit\n{symbol}")
                 break
 
             # -----------------------------
-            # TARGET
+            # ⏱ TIME EXIT
             # -----------------------------
-            if ltp >= target:
-                pnl = (ltp - entry) * remaining_qty
-                send_message(f"🎯 Target hit\n{symbol}")
-
-                with lock:
-                    portfolio_pnl += pnl
-                    daily_pnl += pnl
-
-                    if peak_portfolio == 0:
-                        peak_portfolio = portfolio_pnl
-                    else:
-                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
-
-                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
-
-                    update_streak(pnl)
-
-                update_exit_time(instrument)
-                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
-                # 📊 LOG PERFORMANCE
-                performance_log.append({
-                    "result": "WIN" if pnl > 0 else "LOSS",
-                    "pnl": pnl,
-                    "time": time.time()
-                })
-                
-                if len(performance_log) > 100:
-                    performance_log.pop(0)
-
-                if market_type in strategy_log:
-                    strategy_log[market_type].append(pnl)
-                break
-
-            # -----------------------------
-            # TIME EXIT
-            # -----------------------------
-            # ⏱ Smart time exit
-            if time.time() - entry_time > 600 and profit < entry * 0.02:
+            if time.time() - entry_time > 600 and profit < risk * 0.5:
                 pnl = (ltp - entry) * remaining_qty
                 send_message(f"⏱ Time exit\n{symbol}")
-
-                with lock:
-                    portfolio_pnl += pnl
-                    daily_pnl += pnl
-
-                    if peak_portfolio == 0:
-                        peak_portfolio = portfolio_pnl
-                    else:
-                        peak_portfolio = max(peak_portfolio, portfolio_pnl)
-
-                    max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
-
-                    update_streak(pnl)
-
-                update_exit_time(instrument)
-                log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
-                # 📊 LOG PERFORMANCE
-                performance_log.append({
-                    "result": "WIN" if pnl > 0 else "LOSS",
-                    "pnl": pnl,
-                    "time": time.time()
-                })
-                
-                if len(performance_log) > 100:
-                    performance_log.pop(0)
-
-                if market_type in strategy_log:
-                    strategy_log[market_type].append(pnl)
-               
-                    
                 break
 
-            time.sleep(2)
+            time.sleep(1.5)
 
         except Exception as e:
             print("Trade error:", e)
-            break            
-            
+            break
+
+    # -----------------------------
+    # 📊 FINAL UPDATE BLOCK
+    # -----------------------------
+    with lock:
+        portfolio_pnl += pnl
+        daily_pnl += pnl
+
+        if peak_portfolio == 0:
+            peak_portfolio = portfolio_pnl
+        else:
+            peak_portfolio = max(peak_portfolio, portfolio_pnl)
+
+        max_drawdown = max(max_drawdown, peak_portfolio - portfolio_pnl)
+
+        update_streak(pnl)
+
+    update_exit_time(instrument)
+    log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+
+    performance_log.append({
+        "result": "WIN" if pnl > 0 else "LOSS",
+        "pnl": pnl,
+        "time": time.time()
+    })
+
+    if len(performance_log) > 100:
+        performance_log.pop(0)
+
+    if market_type in strategy_log:
+        strategy_log[market_type].append(pnl)           
   
 
 def tune_strategy():
@@ -1713,6 +1513,11 @@ def nifty_loop():
 
         # ⏳ COOLDOWN
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
+            continue
+            
+        # 🧊 COOLING AFTER EXIT (PRO RISK CONTROL)
+        if time.time() - last_exit_time_nifty < 120:
+            print("⏳ Cooling period")
             continue
 
         # 🔒 LOCK + DUPLICATE PROTECTION (CRITICAL)
@@ -2522,19 +2327,25 @@ def elite_signal(df):
     if df is None or len(df) < 2:
         return "HOLD"
 
-    # 🔒 EMA SAFETY (MUST BE FIRST)
     if "ema9" not in df.columns or "ema20" not in df.columns:
         return "HOLD"
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 🔒 VWAP safety
+    # 🔒 VWAP SAFETY
     if pd.isna(last.get("vwap", None)):
         last["vwap"] = last["close"]
 
     move = abs(last["close"] - prev["close"])
     threshold = last["close"] * 0.0003
+
+    # -----------------------------
+    # 🔥 CANDLE STRENGTH (PRO ADD)
+    # -----------------------------
+    body = abs(last["close"] - last["open"])
+    range_ = last["high"] - last["low"]
+    strong_candle = body > (range_ * 0.5) if range_ > 0 else False
 
     # -----------------------------
     # 🔊 VOLUME CONFIRMATION
@@ -2546,66 +2357,42 @@ def elite_signal(df):
             volume_ok = last["volume"] > vol_ma * 1.2
 
     # -----------------------------
-    # 🧠 TREND FILTER (VWAP + EMA)
+    # 🧠 TREND (EMA PRIORITY)
     # -----------------------------
-    bullish_trend = (
-        last["close"] > last["vwap"] and
-        last["ema9"] > last["ema20"]
-    )
-
-    bearish_trend = (
-        last["close"] < last["vwap"] and
-        last["ema9"] < last["ema20"]
-    )
-
-    # -----------------------------
-    # 🧠 BREAKOUT + RETEST
-    # -----------------------------
-    if len(df) >= 5:
-        recent_high = df["high"].iloc[-5:-1].max()
-        recent_low = df["low"].iloc[-5:-1].min()
-
-        if bullish_trend and last["close"] > recent_high:
-            if prev["close"] > recent_high and last["close"] < prev["close"]:
-                if volume_ok:
-                    return "CALL"
-
-        if bearish_trend and last["close"] < recent_low:
-            if prev["close"] < recent_low and last["close"] > prev["close"]:
-                if volume_ok:
-                    return "PUT"
+    bullish = last["ema9"] > last["ema20"]
+    bearish = last["ema9"] < last["ema20"]
 
     # -----------------------------
     # 🥇 STRONG BREAKOUT
     # -----------------------------
-    if bullish_trend and last["close"] > prev["high"]:
+    if bullish and last["close"] > prev["high"] and strong_candle:
         if volume_ok:
             return "CALL"
 
-    if bearish_trend and last["close"] < prev["low"]:
+    if bearish and last["close"] < prev["low"] and strong_candle:
         if volume_ok:
             return "PUT"
 
     # -----------------------------
-    # 🥈 TREND CONTINUATION
+    # 🥈 PULLBACK (BEST ENTRY)
     # -----------------------------
-    if bullish_trend and last["close"] > prev["close"]:
+    if bullish and last["close"] < prev["close"] and last["close"] > last["vwap"]:
         return "CALL"
 
-    if bearish_trend and last["close"] < prev["close"]:
+    if bearish and last["close"] > prev["close"] and last["close"] < last["vwap"]:
         return "PUT"
 
     # -----------------------------
-    # 🥉 PULLBACK ENTRY
+    # 🥉 CONTINUATION
     # -----------------------------
-    if bullish_trend and last["close"] < prev["close"]:
+    if bullish and last["close"] > prev["close"]:
         return "CALL"
 
-    if bearish_trend and last["close"] > prev["close"]:
+    if bearish and last["close"] < prev["close"]:
         return "PUT"
 
     # -----------------------------
-    # ⚡ MICRO MOMENTUM
+    # ⚡ MOMENTUM
     # -----------------------------
     if move > threshold:
         if last["close"] > prev["close"]:

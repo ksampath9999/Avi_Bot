@@ -102,7 +102,7 @@ ENABLE_CRUDE = False
 performance_log = []
 
 adaptive_config = {
-    "prob_threshold": 35,
+    "prob_threshold": 38,
     "trend_threshold": 0.0015,
     "risk_multiplier": 1.0
 }

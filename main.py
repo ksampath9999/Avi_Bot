@@ -145,6 +145,46 @@ def prepare_indicators(df):
     df["ema20"] = df["close"].ewm(span=20).mean()
 
     return df
+    
+    
+    
+def detect_market_type(df):
+
+    if df is None or len(df) < 20:
+        return "NORMAL"
+
+    df = prepare_indicators(df)
+
+    last = df.iloc[-1]
+
+    # -----------------------------
+    # 📊 VOLATILITY
+    # -----------------------------
+    range_ = df["high"].max() - df["low"].min()
+    price = last["close"]
+
+    volatility = range_ / price
+
+    # -----------------------------
+    # 📈 TREND STRENGTH
+    # -----------------------------
+    trend_move = abs(df.iloc[-1]["close"] - df.iloc[0]["close"]) / price
+
+    # -----------------------------
+    # 🎯 LOGIC
+    # -----------------------------
+    if trend_move > 0.008:
+        return "TREND"
+
+    elif volatility < 0.003:
+        return "SIDEWAYS"
+
+    elif volatility > 0.01:
+        return "VOLATILE"
+
+    return "NORMAL"
+    
+    
 
 def evaluate_strategies():
 
@@ -1398,6 +1438,7 @@ def nifty_loop():
     global last_analysis_time, report_sent_today
     global last_executed_signal_nifty, last_exit_time_nifty
 
+
     print("🔥 NIFTY LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
@@ -1440,13 +1481,27 @@ def nifty_loop():
             time.sleep(5)
             continue
 
-        # 🔥 ALWAYS PREPARE INDICATORS
+        # 🔥 PREPARE INDICATORS
         df = prepare_indicators(df)
 
-        # 🎯 SIGNAL
-        signal = elite_signal(df)
-        market_type = "NORMAL"
+        # -----------------------------
+        # 🎯 ADAPTIVE SIGNAL ENGINE
+        # -----------------------------
+        market_type = detect_market_type(df)
 
+        if market_type == "TREND":
+            signal = elite_signal(df)
+
+        elif market_type == "SIDEWAYS":
+            signal = vwap_signal(config.NIFTY_TOKEN, df)
+
+        elif market_type == "VOLATILE":
+            signal = breakout_signal(config.NIFTY_TOKEN, df)
+
+        else:
+            signal = elite_signal(df)
+
+        print(f"📊 Market Type: {market_type}")
         print(f"🎯 NIFTY Signal: {signal}")
 
         # 🚫 Skip HOLD
@@ -1463,12 +1518,22 @@ def nifty_loop():
 
         # 🔥 SMALL BOOST
         probability += 3
-        
-        # ⚖️ PUT BALANCE BOOST (ADD HERE)
+
+        # ⚖️ CALL/PUT BALANCE
         if signal == "PUT":
             probability += 2
         elif signal == "CALL":
             probability += 1
+
+        # -----------------------------
+        # 🎯 ADAPTIVE PROBABILITY
+        # -----------------------------
+        if market_type == "TREND":
+            probability += 5
+        elif market_type == "SIDEWAYS":
+            probability -= 5
+        elif market_type == "VOLATILE":
+            probability -= 2
 
         # 🤖 ML SIGNAL
         multi_signal, ml_conf = multi_strategy_signal(config.NIFTY_TOKEN, "NIFTY", df)
@@ -1477,9 +1542,7 @@ def nifty_loop():
         # 🎯 Multi-strategy adjustment
         if signal == multi_signal and signal != "HOLD":
             probability += 10
-        elif multi_signal == "HOLD":
-            probability += 0
-        else:
+        elif multi_signal != "HOLD":
             probability -= 3
 
         # 🤖 ML confidence boost
@@ -1498,6 +1561,11 @@ def nifty_loop():
 
         # 🚫 Threshold
         threshold = adaptive_config["prob_threshold"] - 5
+
+        # 🚫 Sideways strict filter
+        if market_type == "SIDEWAYS" and probability < threshold + 5:
+            print("🚫 Sideways strict filter")
+            continue
 
         if probability < threshold:
             print("🚫 Below probability threshold (NIFTY)")
@@ -1523,13 +1591,13 @@ def nifty_loop():
         # ⏳ COOLDOWN
         if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
             continue
-            
-        # 🧊 COOLING AFTER EXIT (PRO RISK CONTROL)
+
+        # 🧊 COOLING AFTER EXIT
         if time.time() - last_exit_time_nifty < 120:
             print("⏳ Cooling period")
             continue
 
-        # 🔒 LOCK + DUPLICATE PROTECTION (CRITICAL)
+        # 🔒 LOCK + DUPLICATE PROTECTION
         with lock:
             if nifty_active:
                 print("⚠️ Duplicate prevented")

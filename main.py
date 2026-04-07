@@ -96,7 +96,7 @@ pyramid_done = False
 TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
-
+ENABLE_CRUDE = False
 
 
 performance_log = []
@@ -1725,7 +1725,13 @@ def crude_loop():
     global last_analysis_time, report_sent_today
     global last_executed_signal_crude, last_exit_time_crude
 
-    print("🔥 CRUDE LOOP STARTED")
+   
+    
+    if not ENABLE_CRUDE:
+        print("🚫 CRUDE DISABLED")
+        return
+        
+     print("🔥 CRUDE LOOP STARTED")
 
     if time.time() - last_analysis_time > 1800:
         tune_strategy()
@@ -3007,10 +3013,10 @@ if __name__ == "__main__":
     # -----------------------------
     threading.Thread(target=nifty_loop, daemon=True).start()
 
-    if CRUDE_TOKEN:
-        threading.Thread(target=crude_loop, daemon=True).start()
-    else:
-        print("⚠️ CRUDE LOOP SKIPPED")
+    #if CRUDE_TOKEN:
+    #    threading.Thread(target=crude_loop, daemon=True).start()
+    #else:
+    #    print("⚠️ CRUDE LOOP SKIPPED")
 
     print("🚀 Trading engine started")
 

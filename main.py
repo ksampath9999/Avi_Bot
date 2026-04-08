@@ -2039,7 +2039,7 @@ def get_quantity(lots, exchange):
     if exchange == "NFO":   # NIFTY
         return lots * 65
     elif exchange == "MCX": # CRUDE
-        return lots * 100
+        return lots
     return lots
     
 def get_balance():

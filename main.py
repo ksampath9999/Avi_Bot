@@ -1762,19 +1762,30 @@ def nifty_loop():
 
         print(f"📊 NIFTY HT Trend (15m): {ht_trend}")
         
-        # 🚫 NO TREND → SKIP
-        # 🔥 SMART HT HANDLING
+        # 🔥 SMART HT HANDLING (IMPROVED)
         if ht_trend == "HOLD":
             print("⚠️ HT no trend — checking momentum")
 
             last = df.iloc[-1]
             prev = df.iloc[-2]
 
-            # 🚀 EARLY ENTRY CONDITION
-            if signal == "CALL" and last["close"] > prev["close"]:
-                print("⚡ Early CALL allowed")
-            elif signal == "PUT" and last["close"] < prev["close"]:
-                print("⚡ Early PUT allowed")
+            move = abs(last["close"] - prev["close"]) / last["close"]
+
+            # 🚀 EARLY ENTRY CONDITION (WITH STRENGTH)
+            if signal == "CALL" and last["close"] > prev["close"] and move > 0.001:
+                if last["close"] > last["vwap"]:
+                    print("⚡ Strong Early CALL allowed")
+                else:
+                    print("🚫 CALL below VWAP — skipping")
+                    continue
+
+            elif signal == "PUT" and last["close"] < prev["close"] and move > 0.001:
+                if last["close"] < last["vwap"]:
+                    print("⚡ Strong Early PUT allowed")
+                else:
+                    print("🚫 PUT above VWAP — skipping")
+                    continue
+
             else:
                 print("🚫 Weak move — skipping")
                 continue
@@ -1990,26 +2001,33 @@ def crude_loop():
         print(f"📊 CRUDE HT Trend (15m): {ht_trend}")
         
         
-        # 🔥 SMART HT HANDLING
+        # 🔥 SMART HT HANDLING (IMPROVED)
         if ht_trend == "HOLD":
             print("⚠️ HT no trend — checking momentum")
 
             last = df.iloc[-1]
             prev = df.iloc[-2]
 
-            # 🚀 EARLY ENTRY CONDITION
-            if signal == "CALL" and last["close"] > prev["close"]:
-                print("⚡ Early CALL allowed")
-            elif signal == "PUT" and last["close"] < prev["close"]:
-                print("⚡ Early PUT allowed")
+            move = abs(last["close"] - prev["close"]) / last["close"]
+
+            # 🚀 EARLY ENTRY CONDITION (WITH STRENGTH)
+            if signal == "CALL" and last["close"] > prev["close"] and move > 0.001:
+                if last["close"] > last["vwap"]:
+                    print("⚡ Strong Early CALL allowed")
+                else:
+                    print("🚫 CALL below VWAP — skipping")
+                    continue
+
+            elif signal == "PUT" and last["close"] < prev["close"] and move > 0.001:
+                if last["close"] < last["vwap"]:
+                    print("⚡ Strong Early PUT allowed")
+                else:
+                    print("🚫 PUT above VWAP — skipping")
+                    continue
+
             else:
                 print("🚫 Weak move — skipping")
                 continue
-
-        # 🔒 TREND FILTER
-        if ht_trend != "HOLD" and signal != ht_trend:
-            print("🚫 HT trend mismatch — skipping")
-            continue
         
             
       

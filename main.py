@@ -1745,26 +1745,27 @@ def nifty_loop():
         # 🔒 SINGLE LOCK (CRITICAL FIX)
         # ===============================
         with lock:
-            if nifty_active or trade_in_progress_nifty:
+            print(f"DEBUG → active: {nifty_active}, in_progress: {trade_in_progress_nifty}")
+
+            if nifty_active:
                 print("🚫 Trade blocked (NIFTY)")
                 continue
-
-            nifty_active = True
-            trade_in_progress_nifty = True
 
         try:
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
             if not symbol or not price:
-                with lock:
-                    nifty_active = False
-                    trade_in_progress_nifty = False
                 continue
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
+            if not filled_price:
+                continue
+
+            # ✅ SET FLAGS ONLY AFTER SUCCESS
             with lock:
-                trade_in_progress_nifty = False
+                nifty_active = True
+                trade_in_progress_nifty = True
 
             if not filled_price:
                 with lock:
@@ -1783,9 +1784,6 @@ def nifty_loop():
 
         except Exception as e:
             print("❌ NIFTY ERROR:", e)
-            with lock:
-                nifty_active = False
-                trade_in_progress_nifty = False
 
         time.sleep(2)
        
@@ -1868,9 +1866,6 @@ def crude_loop():
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
             if not symbol or not price:
-                with lock:
-                    crude_active = False
-                    trade_in_progress_crude = False
                 continue
 
             filled_price = place_order(symbol, lot, exchange, "CRUDE")

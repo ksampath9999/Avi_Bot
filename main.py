@@ -99,7 +99,7 @@ pyramid_done = False
 TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
-ENABLE_CRUDE = False
+ENABLE_CRUDE = True
 last_log_time = 0
 
 performance_log = []

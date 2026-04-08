@@ -839,13 +839,6 @@ def find_option(signal, instrument):
 
     global CRUDE_SYMBOL
 
-    # ✅ ALWAYS ENSURE VALID FUT SYMBOL
-    if instrument == "CRUDE":
-        if CRUDE_SYMBOL is None or "CRUDEOIL" not in CRUDE_SYMBOL:
-            CRUDE_SYMBOL = get_crude_fut_symbol()
-
-        print("✅ CRUDE BASE SYMBOL:", CRUDE_SYMBOL)
-
     # -----------------------------
     # CONFIG
     # -----------------------------
@@ -861,217 +854,120 @@ def find_option(signal, instrument):
         name = "CRUDEOIL"
         step = 100
         token = CRUDE_TOKEN
-        token_symbol = CRUDE_SYMBOL
+        token_symbol = CRUDE_SYMBOL or get_crude_fut_symbol()
         lot_size = 100
 
-    print("DEBUG TOKEN SYMBOL:", token_symbol)
-
-    if instrument == "CRUDE" and not token_symbol:
-        print("❌ CRUDE symbol is None")
-        return None, None, None, None
-
     # -----------------------------
-    # FETCH DATA
+    # DATA
     # -----------------------------
     df = get_cached_data(token, "5minute", 150)
-
     if df is None or df.empty:
-        print("❌ No data for option scoring")
-        return None, None, None, None
-
-    # -----------------------------
-    # LTP SAFE
-    # -----------------------------
-    if not token_symbol or ":" not in token_symbol:
-        print("❌ Invalid token symbol")
         return None, None, None, None
 
     ltp = safe_ltp(token_symbol)
-
     if ltp is None or ltp <= 0:
-        print("❌ LTP fetch failed:", token_symbol, ltp)
         return None, None, None, None
 
     # -----------------------------
     # ATM
     # -----------------------------
-    if instrument == "CRUDE":
-        atm = int(round(ltp / 100) * 100)
-    else:
-        atm = round(ltp / step) * step
-
-    print(f"{instrument} LTP: {ltp} | ATM: {atm}")
+    atm = round(ltp / step) * step
 
     # -----------------------------
-    # CAPITAL
+    # 💰 BALANCE BASED STRIKE LOGIC
     # -----------------------------
     balance = get_balance() or 10000
-    max_trade_value = balance * 0.20
 
-    # -----------------------------
-    # STRIKES
-    # -----------------------------
-    if instrument == "CRUDE":
-        strikes = [atm, atm + 100, atm - 100] if signal == "CALL" else [atm, atm - 100, atm + 100]
+    if balance < 10000:
+        shift = 2   # far OTM
+    elif balance < 15000:
+        shift = 1   # OTM
+    elif balance < 25000:
+        shift = 0   # ATM
     else:
-        strikes = [atm, atm + step, atm - step] if signal == "CALL" else [atm, atm - step, atm + step]
+        shift = -1  # ITM
 
+    if signal == "CALL":
+        target_strike = atm + (shift * step)
+    else:
+        target_strike = atm - (shift * step)
+
+    print(f"💰 Balance: {balance} | Target Strike: {target_strike}")
+
+    # -----------------------------
+    # INSTRUMENTS
+    # -----------------------------
     instruments = get_instruments_cached(exchange)
     today = datetime.datetime.now().date()
 
     opts = [
         i for i in instruments
-        if (
-            (instrument == "CRUDE" and i["name"] == "CRUDEOIL") or
-            (instrument == "NIFTY" and i["name"] == "NIFTY")
-        )
+        if i["name"] == name
         and i["instrument_type"] in ["CE", "PE"]
-        and i["expiry"] >= today
+        and i["expiry"] > today   # 🔥 STRICT EXPIRY
     ]
 
     if not opts:
-        print("❌ No instruments found")
         return None, None, None, None
 
     expiry = sorted(set(i["expiry"] for i in opts))[0]
     opt_type = "CE" if signal == "CALL" else "PE"
 
+    # -----------------------------
+    # 🎯 SELECT CLOSEST STRIKE
+    # -----------------------------
     candidates = []
 
-    print(f"ATM: {atm}, Strikes: {strikes}, Expiry: {expiry}")
+    for i in opts:
 
-    # -----------------------------
-    # MAIN SELECTION
-    # -----------------------------
-    for strike in strikes:
-        for i in opts:
-            
-            # 🔒 EXTRA INSTRUMENT SAFETY
-            if instrument == "CRUDE" and i["name"] != "CRUDEOIL":
-                continue
+        if i["expiry"] != expiry or i["instrument_type"] != opt_type:
+            continue
 
-            if instrument == "NIFTY" and i["name"] != "NIFTY":
-                continue
-            
-            # 🚫 STRICT OPTION FILTER (ADD THIS)
-            if i["instrument_type"] not in ["CE", "PE"]:
-                continue
+        try:
+            strike = int(i["strike"])
+        except:
+            continue
 
-            if i["expiry"] != expiry or i["instrument_type"] != opt_type:
-                continue
+        # sort based on closeness to target
+        diff = abs(strike - target_strike)
 
-            try:
-                s = int(i["strike"])
-            except:
-                continue
+        sym = f"{exchange}:{i['tradingsymbol']}"
+        p = safe_ltp(sym)
 
-            if instrument == "CRUDE" and s % 100 != 0:
-                continue
+        if p is None or p <= 0:
+            continue
 
-            if s != strike:
-                continue
+        trade_value = p * lot_size
 
-            sym = f"{exchange}:{i['tradingsymbol']}"
-            p = safe_ltp(sym)
-            print(f"🔍 Checking: {sym}, Price: {p}")
+        # 🔥 SAFETY: skip too costly trades
+        if trade_value > balance * 0.9:
+            continue
 
-            # 🔴 FIX: skip invalid price
-            if p is None or p <= 0:
-                print(f"❌ Invalid price for {sym}: {p}")
-                continue
+        score = score_option(i["tradingsymbol"], exchange, token, signal, df)
 
-            trade_value = p * lot_size
-            #limit = max_trade_value * (5 if instrument == "CRUDE" else 3)
+        candidates.append({
+            "symbol": i["tradingsymbol"],
+            "price": p,
+            "score": score,
+            "diff": diff
+        })
 
-            # 🔥 RELAX LIMIT
-            limit = max_trade_value * 10
-
-            if trade_value > limit:
-                print(f"⚠️ Skipped (value too high): {trade_value}")
-                continue
-
-            score = score_option(i["tradingsymbol"], exchange, token, signal, df)
-
-            candidates.append({
-                "symbol": i["tradingsymbol"],
-                "price": p,
-                "score": score
-            })
-
-    # -----------------------------
-    # BEST PICK
-    # -----------------------------
     if candidates:
-        best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
-        
-        # 🚫 FINAL INSTRUMENT CHECK
-        if instrument == "CRUDE" and "CRUDEOIL" not in best["symbol"]:
-            print("❌ Wrong instrument selected (CRUDE)")
-            return None, None, None, None
-
-        if instrument == "NIFTY" and "NIFTY" not in best["symbol"]:
-            print("❌ Wrong instrument selected (NIFTY)")
-            return None, None, None, None
-        
-        # 🚫 FINAL SAFETY CHECK (ADD THIS)
-        if not best["symbol"].endswith(("CE", "PE")):
-            print("❌ Not CE/PE — blocked")
-            return None, None, None, None
-            
-        print(f"🔍 Instrument: {instrument} | Selected: {best['symbol']}")
+        # 🔥 BEST = score + closeness
+        best = sorted(candidates, key=lambda x: (x["diff"], -x["score"]))[0]
 
         print(f"🏆 Selected: {best['symbol']} @ {best['price']}")
 
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
 
-        # 🔴 FINAL SAFETY
-        if best["price"] <= 0:
-            print("❌ Final price invalid — skipping")
-            return None, None, None, None
-            
-        # 🚫 FINAL INSTRUMENT SAFETY
-        if instrument == "CRUDE" and not best["symbol"].startswith("CRUDEOIL"):
-            print("❌ WRONG CRUDE OPTION — BLOCKED")
-            return None, None, None, None
-
-        if instrument == "NIFTY" and not best["symbol"].startswith("NIFTY"):
-            print("❌ WRONG NIFTY OPTION — BLOCKED")
-            return None, None, None, None
-
         return best["symbol"], best["price"], lot, exchange
 
-    print("🚫 No candidates — forcing ATM")
-
-    try:
-        opt_type = "CE" if signal == "CALL" else "PE"
-
-        atm_symbol = None
-
-        for i in opts:
-            if i["expiry"] == expiry and i["instrument_type"] == opt_type:
-                if int(i["strike"]) == atm:
-                    atm_symbol = i["tradingsymbol"]
-                    break
-
-        if atm_symbol:
-            sym = f"{exchange}:{atm_symbol}"
-            p = safe_ltp(sym)
-
-            if p and p > 0:
-                print(f"⚡ Forced ATM: {atm_symbol} @ {p}")
-
-                strong_trend = is_market_trending(token, df)
-                lot = calculate_lots(p, exchange, instrument, strong_trend)
-
-                return atm_symbol, p, lot, exchange
-
-    except Exception as e:
-        print("❌ ATM fallback error:", e)
-
     # -----------------------------
-    # FALLBACK
+    # 🚑 FALLBACK (ANY CLOSE OPTION)
     # -----------------------------
+    print("⚠️ No ideal candidate — fallback")
+
     best = None
     best_price = None
     min_diff = float("inf")
@@ -1082,29 +978,28 @@ def find_option(signal, instrument):
             continue
 
         try:
-            s = int(i["strike"])
+            strike = int(i["strike"])
         except:
             continue
 
-        diff = abs(s - atm)
+        diff = abs(strike - atm)
+
+        sym = f"{exchange}:{i['tradingsymbol']}"
+        p = safe_ltp(sym)
+
+        if p is None or p <= 0:
+            continue
+
+        if p * lot_size > balance * 0.9:
+            continue
 
         if diff < min_diff:
+            min_diff = diff
+            best = i["tradingsymbol"]
+            best_price = p
 
-            sym = f"{exchange}:{i['tradingsymbol']}"
-            p = safe_ltp(sym)
-
-            if p is None or p <= 0:
-                continue
-
-            trade_value = p * lot_size
-
-            if trade_value <= max_trade_value * 10:
-                min_diff = diff
-                best = i["tradingsymbol"]
-                best_price = p
-
-    if best and best_price > 0:
-        print(f"✅ Fallback selected: {best} @ {best_price}")
+    if best:
+        print(f"✅ Fallback: {best} @ {best_price}")
 
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best_price, exchange, instrument, strong_trend)
@@ -1112,13 +1007,7 @@ def find_option(signal, instrument):
         return best, best_price, lot, exchange
 
     print("❌ No valid option found")
-    
-    #if i["instrument_type"] not in ["CE", "PE"]:
-    #    continue
-    
-
     return None, None, None, None
-
 # -----------------------------
 # ORDER
 # -----------------------------

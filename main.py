@@ -1679,7 +1679,7 @@ def nifty_loop():
     global nifty_active, last_signal_nifty, last_trade_time_nifty
     global last_analysis_time, report_sent_today
     global last_executed_signal_nifty, last_exit_time_nifty
-    
+    global last_log_time
 
     print("🔥 NIFTY LOOP STARTED")
     
@@ -1926,7 +1926,7 @@ def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
     global last_analysis_time, report_sent_today
     global last_executed_signal_crude, last_exit_time_crude
-    
+    global last_log_time
     
     if datetime.date.today() != last_reset_date:
         reset_daily_pnl()

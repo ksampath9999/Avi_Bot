@@ -97,6 +97,7 @@ TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
 ENABLE_CRUDE = False
+last_log_time = 0
 
 performance_log = []
 
@@ -1743,8 +1744,10 @@ def nifty_loop():
         else:
             signal = elite_signal(df)
 
-        print(f"📊 Market Type: {market_type}")
-        print(f"🎯 NIFTY Signal: {signal}")
+        if time.time() - last_log_time > 5:
+            print(f"📊 Market Type: {market_type}")
+            print(f"🎯 NIFTY Signal: {signal}")
+            last_log_time = time.time()
 
         if not signal or signal == "HOLD":
             continue
@@ -1764,8 +1767,9 @@ def nifty_loop():
         
         # 🔥 SMART HT HANDLING (IMPROVED)
         if ht_trend == "HOLD":
-            print("⚠️ HT no trend — checking momentum")
-
+                if time.time() - last_log_time > 5:
+                    print("⚠️ HT HOLD — checking momentum")
+                    
             last = df.iloc[-1]
             prev = df.iloc[-2]
 
@@ -1787,7 +1791,6 @@ def nifty_loop():
                     continue
 
             else:
-                print("🚫 Weak move — skipping")
                 continue
         
         # 🔒 TREND FILTER
@@ -2003,7 +2006,8 @@ def crude_loop():
         
         # 🔥 SMART HT HANDLING (IMPROVED)
         if ht_trend == "HOLD":
-            print("⚠️ HT no trend — checking momentum")
+            if time.time() - last_log_time > 5:
+                print("⚠️ HT HOLD — checking momentum")
 
             last = df.iloc[-1]
             prev = df.iloc[-2]
@@ -2026,7 +2030,6 @@ def crude_loop():
                     continue
 
             else:
-                print("🚫 Weak move — skipping")
                 continue
         
             

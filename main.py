@@ -3113,10 +3113,10 @@ if __name__ == "__main__":
     # -----------------------------
     threading.Thread(target=nifty_loop, daemon=True).start()
 
-    #if CRUDE_TOKEN:
-    #    threading.Thread(target=crude_loop, daemon=True).start()
-    #else:
-    #    print("⚠️ CRUDE LOOP SKIPPED")
+    if CRUDE_TOKEN:
+        threading.Thread(target=crude_loop, daemon=True).start()
+    else:
+        print("⚠️ CRUDE LOOP SKIPPED")
 
     print("🚀 Trading engine started")
 

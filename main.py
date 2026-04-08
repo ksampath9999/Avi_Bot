@@ -32,6 +32,9 @@ SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 nifty_active = False
 crude_active = False
 
+trade_in_progress_nifty = False
+trade_in_progress_crude = False
+
 # -----------------------------
 # RISK VARIABLES
 # -----------------------------
@@ -127,6 +130,7 @@ strategy_weights = {
     "VOLATILE": 0.8,
     "NORMAL": 0.9
 }
+
 
 
 def is_trading_time():
@@ -936,6 +940,10 @@ def find_option(signal, instrument):
 
         if p is None or p <= 0:
             continue
+            
+        # 🎯 PREMIUM TARGETING (₹70–₹100)
+        if p < 70 or p > 100:
+            continue
 
         trade_value = p * lot_size
 
@@ -951,6 +959,29 @@ def find_option(signal, instrument):
             "score": score,
             "diff": diff
         })
+        
+        
+    # 🔁 RELAX RANGE IF NOTHING FOUND
+    if not candidates:
+        print("⚠️ No options in ₹70–₹100, relaxing range")
+
+        for i in opts:
+            if i["expiry"] != expiry or i["instrument_type"] != opt_type:
+                continue
+
+            sym = f"{exchange}:{i['tradingsymbol']}"
+            p = safe_ltp(sym)
+
+            if p is None or p <= 0:
+                continue
+
+            if 50 <= p <= 120:
+                candidates.append({
+                    "symbol": i["tradingsymbol"],
+                    "price": p,
+                    "score": 0,
+                    "diff": abs(int(i["strike"]) - target_strike)
+                })
 
     if candidates:
         # 🔥 BEST = score + closeness
@@ -1324,11 +1355,21 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             update_streak(pnl)
             update_exit_time(instrument)
+            
+            
 
             if instrument == "NIFTY":
                 nifty_active = False
             else:
                 crude_active = False
+                
+            # 🔥 CRITICAL FIX (MISSING)
+            global trade_in_progress_nifty, trade_in_progress_crude
+
+            if instrument == "NIFTY":
+                trade_in_progress_nifty = False
+            else:
+                trade_in_progress_crude = False
 
 
             print(f"✅ {instrument} trade closed — ready for next")
@@ -1665,8 +1706,6 @@ def nifty_loop():
         if probability < adaptive_config["prob_threshold"]:
             continue
 
-        if time.time() - last_trade_time_nifty < SIGNAL_COOLDOWN:
-            continue
 
         if time.time() - last_exit_time_nifty < 120:
             continue
@@ -1674,8 +1713,16 @@ def nifty_loop():
         # 🔒 LOCK
         with lock:
             if nifty_active:
+                print("🚫 NIFTY already running")
                 continue
             nifty_active = True
+            
+        with lock:
+            if trade_in_progress_nifty:
+                print("🚫 Order already in progress (NIFTY)")
+                nifty_active = False
+                continue
+            trade_in_progress_nifty = True
 
         try:
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
@@ -1684,12 +1731,21 @@ def nifty_loop():
                 with lock:
                     nifty_active = False
                 continue
+                
+            # 🔥 FINAL LOCK CHECK
+            with lock:
+                if not nifty_active:
+                    print("⚠️ Lost lock — skipping order")
+                    continue
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
+            with lock:
+                trade_in_progress_nifty = False
 
             if not filled_price:
                 with lock:
                     nifty_active = False
+                    trade_in_progress_nifty = False
                 continue
 
             last_executed_signal_nifty = signal
@@ -1789,14 +1845,21 @@ def crude_loop():
         if probability < adaptive_config["prob_threshold"]:
             continue
 
-        if time.time() - last_trade_time_crude < SIGNAL_COOLDOWN:
-            continue
+        
 
         # 🔒 LOCK
         with lock:
             if crude_active:
+                print("🚫 CRUDE already running")
                 continue
             crude_active = True
+            
+        with lock:
+            if trade_in_progress_crude:
+                print("🚫 Order already in progress (CRUDE)")
+                crude_active = False
+                continue
+            trade_in_progress_crude = True
 
         try:
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
@@ -1805,12 +1868,21 @@ def crude_loop():
                 with lock:
                     crude_active = False
                 continue
+                
+            # 🔥 FINAL LOCK CHECK
+            with lock:
+                if not crude_active:
+                    print("⚠️ crude Lost lock — skipping order")
+                    continue
 
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
+            with lock:
+                trade_in_progress_crude = False
 
             if not filled_price:
                 with lock:
                     crude_active = False
+                    trade_in_progress_crude = False
                 continue
 
             last_executed_signal_crude = signal

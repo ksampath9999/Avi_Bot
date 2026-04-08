@@ -954,7 +954,7 @@ def find_option(signal, instrument):
         except:
             continue
             
-         print(f"🔍 {i['tradingsymbol']} | LOT SIZE → {i['lot_size']}")
+        print(f"🔍 {i['tradingsymbol']} | LOT SIZE → {i['lot_size']}")
 
         # sort based on closeness to target
         diff = abs(strike - target_strike)

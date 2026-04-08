@@ -1767,8 +1767,8 @@ def nifty_loop():
         
         # 🔥 SMART HT HANDLING (IMPROVED)
         if ht_trend == "HOLD":
-                if time.time() - last_log_time > 5:
-                    print("⚠️ HT HOLD — checking momentum")
+            if time.time() - last_log_time > 5:
+                print("⚠️ HT HOLD — checking momentum")
                     
             last = df.iloc[-1]
             prev = df.iloc[-2]

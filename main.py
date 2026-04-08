@@ -97,7 +97,6 @@ TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
 ENABLE_CRUDE = False
-trade_in_progress = False
 
 performance_log = []
 
@@ -1278,7 +1277,6 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global portfolio_pnl, peak_portfolio, risk_off
     global max_drawdown, last_exit_time_nifty, last_exit_time_crude
     global nifty_active, crude_active
-    global trade_in_progress
 
     full_symbol = f"{exchange}:{symbol}"
     actual_qty = get_quantity(qty, exchange)
@@ -1442,7 +1440,6 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             else:
                 crude_active = False
 
-            trade_in_progress = False
 
             print(f"✅ {instrument} trade closed — ready for next")
 
@@ -1681,7 +1678,7 @@ def nifty_loop():
     global nifty_active, last_signal_nifty, last_trade_time_nifty
     global last_analysis_time, report_sent_today
     global last_executed_signal_nifty, last_exit_time_nifty
-    global trade_in_progress
+    
 
     print("🔥 NIFTY LOOP STARTED")
     
@@ -1765,6 +1762,11 @@ def nifty_loop():
 
         print(f"📊 NIFTY HT Trend (15m): {ht_trend}")
         
+        # 🚫 NO TREND → SKIP
+        if ht_trend == "HOLD":
+            print("⚠️ HT no trend — skipping")
+            continue
+        
         # 🔒 TREND FILTER
         if ht_trend != "HOLD" and signal != ht_trend:
             print("🚫 HT trend mismatch — skipping")
@@ -1832,11 +1834,10 @@ def nifty_loop():
 
         # 🔒 LOCK
         with lock:
-            if nifty_active or trade_in_progress:
-                print("🚫 Trade blocked (NIFTY or GLOBAL active)")
+            if nifty_active :
+                print("🚫 NIFTY already running")
                 continue
             nifty_active = True
-            trade_in_progress = True
 
         try:
             # 🔍 OPTION
@@ -1899,7 +1900,7 @@ def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
     global last_analysis_time, report_sent_today
     global last_executed_signal_crude, last_exit_time_crude
-    global trade_in_progress
+    
     
     if datetime.date.today() != last_reset_date:
         reset_daily_pnl()
@@ -1975,6 +1976,12 @@ def crude_loop():
         ht_trend = halftrend_trend(df_ht)
 
         print(f"📊 CRUDE HT Trend (15m): {ht_trend}")
+        
+        
+        # 🚫 NO TREND → SKIP
+        if ht_trend == "HOLD":
+            print("⚠️ HT no trend — skipping")
+            continue
 
         # 🔒 TREND FILTER
         if ht_trend != "HOLD" and signal != ht_trend:
@@ -2017,11 +2024,10 @@ def crude_loop():
 
         # 🔒 LOCK (ONLY HERE)
         with lock:
-            if crude_active or trade_in_progress:
+            if crude_active:
                 print("🚫 Trade blocked (CRUDE or GLOBAL active)")
                 continue
             crude_active = True
-            trade_in_progress = True
 
         # 🔍 OPTION SELECTION
         symbol, price, lot, exchange = find_option(signal, "CRUDE")

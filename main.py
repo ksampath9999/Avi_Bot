@@ -131,6 +131,8 @@ strategy_weights = {
     "NORMAL": 0.9
 }
 
+exit_done = False
+partial_booked = False
 
 
 def is_trading_time():
@@ -1241,6 +1243,19 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 peak = min(peak, ltp)
 
             current_pnl = profit * remaining_qty
+            
+            # 💰 REAL PARTIAL BOOKING
+            if not partial_booked and current_pnl >= 1000:
+
+                half_qty = remaining_qty // 2
+
+                if half_qty > 0:
+                    exit_position(symbol, half_qty, exchange)
+
+                    remaining_qty -= half_qty
+                    partial_booked = True
+
+                    send_message(f"💰 Partial booked\n{symbol}")
 
             # ===============================
             # 🧠 ATR BASED TRAILING
@@ -1308,11 +1323,17 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
                 if ht1 == ht2:
                     if signal == "CALL" and ht2 == "PUT":
+                        if not exit_done:
+                            exit_position(symbol, remaining_qty, exchange)
+                            exit_done = True
                         print("🔄 Confirmed HalfTrend Exit")
                         pnl = current_pnl
                         break
 
                     if signal == "PUT" and ht2 == "CALL":
+                        if not exit_done:
+                            exit_position(symbol, remaining_qty, exchange)
+                            exit_done = True
                         print("🔄 Confirmed HalfTrend Exit")
                         pnl = current_pnl
                         break
@@ -1323,6 +1344,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🚨 HARD SL
             if profit < -risk:
                 pnl = profit * remaining_qty
+                if not exit_done:
+                    exit_position(symbol, remaining_qty, exchange)
+                    exit_done = True
                 send_message(f"🚨 HARD SL\n{symbol}")
                 break
 
@@ -1331,14 +1355,22 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🚪 EXIT
             if (signal == "CALL" and ltp <= sl) or (signal == "PUT" and ltp >= sl):
                 pnl = profit * remaining_qty
+                if not exit_done:
+                    exit_position(symbol, remaining_qty, exchange)
+                    exit_done = True
                 send_message(f"🛑 Exit\n{symbol}")
                 break
 
-            # ⏱ TIME EXIT
-            if time.time() - entry_time > 600 and profit < risk * 0.5:
-                pnl = profit * remaining_qty
-                send_message(f"⏱ Time exit\n{symbol}")
-                break
+            # 🚀 Smart time exit (only if NO momentum)
+            if time.time() - entry_time > 900:
+                
+                if abs(ltp - entry) < entry * 0.003:
+                    pnl = profit * remaining_qty
+                    if not exit_done:
+                        exit_position(symbol, remaining_qty, exchange)
+                        exit_done = True
+                    send_message(f"⏱ No momentum exit\n{symbol}")
+                    break
 
             time.sleep(1.5)
 
@@ -1390,7 +1422,39 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
         # 📊 STRATEGY LOG (OUTSIDE LOCK OK)
         if market_type in strategy_log:
-            strategy_log[market_type].append(pnl)  
+            strategy_log[market_type].append(pnl) 
+
+
+#exit sell orders
+def exit_position(symbol, qty, exchange):
+
+    try:
+        print(f"🚪 EXIT ORDER: {symbol}")
+
+        ltp = safe_ltp(f"{exchange}:{symbol}")
+
+        if ltp:
+            price = round(ltp * 0.999, 1)
+        else:
+            price = 0  # fallback
+
+        kite.place_order(
+            variety="regular",
+            exchange=exchange,
+            tradingsymbol=symbol,
+            transaction_type="SELL",
+            quantity=qty,
+            order_type="LIMIT",
+            price=price,
+            product="MIS" if exchange == "NFO" else "NRML"
+        )
+
+        print("✅ Exit order placed")
+
+    except Exception as e:
+        print("❌ Exit error:", e)
+        send_message(f"❌ Exit order failed: {symbol}")
+            
 
 def tune_strategy():
     global adaptive_config
@@ -1657,6 +1721,16 @@ def nifty_loop():
             continue
 
         ht_trend = halftrend_trend(df_ht)
+        print(f"📊 HT: {ht_trend} | Signal: {signal}")
+        
+        # 🔒 STRICT HALF TREND FILTER
+        if ht_trend == "HOLD":
+            print("⚠️ HT HOLD — skipping")
+            continue
+
+        if signal != ht_trend:
+            print(f"🚫 HT mismatch → Signal: {signal}, HT: {ht_trend}")
+            continue
 
         # 🔥 LOG (THROTTLED)
         if time.time() - last_log_time > 5:
@@ -1664,35 +1738,7 @@ def nifty_loop():
             print(f"🎯 Signal: {signal}")
             last_log_time = time.time()
 
-        # ============================
-        # 🔥 STEP 1 — EMA FALLBACK
-        # ============================
-        if ht_trend == "HOLD":
-            last = df.iloc[-1]
 
-            if last["ema9"] > last["ema20"]:
-                ht_trend = "CALL"
-            elif last["ema9"] < last["ema20"]:
-                ht_trend = "PUT"
-
-        # ============================
-        # 🔥 STEP 2 — MOMENTUM ENTRY
-        # ============================
-        if ht_trend == "HOLD":
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            move = abs(last["close"] - prev["close"]) / last["close"]
-
-            if signal == "CALL" and last["close"] > prev["close"] and move > 0.001:
-                if last["close"] <= last["vwap"]:
-                    continue
-
-            elif signal == "PUT" and last["close"] < prev["close"] and move > 0.001:
-                if last["close"] >= last["vwap"]:
-                    continue
-            else:
-                continue
 
         # 🔒 TREND MATCH
         if ht_trend != "HOLD" and signal != ht_trend:
@@ -1805,6 +1851,16 @@ def crude_loop():
             continue
 
         ht_trend = halftrend_trend(df_ht)
+        print(f"📊 HT: {ht_trend} | Signal: {signal}")
+        
+        # 🔒 STRICT HALF TREND FILTER
+        if ht_trend == "HOLD":
+            print("⚠️ HT HOLD — skipping")
+            continue
+
+        if signal != ht_trend:
+            print(f"🚫 HT mismatch → Signal: {signal}, HT: {ht_trend}")
+            continue
 
         if time.time() - last_log_time > 5:
             print(f"📊 CRUDE HT Trend: {ht_trend}")

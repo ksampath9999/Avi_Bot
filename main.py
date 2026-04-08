@@ -135,6 +135,25 @@ exit_done = False
 partial_booked = False
 
 
+def is_nifty_trading_time():
+    now = datetime.datetime.now(IST)
+
+    return (
+        (now.hour == 9 and now.minute >= 15) or
+        (9 < now.hour < 15) or
+        (now.hour == 15 and now.minute <= 30)
+    )
+
+
+def is_crude_trading_time():
+    now = datetime.datetime.now(IST)
+
+    return (
+        (now.hour == 9 and now.minute >= 0) or
+        (9 < now.hour < 23)   # CRUDE runs till ~11 PM
+    )
+
+
 def is_trading_time():
     now = datetime.datetime.now(IST)
 
@@ -1685,9 +1704,9 @@ def nifty_loop():
     while True:
         now = datetime.datetime.now()
 
-        if not is_trading_time():
-            time.sleep(60)
-            continue
+        if not is_nifty_trading_time():
+            print("🛑 NIFTY market closed — stopping loop")
+            break   # 🔥 stops only NIFTY thread
 
         if portfolio_pnl < HARD_STOP_LOSS:
             send_message("🚨 HARD STOP — NIFTY")
@@ -1802,7 +1821,8 @@ def crude_loop():
     while True:
         now = datetime.datetime.now(IST)
 
-        if not is_trading_time():
+        if not is_crude_trading_time():
+            print("🛑 CRUDE market closed — waiting")
             time.sleep(60)
             continue
 

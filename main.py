@@ -165,12 +165,12 @@ def prepare_indicators(df):
 
     return df
     
-   
+#HalfTrend
 def halftrend_entry(df, amplitude=2):
 
     try:
-        if df is None or len(df) < 50:
-            return "HOLD"
+        if df is None or len(df) < 30:
+            return "HOLD", "HOLD"
 
         df = df.copy()
 
@@ -184,7 +184,7 @@ def halftrend_entry(df, amplitude=2):
         maxLowPrice = low[0]
         minHighPrice = high[0]
 
-        prev_trend = 0
+        last_arrow = "HOLD"
 
         for i in range(2, len(df)):
 
@@ -212,20 +212,21 @@ def halftrend_entry(df, amplitude=2):
                     nextTrend = 1
                     maxLowPrice = lowPrice
 
-            # 🎯 ENTRY SIGNAL
+            # 🔥 Capture last arrow
             if trend == 0 and prev_trend == 1:
-                return "CALL"
+                last_arrow = "CALL"
 
-            if trend == 1 and prev_trend == 0:
-                return "PUT"
+            elif trend == 1 and prev_trend == 0:
+                last_arrow = "PUT"
 
-        return "HOLD"
+        # 🔥 Current trend
+        current_trend = "CALL" if trend == 0 else "PUT"
+
+        return current_trend, last_arrow
 
     except Exception as e:
-        print("HalfTrend error:", e)
-        return "HOLD"
-    
-    
+        print("HalfTrend entry error:", e)
+        return "HOLD", "HOLD"    
     
 def detect_market_type(df):
 
@@ -1619,7 +1620,7 @@ def ai_trade_filter(token, signal, df):
 def halftrend_trend(df, amplitude=2):
 
     try:
-        if df is None or len(df) < 100:
+        if df is None or len(df) < 20:
             return "HOLD"
 
         df = df.copy()
@@ -1658,13 +1659,14 @@ def halftrend_trend(df, amplitude=2):
                     nextTrend = 1
                     maxLowPrice = lowPrice
 
-        # 🔥 RETURN CURRENT TREND (NOT ARROW)
-        if trend == 0:
-            return "CALL"
-        elif trend == 1:
-            return "PUT"
-        else:
-            return "HOLD"
+        # 🔥 STABLE TREND OUTPUT (LESS NOISE)
+        if len(df) >= 3:
+            if trend == 0:
+                return "CALL"
+            elif trend == 1:
+                return "PUT"
+
+        return "HOLD"
 
     except:
         return "HOLD"
@@ -1674,11 +1676,9 @@ def halftrend_trend(df, amplitude=2):
 # THREADS
 # -----------------------------
 def nifty_loop():
-    global nifty_active, last_signal_nifty, last_trade_time_nifty
-    global last_analysis_time, report_sent_today
+    global nifty_active, last_trade_time_nifty
     global last_executed_signal_nifty, last_exit_time_nifty
-    global last_log_time
-    global trade_in_progress_nifty
+    global last_log_time, trade_in_progress_nifty
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1704,71 +1704,52 @@ def nifty_loop():
 
         df = prepare_indicators(df)
 
-        # 🎯 SIGNAL
-        market_type = detect_market_type(df)
-
-        if market_type == "TREND":
-            signal = elite_signal(df)
-        else:
-            signal = elite_signal(df)
-
-        if not signal or signal == "HOLD":
-            continue
-
-        # 📊 HT TREND (15m)
+        # ===============================
+        # 🔥 HALF TREND (15m MASTER FILTER)
+        # ===============================
         df_ht = get_cached_data(config.NIFTY_TOKEN, "15minute", 120)
         if df_ht is None or len(df_ht) < 50:
             continue
 
-        ht_trend = halftrend_trend(df_ht)
-        print(f"📊 HT: {ht_trend} | Signal: {signal}")
-        
-        # 🔒 STRICT HALF TREND FILTER
-        if ht_trend == "HOLD":
-            print("⚠️ HT HOLD — skipping")
+        current_trend, last_arrow = halftrend_entry(df_ht)
+
+        print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
+
+        if current_trend == "HOLD":
             continue
 
-        if signal != ht_trend:
-            print(f"🚫 HT mismatch → Signal: {signal}, HT: {ht_trend}")
+        if last_arrow != "HOLD" and current_trend != last_arrow:
+            print("🚫 HT mismatch — skipping")
             continue
 
-        # 🔥 LOG (THROTTLED)
-        if time.time() - last_log_time > 5:
-            print(f"📊 NIFTY HT Trend: {ht_trend}")
-            print(f"🎯 Signal: {signal}")
-            last_log_time = time.time()
+        signal = current_trend
 
-
-
-        # 🔒 TREND MATCH
-        if ht_trend != "HOLD" and signal != ht_trend:
-            continue
-
-        # 🔁 DUPLICATE BLOCK
+        # ===============================
+        # 🚫 DUPLICATE CONTROL
+        # ===============================
         if signal == last_executed_signal_nifty:
             if time.time() - last_trade_time_nifty < 300:
                 continue
 
+        # ===============================
+        # 🎯 PROBABILITY FILTER
+        # ===============================
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
         if probability < adaptive_config["prob_threshold"]:
             continue
 
-
         if time.time() - last_exit_time_nifty < 120:
             continue
 
-        # 🔒 LOCK
+        # ===============================
+        # 🔒 SINGLE LOCK (CRITICAL FIX)
+        # ===============================
         with lock:
-            if nifty_active:
-                print("🚫 NIFTY already running")
+            if nifty_active or trade_in_progress_nifty:
+                print("🚫 Trade blocked (NIFTY)")
                 continue
+
             nifty_active = True
-            
-        with lock:
-            if trade_in_progress_nifty:
-                print("🚫 Order already in progress (NIFTY)")
-                nifty_active = False
-                continue
             trade_in_progress_nifty = True
 
         try:
@@ -1777,15 +1758,11 @@ def nifty_loop():
             if not symbol or not price:
                 with lock:
                     nifty_active = False
+                    trade_in_progress_nifty = False
                 continue
-                
-            # 🔥 FINAL LOCK CHECK
-            with lock:
-                if not nifty_active:
-                    print("⚠️ Lost lock — skipping order")
-                    continue
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
+
             with lock:
                 trade_in_progress_nifty = False
 
@@ -1800,7 +1777,7 @@ def nifty_loop():
 
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, probability, market_type),
+                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, probability, "TREND"),
                 daemon=True
             ).start()
 
@@ -1808,13 +1785,14 @@ def nifty_loop():
             print("❌ NIFTY ERROR:", e)
             with lock:
                 nifty_active = False
+                trade_in_progress_nifty = False
 
-        time.sleep(2.5)
+        time.sleep(2)
        
         
 #CRUDE LOOP
 def crude_loop():
-    global crude_active, last_signal_crude, last_trade_time_crude
+    global crude_active, last_trade_time_crude
     global last_executed_signal_crude, last_log_time
     global trade_in_progress_crude
 
@@ -1841,82 +1819,49 @@ def crude_loop():
 
         df = prepare_indicators(df)
 
-        signal = halftrend_entry(df)
-        if signal == "HOLD":
-            continue
-
-        # 📊 HT TREND
+        # ===============================
+        # 🔥 HALF TREND (15m MASTER)
+        # ===============================
         df_ht = get_cached_data(CRUDE_TOKEN, "15minute", 120)
         if df_ht is None or len(df_ht) < 50:
             continue
 
-        ht_trend = halftrend_trend(df_ht)
-        print(f"📊 HT: {ht_trend} | Signal: {signal}")
-        
-        # 🔒 STRICT HALF TREND FILTER
-        if ht_trend == "HOLD":
-            print("⚠️ HT HOLD — skipping")
+        current_trend, last_arrow = halftrend_entry(df_ht)
+
+        print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
+
+        if current_trend == "HOLD":
             continue
 
-        if signal != ht_trend:
-            print(f"🚫 HT mismatch → Signal: {signal}, HT: {ht_trend}")
+        if last_arrow != "HOLD" and current_trend != last_arrow:
+            print("🚫 HT mismatch — skipping")
             continue
 
-        if time.time() - last_log_time > 5:
-            print(f"📊 CRUDE HT Trend: {ht_trend}")
-            print(f"🎯 CRUDE Signal: {signal}")
-            last_log_time = time.time()
+        signal = current_trend
 
-        # 🔥 EMA FALLBACK
-        if ht_trend == "HOLD":
-            last = df.iloc[-1]
-
-            if last["ema9"] > last["ema20"]:
-                ht_trend = "CALL"
-            elif last["ema9"] < last["ema20"]:
-                ht_trend = "PUT"
-
-        # 🔥 MOMENTUM
-        if ht_trend == "HOLD":
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            move = abs(last["close"] - prev["close"]) / last["close"]
-
-            if signal == "CALL" and last["close"] > prev["close"] and move > 0.001:
-                if last["close"] <= last["vwap"]:
-                    continue
-            elif signal == "PUT" and last["close"] < prev["close"] and move > 0.001:
-                if last["close"] >= last["vwap"]:
-                    continue
-            else:
-                continue
-
-        if ht_trend != "HOLD" and signal != ht_trend:
-            continue
-
+        # ===============================
+        # 🚫 DUPLICATE CONTROL
+        # ===============================
         if signal == last_executed_signal_crude:
             if time.time() - last_trade_time_crude < 300:
                 continue
 
+        # ===============================
+        # 🎯 PROBABILITY FILTER
+        # ===============================
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
         if probability < adaptive_config["prob_threshold"]:
             continue
 
-        
+        # ===============================
+        # 🔒 SINGLE LOCK
+        # ===============================
+        with lock:
+            if crude_active or trade_in_progress_crude:
+                print("🚫 Trade blocked (CRUDE)")
+                continue
 
-        # 🔒 LOCK
-        with lock:
-            if crude_active:
-                print("🚫 CRUDE already running")
-                continue
             crude_active = True
-            
-        with lock:
-            if trade_in_progress_crude:
-                print("🚫 Order already in progress (CRUDE)")
-                crude_active = False
-                continue
             trade_in_progress_crude = True
 
         try:
@@ -1925,15 +1870,11 @@ def crude_loop():
             if not symbol or not price:
                 with lock:
                     crude_active = False
+                    trade_in_progress_crude = False
                 continue
-                
-            # 🔥 FINAL LOCK CHECK
-            with lock:
-                if not crude_active:
-                    print("⚠️ crude Lost lock — skipping order")
-                    continue
 
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
+
             with lock:
                 trade_in_progress_crude = False
 
@@ -1948,7 +1889,7 @@ def crude_loop():
 
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "CRUDE", signal, probability, "NORMAL"),
+                args=(symbol, filled_price, lot, exchange, "CRUDE", signal, probability, "TREND"),
                 daemon=True
             ).start()
 
@@ -1956,8 +1897,9 @@ def crude_loop():
             print("❌ CRUDE ERROR:", e)
             with lock:
                 crude_active = False
+                trade_in_progress_crude = False
 
-        time.sleep(2.5)
+        time.sleep(2)
 
         
 def get_strike_mode(token):

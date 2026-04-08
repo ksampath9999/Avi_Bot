@@ -954,7 +954,6 @@ def find_option(signal, instrument):
         except:
             continue
             
-        print(f"🔍 {i['tradingsymbol']} | LOT SIZE → {i['lot_size']}")
 
         # sort based on closeness to target
         diff = abs(strike - target_strike)
@@ -1007,7 +1006,7 @@ def find_option(signal, instrument):
         sym = f"{exchange}:{i['tradingsymbol']}"
         p = safe_ltp(sym)
 
-        print(f"🔍 {i['tradingsymbol']} → Price: {p} | LOT: {i['lot_size']}")
+        
 
         if p is None or p <= 0:
             continue

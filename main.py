@@ -1763,9 +1763,21 @@ def nifty_loop():
         print(f"📊 NIFTY HT Trend (15m): {ht_trend}")
         
         # 🚫 NO TREND → SKIP
+        # 🔥 SMART HT HANDLING
         if ht_trend == "HOLD":
-            print("⚠️ HT no trend — skipping")
-            continue
+            print("⚠️ HT no trend — checking momentum")
+
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            # 🚀 EARLY ENTRY CONDITION
+            if signal == "CALL" and last["close"] > prev["close"]:
+                print("⚡ Early CALL allowed")
+            elif signal == "PUT" and last["close"] < prev["close"]:
+                print("⚡ Early PUT allowed")
+            else:
+                print("🚫 Weak move — skipping")
+                continue
         
         # 🔒 TREND FILTER
         if ht_trend != "HOLD" and signal != ht_trend:
@@ -1978,10 +1990,21 @@ def crude_loop():
         print(f"📊 CRUDE HT Trend (15m): {ht_trend}")
         
         
-        # 🚫 NO TREND → SKIP
+        # 🔥 SMART HT HANDLING
         if ht_trend == "HOLD":
-            print("⚠️ HT no trend — skipping")
-            continue
+            print("⚠️ HT no trend — checking momentum")
+
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            # 🚀 EARLY ENTRY CONDITION
+            if signal == "CALL" and last["close"] > prev["close"]:
+                print("⚡ Early CALL allowed")
+            elif signal == "PUT" and last["close"] < prev["close"]:
+                print("⚡ Early PUT allowed")
+            else:
+                print("🚫 Weak move — skipping")
+                continue
 
         # 🔒 TREND FILTER
         if ht_trend != "HOLD" and signal != ht_trend:

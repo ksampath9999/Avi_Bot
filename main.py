@@ -1614,6 +1614,7 @@ def nifty_loop():
     global last_analysis_time, report_sent_today
     global last_executed_signal_nifty, last_exit_time_nifty
     global last_log_time
+    global trade_in_progress_nifty
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1769,6 +1770,7 @@ def nifty_loop():
 def crude_loop():
     global crude_active, last_signal_crude, last_trade_time_crude
     global last_executed_signal_crude, last_log_time
+    global trade_in_progress_crude
 
     if not ENABLE_CRUDE:
         return

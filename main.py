@@ -953,6 +953,8 @@ def find_option(signal, instrument):
             strike = int(i["strike"])
         except:
             continue
+            
+         print(f"🔍 {i['tradingsymbol']} | LOT SIZE → {i['lot_size']}")
 
         # sort based on closeness to target
         diff = abs(strike - target_strike)
@@ -1005,7 +1007,7 @@ def find_option(signal, instrument):
         sym = f"{exchange}:{i['tradingsymbol']}"
         p = safe_ltp(sym)
 
-        print(f"🔍 Checking {i['tradingsymbol']} → Price: {p}")   # ✅ DEBUG
+        print(f"🔍 {i['tradingsymbol']} → Price: {p} | LOT: {i['lot_size']}")
 
         if p is None or p <= 0:
             continue
@@ -1027,7 +1029,7 @@ def find_option(signal, instrument):
 
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
-
+        
         return best["symbol"], best["price"], lot, exchange
 
     # -----------------------------

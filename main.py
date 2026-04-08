@@ -35,6 +35,10 @@ crude_active = False
 trade_in_progress_nifty = False
 trade_in_progress_crude = False
 
+# 🔥 TREND MEMORY (NEW)
+last_trend_nifty = None
+last_trend_crude = None
+
 # -----------------------------
 # RISK VARIABLES
 # -----------------------------
@@ -1713,6 +1717,7 @@ def nifty_loop():
     global nifty_active, last_trade_time_nifty
     global last_executed_signal_nifty, last_exit_time_nifty
     global last_log_time, trade_in_progress_nifty
+    global last_trend_nifty
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1748,6 +1753,23 @@ def nifty_loop():
         current_trend, last_arrow = halftrend_entry(df_ht)
 
         print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
+        
+        # 🔄 TREND FLIP DETECTION FIRST
+        if last_trend_nifty and current_trend != last_trend_nifty:
+            print(f"🔄 NIFTY TREND FLIP: {last_trend_nifty} → {current_trend}")
+            last_executed_signal_nifty = None
+            last_trade_time_nifty = 0
+
+        # ✅ UPDATE MEMORY
+        last_trend_nifty = current_trend
+
+        # 🔥 NOW APPLY STRONG FILTER
+        prev_trend, _ = halftrend_entry(df_ht.iloc[:-1])
+
+        if prev_trend != current_trend:
+            print("⚠️ Weak NIFTY flip — waiting confirmation")
+            continue
+
 
         if current_trend == "HOLD":
             continue
@@ -1757,6 +1779,11 @@ def nifty_loop():
             continue
 
         signal = current_trend
+        
+        # 🚫 BLOCK OLD SIGNALS
+        if signal != last_trend_nifty:
+            print("🚫 Outdated NIFTY signal blocked")
+            continue
         
         # 🔥 TREND CONTINUATION ENTRY (NEW)
         if last_arrow == "HOLD":
@@ -1788,6 +1815,9 @@ def nifty_loop():
             if nifty_active:
                 print("🚫 Trade blocked (NIFTY)")
                 continue
+                
+        if signal != last_trend_nifty:
+            continue
 
         try:
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
@@ -1831,6 +1861,7 @@ def crude_loop():
     global crude_active, last_trade_time_crude
     global last_executed_signal_crude, last_log_time
     global trade_in_progress_crude
+    global last_trend_crude
 
     if not ENABLE_CRUDE:
         return
@@ -1866,6 +1897,23 @@ def crude_loop():
         current_trend, last_arrow = halftrend_entry(df_ht)
 
         print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
+        
+        # 🔄 TREND FLIP DETECTION FIRST
+        if last_trend_crude and current_trend != last_trend_crude:
+            print(f"🔄 CRUD TREND FLIP: {last_trend_crude} → {current_trend}")
+            last_executed_signal_crude = None
+            last_trade_time_crude = 0
+
+        # ✅ UPDATE MEMORY
+        last_trend_crude = current_trend
+
+        # 🔥 NOW APPLY STRONG FILTER
+        prev_trend, _ = halftrend_entry(df_ht.iloc[:-1])
+
+        if prev_trend != current_trend:
+            print("⚠️ Weak CRUDE flip — waiting confirmation")
+            continue
+
 
         if current_trend == "HOLD":
             continue
@@ -1875,6 +1923,11 @@ def crude_loop():
             continue
 
         signal = current_trend
+        
+        # 🚫 BLOCK OLD SIGNALS
+        if signal != last_trend_crude:
+            print("🚫 Outdated CRUDE signal blocked")
+            continue
 
         # ===============================
         # 🚫 DUPLICATE CONTROL
@@ -1898,8 +1951,9 @@ def crude_loop():
                 print("🚫 Trade blocked (CRUDE)")
                 continue
 
-            crude_active = True
-            trade_in_progress_crude = True
+            
+        if signal != last_trend_crude:
+            continue
 
         try:
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
@@ -1909,8 +1963,16 @@ def crude_loop():
 
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
 
+            if not filled_price:
+                with lock:
+                    crude_active = False
+                    trade_in_progress_crude = False
+                continue
+
+            # ✅ SET FLAGS ONLY AFTER SUCCESS
             with lock:
-                trade_in_progress_crude = False
+                crude_active = True
+                trade_in_progress_crude = True
 
             if not filled_price:
                 with lock:

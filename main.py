@@ -930,7 +930,7 @@ def find_option(signal, instrument):
         i for i in instruments
         if i["name"] == name
         and i["instrument_type"] in ["CE", "PE"]
-        and i["expiry"] > today   # 🔥 STRICT EXPIRY
+        and i["expiry"] >= today   # 🔥 STRICT EXPIRY
     ]
 
     if not opts:
@@ -963,15 +963,23 @@ def find_option(signal, instrument):
         if p is None or p <= 0:
             continue
             
-        # 🎯 PREMIUM TARGETING (₹70–₹100)
-        if p < 70 or p > 100:
-            continue
+        # 🎯 PREMIUM FILTER (INSTRUMENT BASED)
+        if instrument == "NIFTY":
+            if p < 70 or p > 100:
+                continue
+        else:  # CRUDE
+            if p < 30 or p > 200:
+                continue
 
         trade_value = p * lot_size
 
         # 🔥 SAFETY: skip too costly trades
-        if trade_value > balance * 0.9:
-            continue
+        if instrument == "NIFTY":
+            if trade_value > balance * 0.9:
+                continue
+        else:  # CRUDE
+            if trade_value > balance * 1.2:
+                continue
 
         score = score_option(i["tradingsymbol"], exchange, token, signal, df)
 
@@ -984,27 +992,33 @@ def find_option(signal, instrument):
         
         
     # 🔁 RELAX RANGE IF NOTHING FOUND
-    if not candidates:
-        print("⚠️ No options in ₹70–₹100, relaxing range")
+    for i in opts:
 
-        for i in opts:
-            if i["expiry"] != expiry or i["instrument_type"] != opt_type:
-                continue
+        if i["expiry"] != expiry or i["instrument_type"] != opt_type:
+            continue
 
-            sym = f"{exchange}:{i['tradingsymbol']}"
-            p = safe_ltp(sym)
+        try:
+            strike = int(i["strike"])
+        except:
+            continue
 
-            if p is None or p <= 0:
-                continue
+        sym = f"{exchange}:{i['tradingsymbol']}"
+        p = safe_ltp(sym)
 
-            if 50 <= p <= 120:
-                candidates.append({
-                    "symbol": i["tradingsymbol"],
-                    "price": p,
-                    "score": 0,
-                    "diff": abs(int(i["strike"]) - target_strike)
-                })
+        print(f"🔍 Checking {i['tradingsymbol']} → Price: {p}")   # ✅ DEBUG
 
+        if p is None or p <= 0:
+            continue
+
+        if 50 <= p <= 120:
+            candidates.append({
+                "symbol": i["tradingsymbol"],
+                "price": p,
+                "score": 0,
+                "diff": abs(int(i["strike"]) - target_strike)
+            })
+            
+    print(f"📊 Candidates found: {len(candidates)}")
     if candidates:
         # 🔥 BEST = score + closeness
         best = sorted(candidates, key=lambda x: (x["diff"], -x["score"]))[0]
@@ -1742,6 +1756,10 @@ def nifty_loop():
             continue
 
         signal = current_trend
+        
+        # 🔥 TREND CONTINUATION ENTRY (NEW)
+        if last_arrow == "HOLD":
+            print("⚡ Continuation trade allowed (no arrow)")
 
         # ===============================
         # 🚫 DUPLICATE CONTROL

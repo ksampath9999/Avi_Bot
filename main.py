@@ -1848,15 +1848,17 @@ def nifty_loop():
         if last_arrow != "HOLD":
             last_valid_arrow_nifty = last_arrow
 
-        # 🚫 NO ARROW HISTORY
+        # 🚫 NO ARROW HISTORY (OPTIONAL ENTRY)
         now_ts = time.time()
+
         if last_valid_arrow_nifty is None:
             if now_ts - last_no_arrow_log_time > 60:
-                print("⏳ No arrow history yet...")
+                print("⚡ No arrow yet — using trend for first trade")
                 last_no_arrow_log_time = now_ts
-            continue
 
-        signal = last_valid_arrow_nifty
+            signal = current_trend   # 👈 KEY CHANGE
+        else:
+            signal = last_valid_arrow_nifty
 
         # 🔄 AUTO REVERSE
         if global_trade_active and last_running_signal and signal != last_running_signal:

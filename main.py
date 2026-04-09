@@ -206,8 +206,10 @@ def prepare_indicators(df):
     df["ema20"] = df["close"].ewm(span=20).mean()
 
     return df
-    
-#HalfTrend
+
+# =========================
+# 🔥 FIXED HALF TREND (PRO)
+# =========================
 def halftrend_entry(df, amplitude=2):
 
     try:
@@ -226,7 +228,7 @@ def halftrend_entry(df, amplitude=2):
         maxLowPrice = low[0]
         minHighPrice = high[0]
 
-        last_arrow = "HOLD"
+        last_arrow = None   # 🔥 IMPORTANT CHANGE
 
         for i in range(2, len(df)):
 
@@ -254,21 +256,27 @@ def halftrend_entry(df, amplitude=2):
                     nextTrend = 1
                     maxLowPrice = lowPrice
 
-            # 🔥 Capture last arrow
+            # =========================
+            # 🔥 STORE LAST VALID ARROW (DO NOT RESET)
+            # =========================
             if trend == 0 and prev_trend == 1:
                 last_arrow = "CALL"
 
             elif trend == 1 and prev_trend == 0:
                 last_arrow = "PUT"
 
-        # 🔥 Current trend
+        # 🔥 CURRENT TREND
         current_trend = "CALL" if trend == 0 else "PUT"
+
+        # 🔥 FINAL ARROW FIX
+        if last_arrow is None:
+            last_arrow = "HOLD"
 
         return current_trend, last_arrow
 
     except Exception as e:
         print("HalfTrend entry error:", e)
-        return "HOLD", "HOLD"    
+        return "HOLD", "HOLD"
     
 def detect_market_type(df):
 
@@ -1831,21 +1839,7 @@ def nifty_loop():
         if df_ht is None or len(df_ht) < 50:
             continue
             
-        # =========================
-        # 🔥 INITIAL ARROW LOAD (ONCE)
-        # =========================
-        if last_valid_arrow_nifty is None:
-
-            print("🔍 Loading previous arrow from history...")
-
-            for i in range(len(df_ht)-1, -1, -1):
-                _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
-
-                if arrow_i != "HOLD":
-                    last_valid_arrow_nifty = arrow_i
-                    print(f"📌 Initial Arrow Loaded (NIFTY): {arrow_i}")
-                    break
-
+      
         # =========================
         # 🔥 FULL ARROW ENGINE (FIXED)
         # =========================
@@ -2047,17 +2041,6 @@ def crude_loop():
 
         current_trend, _ = halftrend_entry(df_ht)
 
-        # 🔥 INITIAL LOAD (ONLY ONCE)
-        if last_valid_arrow_crude is None:
-            print("🔍 Loading previous arrow (CRUDE)...")
-
-            for i in range(len(df_ht)-1, -1, -1):
-                _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
-
-                if arrow_i != "HOLD":
-                    last_valid_arrow_crude = arrow_i
-                    print(f"📌 Initial Arrow Loaded (CRUDE): {arrow_i}")
-                    break
 
         # 🔥 LIVE UPDATE (NO SCAN)
         current_trend, last_arrow = halftrend_entry(df_ht)

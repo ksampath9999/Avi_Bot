@@ -2037,7 +2037,6 @@ def crude_loop():
         else:
             signal = current_trend
 
-        print(f"🎯 FINAL SIGNAL → {signal}")
 
         # 🚫 DUPLICATE
         if signal == last_executed_signal_crude:

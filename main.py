@@ -1249,6 +1249,7 @@ def update_exit_time(instrument):
 def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, market_type):
     
     global max_profit_reached
+    global global_trade_active
     global daily_pnl, trade_count, last_loss_time
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio, risk_off
@@ -1478,7 +1479,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             else:
                 crude_active = False
                 
-            global global_trade_active
+            
             global_trade_active = False
                 
             # 🔥 CRITICAL FIX (MISSING)
@@ -1769,6 +1770,8 @@ def nifty_loop():
     global last_log_time, trade_in_progress_nifty
     global last_trend_nifty
     global last_valid_arrow_nifty
+    global global_trade_active
+    
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1865,7 +1868,7 @@ def nifty_loop():
                 print("Reverse error:", e)
 
             with lock:
-                global global_trade_active
+                
                 global_trade_active = False
 
             time.sleep(10)
@@ -1953,7 +1956,7 @@ def nifty_loop():
             with lock:
                 nifty_active = True
                 trade_in_progress_nifty = True
-                global global_trade_active
+                
                 global_trade_active = True
 
             
@@ -1980,7 +1983,8 @@ def crude_loop():
     global trade_in_progress_crude
     global last_trend_crude
     global last_valid_arrow_crude
-
+    global global_trade_active
+    
     if not ENABLE_CRUDE:
         return
 
@@ -2075,7 +2079,7 @@ def crude_loop():
                 print("Reverse error:", e)
 
             with lock:
-                global global_trade_active
+                
                 global_trade_active = False
 
             time.sleep(10)
@@ -2160,7 +2164,7 @@ def crude_loop():
             with lock:
                 crude_active = True
                 trade_in_progress_crude = True
-                global global_trade_active
+                
                 global_trade_active = True
 
            

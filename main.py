@@ -230,7 +230,8 @@ def halftrend_entry(df, amplitude=2):
         maxLowPrice = low[0]
         minHighPrice = high[0]
 
-        last_arrow = None   # 🔥 IMPORTANT CHANGE
+        last_arrow = None
+        last_arrow_index = None   # 🔥 IMPORTANT CHANGE
 
         for i in range(2, len(df)):
 
@@ -262,12 +263,12 @@ def halftrend_entry(df, amplitude=2):
             # 🔥 STORE LAST VALID ARROW (DO NOT RESET)
             # =========================
             if trend == 0 and prev_trend == 1:
-                print(f"CALL arrow at index {i}")
                 last_arrow = "CALL"
+                last_arrow_index = i
 
             elif trend == 1 and prev_trend == 0:
-                print(f"PUT arrow at index {i}")
                 last_arrow = "PUT"
+                last_arrow_index = i
 
         # 🔥 CURRENT TREND
         current_trend = "CALL" if trend == 0 else "PUT"
@@ -276,7 +277,7 @@ def halftrend_entry(df, amplitude=2):
         if last_arrow is None:
             last_arrow = "HOLD"
 
-        return current_trend, last_arrow, i  # return index of last arrow
+        return current_trend, last_arrow, last_arrow_index # return index of last arrow
 
     except Exception as e:
         print("HalfTrend entry error:", e)

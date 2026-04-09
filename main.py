@@ -281,7 +281,7 @@ def halftrend_entry(df, amplitude=2):
 
     except Exception as e:
         print("HalfTrend entry error:", e)
-        return "HOLD", "HOLD"
+        return "HOLD", "HOLD", None
     
 def detect_market_type(df):
 
@@ -1122,7 +1122,11 @@ def place_order(symbol, qty, exchange, instrument):
     
     now = datetime.datetime.now(IST)
 
-    if exchange == "NFO" and not (9 <= now.hour < 15):
+    if exchange == "NFO" and not (
+        (now.hour == 9 and now.minute >= 15) or
+        (9 < now.hour < 15) or
+        (now.hour == 15 and now.minute <= 30)
+    ):
         print("🚫 Market closed — skipping order")
         return None
 
@@ -1854,9 +1858,9 @@ def nifty_loop():
         # =========================
         # 🚫 IGNORE SAME ARROW AGAIN (CRITICAL FIX)
         # =========================
-        if arrow_index == last_arrow_index_nifty:
-            last_arrow = "HOLD"   # ignore duplicate arrow
-        else:
+        if arrow_index is not None and arrow_index == last_arrow_index_nifty:
+            last_arrow = "HOLD"
+        elif arrow_index is not None:
             last_arrow_index_nifty = arrow_index
 
 
@@ -1877,7 +1881,6 @@ def nifty_loop():
             print(f"🔄 NIFTY TREND FLIP: {last_trend_nifty} → {current_trend}")
             last_executed_signal_nifty = None
             last_trade_time_nifty = 0
-            last_valid_arrow_nifty = None
 
         last_trend_nifty = current_trend
 
@@ -1888,9 +1891,6 @@ def nifty_loop():
         if current_trend == "HOLD":
             continue
 
-        # 🧠 STORE ARROW
-        if last_arrow != "HOLD":
-            last_valid_arrow_nifty = last_arrow
 
         # 🚫 NO ARROW HISTORY (OPTIONAL ENTRY)
         now_ts = time.time()
@@ -1899,14 +1899,18 @@ def nifty_loop():
         # 🎯 FINAL SIGNAL (FIXED)
         # =========================
 
-        if last_valid_arrow_nifty:
-            signal = last_valid_arrow_nifty
-        else:
-            # fallback only if NO arrow found anywhere
-            if now_ts - last_no_arrow_log_time > 60:
-                print("⚡ No arrow found — using trend fallback")
-                last_no_arrow_log_time = now_ts
+        if last_arrow != "HOLD":
+            signal = last_arrow
 
+        elif current_trend != last_valid_arrow_nifty:
+            print("⚡ Trend flip without arrow — switching to trend")
+            signal = current_trend
+            last_valid_arrow_nifty = current_trend
+
+        elif last_valid_arrow_nifty:
+            signal = last_valid_arrow_nifty
+
+        else:
             signal = current_trend
 
         print(f"🎯 FINAL SIGNAL → {signal} | TREND → {current_trend} | ARROW → {last_valid_arrow_nifty}")
@@ -1950,9 +1954,6 @@ def nifty_loop():
         if time.time() - last_exit_time_nifty < 120:
             continue
 
-        with lock:
-            if global_trade_active:
-                continue
 
         try:
 
@@ -1962,6 +1963,14 @@ def nifty_loop():
                 continue
 
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
+            
+            # =========================
+            # 🔒 GLOBAL TRADE LOCK (CRITICAL FIX)
+            # =========================
+            with lock:
+                if global_trade_active:
+                    continue
+                global_trade_active = True
 
             if last_exit_reason == "SL":
                 if not is_market_trending(config.NIFTY_TOKEN, df):
@@ -1973,7 +1982,10 @@ def nifty_loop():
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
             if not filled_price:
-                continue
+            with lock:
+                global_trade_active = False
+            continue
+                
 
             # ✅ SUCCESS
             nifty_trade_count += 1
@@ -2060,14 +2072,10 @@ def crude_loop():
         # =========================
         # 🚫 IGNORE SAME ARROW AGAIN (CRITICAL FIX)
         # =========================
-        if arrow_index == last_arrow_index_crude:
-            last_arrow = "HOLD"   # ignore duplicate arrow
-        else:
+        if arrow_index is not None and arrow_index == last_arrow_index_crude:
+            last_arrow = "HOLD"
+        elif arrow_index is not None:
             last_arrow_index_crude = arrow_index
-
-        print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
-        
-        
 
         if last_arrow != "HOLD":
             last_valid_arrow_crude = last_arrow
@@ -2082,7 +2090,6 @@ def crude_loop():
         if last_trend_crude and current_trend != last_trend_crude:
             last_executed_signal_crude = None
             last_trade_time_crude = 0
-            last_valid_arrow_crude = None
 
         last_trend_crude = current_trend
 
@@ -2093,13 +2100,25 @@ def crude_loop():
         if current_trend == "HOLD":
             continue
 
+
+        # =========================
+        # 🎯 FINAL SIGNAL FIX (CRITICAL)
+        # =========================
+
         if last_arrow != "HOLD":
-            last_valid_arrow_crude = last_arrow
+            signal = last_arrow  # fresh arrow → highest priority
 
-        if last_valid_arrow_crude is None:
+        elif current_trend != last_valid_arrow_crude:
+            # 🔥 TREND FLIP WITHOUT ARROW
+            print("⚡ Trend flip without arrow — switching to trend")
+            signal = current_trend
+            last_valid_arrow_crude = current_trend
+
+        elif last_valid_arrow_crude:
+            signal = last_valid_arrow_crude
+
+        else:
             continue
-
-        signal = last_valid_arrow_crude
 
         # 🔄 AUTO REVERSE
         if global_trade_active and last_running_signal and signal != last_running_signal:
@@ -2138,6 +2157,11 @@ def crude_loop():
                 continue
 
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
+            
+            with lock:
+                if global_trade_active:
+                    continue
+                global_trade_active = True
 
             if last_exit_reason == "SL":
                 if not is_market_trending(CRUDE_TOKEN, df):
@@ -2149,7 +2173,10 @@ def crude_loop():
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
 
             if not filled_price:
+                with lock:
+                    global_trade_active = False
                 continue
+                
 
             crude_trade_count += 1
             last_exit_reason = None
@@ -2283,12 +2310,13 @@ def get_quantity(lots, exchange):
         return lots
     return lots
     
-def get_balance():
-    try:
-        margin = kite.margins()
-        return margin["equity"]["available"]["cash"] or 10000
-    except:
-        return 0
+def get_balance(instrument):
+    margin = kite.margins()
+
+    if instrument == "NIFTY":
+        return margin["equity"]["available"].get("live_balance", 0)
+    else:
+        return margin["commodity"]["available"].get("live_balance", 0)
         
         
 def calculate_lots(price, exchange, instrument, strong_trend=False):

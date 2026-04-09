@@ -1830,22 +1830,28 @@ def nifty_loop():
         df_ht = get_cached_data(config.NIFTY_TOKEN, "15minute", 120)
         if df_ht is None or len(df_ht) < 50:
             continue
+            
+        # =========================
+        # 🔥 INITIAL ARROW LOAD (ONCE)
+        # =========================
+        if last_valid_arrow_nifty is None:
+
+            print("🔍 Loading previous arrow from history...")
+
+            for i in range(len(df_ht)-1, -1, -1):
+                _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
+
+                if arrow_i != "HOLD":
+                    last_valid_arrow_nifty = arrow_i
+                    print(f"📌 Initial Arrow Loaded (NIFTY): {arrow_i}")
+                    break
 
         # =========================
         # 🔥 FULL ARROW ENGINE (FIXED)
         # =========================
 
-        current_trend, _ = halftrend_entry(df_ht)
+        current_trend, last_arrow = halftrend_entry(df_ht)
 
-        last_arrow = "HOLD"
-
-        # 🔍 ALWAYS SCAN FULL HISTORY (latest arrow)
-        for i in range(len(df_ht)-1, -1, -1):
-            _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
-
-            if arrow_i != "HOLD":
-                last_arrow = arrow_i
-                break
 
         # 🧠 STORE
         if last_arrow != "HOLD":
@@ -1897,6 +1903,15 @@ def nifty_loop():
             signal = current_trend
 
         print(f"🎯 FINAL SIGNAL → {signal} | TREND → {current_trend} | ARROW → {last_valid_arrow_nifty}")
+        
+        # =========================
+        # 🔥 STEP 4 — NEW ARROW ONLY
+        # =========================
+        prev_arrow = last_executed_signal_nifty
+
+        # 🚫 Skip if same arrow already traded
+        if prev_arrow == signal:
+            continue
 
         # 🔄 AUTO REVERSE
         if global_trade_active and last_running_signal and signal != last_running_signal:
@@ -1919,7 +1934,6 @@ def nifty_loop():
 
         # 🚫 DUPLICATE
         if signal == last_executed_signal_nifty:
-            if time.time() - last_trade_time_nifty < 300:
                 continue
 
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
@@ -2033,14 +2047,23 @@ def crude_loop():
 
         current_trend, _ = halftrend_entry(df_ht)
 
-        last_arrow = "HOLD"
+        # 🔥 INITIAL LOAD (ONLY ONCE)
+        if last_valid_arrow_crude is None:
+            print("🔍 Loading previous arrow (CRUDE)...")
 
-        for i in range(len(df_ht)-1, -1, -1):
-            _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
+            for i in range(len(df_ht)-1, -1, -1):
+                _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
 
-            if arrow_i != "HOLD":
-                last_arrow = arrow_i
-                break
+                if arrow_i != "HOLD":
+                    last_valid_arrow_crude = arrow_i
+                    print(f"📌 Initial Arrow Loaded (CRUDE): {arrow_i}")
+                    break
+
+        # 🔥 LIVE UPDATE (NO SCAN)
+        current_trend, last_arrow = halftrend_entry(df_ht)
+
+
+        print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
 
         if last_arrow != "HOLD":
             last_valid_arrow_crude = last_arrow
@@ -2094,7 +2117,6 @@ def crude_loop():
 
 
         if signal == last_executed_signal_crude:
-            if time.time() - last_trade_time_crude < 300:
                 continue
 
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)

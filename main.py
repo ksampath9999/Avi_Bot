@@ -260,9 +260,11 @@ def halftrend_entry(df, amplitude=2):
             # 🔥 STORE LAST VALID ARROW (DO NOT RESET)
             # =========================
             if trend == 0 and prev_trend == 1:
+                print(f"CALL arrow at index {i}")
                 last_arrow = "CALL"
 
             elif trend == 1 and prev_trend == 0:
+                print(f"PUT arrow at index {i}")
                 last_arrow = "PUT"
 
         # 🔥 CURRENT TREND

@@ -1850,9 +1850,16 @@ def nifty_loop():
         # 🔥 HALF TREND
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
         
-        # 🔥 DIRECT USE (NO HISTORY LOOP)
-        if last_valid_arrow_nifty is None and last_arrow != "HOLD":
+        # =========================
+        # 🔥 INITIAL ARROW FIX (CRITICAL)
+        # =========================
+        if last_arrow != "HOLD":
             last_valid_arrow_nifty = last_arrow
+
+        elif last_valid_arrow_nifty is None:
+            # 🔥 FIRST TIME → USE TREND
+            print("⚡ No arrow yet — using trend as initial signal")
+            last_valid_arrow_nifty = current_trend
         
   
 
@@ -1999,9 +2006,17 @@ def crude_loop():
 
         # 🔥 HALF TREND
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
-        # 🔥 DIRECT USE (NO HISTORY LOOP)
-        if last_valid_arrow_crude is None and last_arrow != "HOLD":
+        
+        # =========================
+        # 🔥 INITIAL ARROW FIX (CRITICAL)
+        # =========================
+        if last_arrow != "HOLD":
             last_valid_arrow_crude = last_arrow
+
+        elif last_valid_arrow_crude is None:
+            # 🔥 FIRST TIME → USE TREND
+            print("⚡ No arrow yet — using trend as initial signal")
+            last_valid_arrow_crude = current_trend
         
 
         # 🚫 DUPLICATE FILTER

@@ -157,6 +157,8 @@ last_logged_trend_nifty = None
 last_logged_arrow_nifty = None
 last_logged_trend_crude = None
 last_logged_arrow_crude = None
+last_arrow_index_nifty = None
+last_arrow_index_crude = None
 
 def is_nifty_trading_time():
     now = datetime.datetime.now(IST)
@@ -274,7 +276,7 @@ def halftrend_entry(df, amplitude=2):
         if last_arrow is None:
             last_arrow = "HOLD"
 
-        return current_trend, last_arrow
+        return current_trend, last_arrow, i  # return index of last arrow
 
     except Exception as e:
         print("HalfTrend entry error:", e)
@@ -1846,7 +1848,14 @@ def nifty_loop():
         # 🔥 FULL ARROW ENGINE (FIXED)
         # =========================
 
-        current_trend, last_arrow = halftrend_entry(df_ht)
+        current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
+        # =========================
+        # 🚫 IGNORE SAME ARROW AGAIN (CRITICAL FIX)
+        # =========================
+        if arrow_index == last_arrow_index_nifty:
+            last_arrow = "HOLD"   # ignore duplicate arrow
+        else:
+            last_arrow_index_nifty = arrow_index
 
 
         # 🧠 STORE
@@ -2045,10 +2054,18 @@ def crude_loop():
 
 
         # 🔥 LIVE UPDATE (NO SCAN)
-        current_trend, last_arrow = halftrend_entry(df_ht)
-
+        current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
+        # =========================
+        # 🚫 IGNORE SAME ARROW AGAIN (CRITICAL FIX)
+        # =========================
+        if arrow_index == last_arrow_index_crude:
+            last_arrow = "HOLD"   # ignore duplicate arrow
+        else:
+            last_arrow_index_crude = arrow_index
 
         print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
+        
+        
 
         if last_arrow != "HOLD":
             last_valid_arrow_crude = last_arrow

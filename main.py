@@ -1771,39 +1771,35 @@ def halftrend_trend(df, amplitude=2):
 # THREADS
 # -----------------------------
 def nifty_loop():
-    
+
     global last_running_signal, current_symbol, current_qty, current_exchange
     global nifty_active, last_trade_time_nifty
     global last_executed_signal_nifty, last_exit_time_nifty
-    global last_log_time, trade_in_progress_nifty
-    global last_trend_nifty
-    global last_valid_arrow_nifty
-    global global_trade_active
-    global nifty_trade_count
-    global last_exit_reason
+    global trade_in_progress_nifty, last_trend_nifty
+    global last_valid_arrow_nifty, global_trade_active
+    global nifty_trade_count, last_exit_reason
+    global last_reset_day
+    global last_logged_trend_nifty, last_logged_arrow_nifty
+    global last_no_arrow_log_time
 
     print("🔥 NIFTY LOOP STARTED")
 
     while True:
-        now = datetime.datetime.now(IST)
+
+        now_dt = datetime.datetime.now(IST)
         today = now_dt.date()
 
-        # ❌ AFTER 3:30 STOP NIFTY
-        if now.hour > 15 or (now.hour == 15 and now.minute > 30):
+        # ⏰ STOP AFTER 3:30
+        if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
             print("🛑 NIFTY time over — stopping")
             break
-            
-        # 🗓️ DAILY RESET
-        
 
-        global last_reset_day, nifty_trade_count, crude_trade_count
-
+        # 🔄 DAILY RESET
         if last_reset_day != today:
             nifty_trade_count = 0
             crude_trade_count = 0
             last_reset_day = today
-
-            print(f"🔄 Daily reset done: {today}")   # prints ONLY once ✅
+            print(f"🔄 Daily reset done: {today}")
 
         if portfolio_pnl < HARD_STOP_LOSS:
             send_message("🚨 HARD STOP — NIFTY")
@@ -1820,61 +1816,48 @@ def nifty_loop():
 
         df = prepare_indicators(df)
 
-        # ===============================
-        # 🔥 HALF TREND (15m MASTER FILTER)
-        # ===============================
         df_ht = get_cached_data(config.NIFTY_TOKEN, "15minute", 120)
         if df_ht is None or len(df_ht) < 50:
             continue
 
         current_trend, last_arrow = halftrend_entry(df_ht)
 
+        # 📊 LOG ONLY IF CHANGE
         if current_trend != last_logged_trend_nifty or last_arrow != last_logged_arrow_nifty:
             print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
             last_logged_trend_nifty = current_trend
             last_logged_arrow_nifty = last_arrow
-        
-        # 🔄 TREND FLIP DETECTION FIRST
+
+        # 🔄 TREND FLIP
         if last_trend_nifty and current_trend != last_trend_nifty:
             print(f"🔄 NIFTY TREND FLIP: {last_trend_nifty} → {current_trend}")
             last_executed_signal_nifty = None
             last_trade_time_nifty = 0
             last_valid_arrow_nifty = None
 
-        # ✅ UPDATE MEMORY
         last_trend_nifty = current_trend
 
-        # 🔥 NOW APPLY STRONG FILTER
         prev_trend, _ = halftrend_entry(df_ht.iloc[:-1])
-
         if prev_trend != current_trend:
-            print("⚠️ Weak NIFTY flip — waiting confirmation")
             continue
-
 
         if current_trend == "HOLD":
             continue
 
-        
-
-        
-
-        # ✅ STEP 1: STORE NEW ARROW
+        # 🧠 STORE ARROW
         if last_arrow != "HOLD":
             last_valid_arrow_nifty = last_arrow
 
-        # 🚫 NO ARROW EVER FOUND
+        # 🚫 NO ARROW HISTORY
         now_ts = time.time()
-
         if last_valid_arrow_nifty is None:
-            if now_ts - last_no_arrow_log_time > 60:   # print once per minute
+            if now_ts - last_no_arrow_log_time > 60:
                 print("⏳ No arrow history yet...")
                 last_no_arrow_log_time = now_ts
             continue
 
-        # 🔥 USE LAST VALID ARROW (KEY CHANGE)
         signal = last_valid_arrow_nifty
-        
+
         # 🔄 AUTO REVERSE
         if global_trade_active and last_running_signal and signal != last_running_signal:
             print("🔄 Opposite signal — reversing NIFTY")
@@ -1885,30 +1868,22 @@ def nifty_loop():
                 print("Reverse error:", e)
 
             with lock:
-                
                 global_trade_active = False
 
-            time.sleep(10)
+            last_executed_signal_nifty = None
+            last_trade_time_nifty = time.time()
+
+            time.sleep(3)
             continue
 
-        # 🔥 SAFETY: TREND MUST MATCH SIGNAL
         if signal != current_trend:
-            print("🚫 Trend mismatch with stored arrow")
             continue
-        
-        
 
-        # ===============================
-        # 🚫 DUPLICATE CONTROL
-        # ===============================
+        # 🚫 DUPLICATE
         if signal == last_executed_signal_nifty:
             if time.time() - last_trade_time_nifty < 300:
                 continue
-        
 
-        # ===============================
-        # 🎯 PROBABILITY FILTER
-        # ===============================
         probability = get_trade_probability(config.NIFTY_TOKEN, signal, df)
         if probability < adaptive_config["prob_threshold"]:
             continue
@@ -1916,67 +1891,44 @@ def nifty_loop():
         if time.time() - last_exit_time_nifty < 120:
             continue
 
-        # ===============================
-        # 🔒 SINGLE LOCK (CRITICAL FIX)
-        # ===============================
         with lock:
-            print(f"DEBUG → active: {nifty_active}, in_progress: {trade_in_progress_nifty}")
-
             if global_trade_active:
-                print("🚫 Trade blocked (GLOBAL LOCK)")
                 continue
-            
 
         try:
-            
-            # 🚫 NIFTY TRADE LIMIT
+
+            # 🚫 TRADE LIMIT
             if nifty_trade_count >= 3:
-                print("🚫 NIFTY trade limit reached (3)")
                 time.sleep(10)
                 continue
-    
+
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
-            
-            # 📈 SMART RE-ENTRY FILTER
+
             if last_exit_reason == "SL":
                 if not is_market_trending(config.NIFTY_TOKEN, df):
-                    print("🚫 Weak trend — skip re-entry")
                     continue
-                print("✅ Strong trend — re-entry allowed")
 
-            if not symbol or not price:
+            if not symbol:
                 continue
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
             if not filled_price:
                 continue
-                
-            
+
+            # ✅ SUCCESS
             nifty_trade_count += 1
-
-            print(f"📊 NIFTY trades today: {nifty_trade_count}/3")
-
-            # ✅ RESET EXIT REASON
-            
             last_exit_reason = None
-
-            # ✅ STORE RUNNING TRADE (already added earlier)
-            
 
             last_running_signal = signal
             current_symbol = symbol
             current_qty = get_quantity(lot, exchange)
             current_exchange = exchange
 
-            # ✅ SET FLAGS
             with lock:
                 nifty_active = True
                 trade_in_progress_nifty = True
-                
                 global_trade_active = True
-
-            
 
             last_executed_signal_nifty = signal
             last_trade_time_nifty = time.time()
@@ -1990,47 +1942,41 @@ def nifty_loop():
         except Exception as e:
             print("❌ NIFTY ERROR:", e)
 
-        time.sleep(3)
+        time.sleep(2)
        
         
 #CRUDE LOOP
 def crude_loop():
-    
+
     global last_running_signal, current_symbol, current_qty, current_exchange
     global crude_active, last_trade_time_crude
-    global last_executed_signal_crude, last_log_time
-    global trade_in_progress_crude
-    global last_trend_crude
-    global last_valid_arrow_crude
-    global global_trade_active
-    global crude_trade_count
-    global last_exit_reason
-    
+    global last_executed_signal_crude
+    global trade_in_progress_crude, last_trend_crude
+    global last_valid_arrow_crude, global_trade_active
+    global crude_trade_count, last_exit_reason
+    global last_reset_day
+    global last_logged_trend_crude, last_logged_arrow_crude
+
     if not ENABLE_CRUDE:
         return
 
     print("🔥 CRUDE LOOP STARTED")
 
     while True:
-        now = datetime.datetime.now(IST)
+
+        now_dt = datetime.datetime.now(IST)
         today = now_dt.date()
 
-        # ❌ BEFORE 3:30 DON'T TRADE CRUDE
-        if now.hour < 15 or (now.hour == 15 and now.minute <= 30):
+        # ⏰ BEFORE 3:30 SKIP
+        if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
             time.sleep(5)
             continue
-            
-                # 🗓️ DAILY RESET
-        
-
-        global last_reset_day, nifty_trade_count, crude_trade_count
 
         if last_reset_day != today:
             nifty_trade_count = 0
             crude_trade_count = 0
             last_reset_day = today
-
-            print(f"🔄 Daily reset done: {today}")   # prints ONLY once ✅
+            print(f"🔄 Daily reset done: {today}")
 
         if portfolio_pnl < HARD_STOP_LOSS:
             send_message("🚨 HARD STOP — CRUDE")
@@ -2043,9 +1989,6 @@ def crude_loop():
 
         df = prepare_indicators(df)
 
-        # ===============================
-        # 🔥 HALF TREND (15m MASTER)
-        # ===============================
         df_ht = get_cached_data(CRUDE_TOKEN, "15minute", 120)
         if df_ht is None or len(df_ht) < 50:
             continue
@@ -2056,44 +1999,29 @@ def crude_loop():
             print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
             last_logged_trend_crude = current_trend
             last_logged_arrow_crude = last_arrow
-        
-        # 🔄 TREND FLIP DETECTION FIRST
+
         if last_trend_crude and current_trend != last_trend_crude:
-            print(f"🔄 CRUD TREND FLIP: {last_trend_crude} → {current_trend}")
             last_executed_signal_crude = None
             last_trade_time_crude = 0
             last_valid_arrow_crude = None
 
-        # ✅ UPDATE MEMORY
         last_trend_crude = current_trend
 
-        # 🔥 NOW APPLY STRONG FILTER
         prev_trend, _ = halftrend_entry(df_ht.iloc[:-1])
-
         if prev_trend != current_trend:
-            print("⚠️ Weak CRUDE flip — waiting confirmation")
             continue
-
 
         if current_trend == "HOLD":
             continue
 
-        
-
-        
-
-        # ✅ STORE NEW ARROW
         if last_arrow != "HOLD":
             last_valid_arrow_crude = last_arrow
 
-        # 🚫 NO HISTORY
         if last_valid_arrow_crude is None:
-            print("⏳ No crude arrow history yet...")
             continue
 
-        # 🔥 USE STORED ARROW
         signal = last_valid_arrow_crude
-        
+
         # 🔄 AUTO REVERSE
         if global_trade_active and last_running_signal and signal != last_running_signal:
             print("🔄 Opposite signal — reversing CRUDE")
@@ -2104,95 +2032,61 @@ def crude_loop():
                 print("Reverse error:", e)
 
             with lock:
-                
                 global_trade_active = False
 
-            time.sleep(10)
+            last_executed_signal_crude = None
+            last_trade_time_crude = time.time()
+
+            time.sleep(3)
             continue
 
-        # 🔥 TREND CONFIRMATION
         if signal != current_trend:
-            print("🚫 CRUDE trend mismatch")
             continue
-        
 
-        # ===============================
-        # 🚫 DUPLICATE CONTROL
-        # ===============================
         if signal == last_executed_signal_crude:
             if time.time() - last_trade_time_crude < 300:
                 continue
-           
 
-        # ===============================
-        # 🎯 PROBABILITY FILTER
-        # ===============================
         probability = get_trade_probability(CRUDE_TOKEN, signal, df)
         if probability < adaptive_config["prob_threshold"]:
             continue
 
-        # ===============================
-        # 🔒 SINGLE LOCK
-        # ===============================
         with lock:
             if global_trade_active:
-                print("🚫 Trade blocked (GLOBAL LOCK)")
                 continue
-
 
         try:
-            
-            # 🚫 CRUDE TRADE LIMIT
+
             if crude_trade_count >= 2:
-                print("🚫 CRUDE trade limit reached (2)")
                 time.sleep(10)
                 continue
-                
+
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
-            
-            # 📈 SMART RE-ENTRY FILTER
+
             if last_exit_reason == "SL":
                 if not is_market_trending(CRUDE_TOKEN, df):
-                    print("🚫 Weak trend — skip re-entry")
                     continue
-                print("✅ Strong trend — re-entry allowed")
 
-            if not symbol or not price:
+            if not symbol:
                 continue
 
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
 
             if not filled_price:
-                with lock:
-                    crude_active = False
-                    trade_in_progress_crude = False
                 continue
-                
-            
+
             crude_trade_count += 1
-
-            print(f"📊 Crude trades today: {crude_trade_count}/2")
-
-            # ✅ RESET EXIT REASON
-            
             last_exit_reason = None
-
-            # ✅ STORE RUNNING TRADE
-            
 
             last_running_signal = signal
             current_symbol = symbol
             current_qty = get_quantity(lot, exchange)
             current_exchange = exchange
 
-            # ✅ SET FLAGS
             with lock:
                 crude_active = True
                 trade_in_progress_crude = True
-                
                 global_trade_active = True
-
-           
 
             last_executed_signal_crude = signal
             last_trade_time_crude = time.time()
@@ -2205,12 +2099,8 @@ def crude_loop():
 
         except Exception as e:
             print("❌ CRUDE ERROR:", e)
-            with lock:
-                crude_active = False
-                trade_in_progress_crude = False
 
-        time.sleep(3)
-
+        time.sleep(2)
         
 def get_strike_mode(token):
 

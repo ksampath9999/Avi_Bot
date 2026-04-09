@@ -1831,19 +1831,27 @@ def nifty_loop():
         if df_ht is None or len(df_ht) < 50:
             continue
 
-        current_trend, last_arrow = halftrend_entry(df_ht)
-        
-        if last_valid_arrow_nifty is None:
+        # =========================
+        # 🔥 FULL ARROW ENGINE (FIXED)
+        # =========================
 
-            # 🔍 SEARCH HISTORICAL ARROW (INCLUDING PREVIOUS DAY)
-            for i in range(len(df_ht)-1, -1, -1):
-                _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
-                if arrow_i != "HOLD":
-                    last_valid_arrow_nifty = arrow_i
-                    print(f"📌 Using previous arrow: {arrow_i}")
-                    break
-                    
-            print(f"🧠 Active Arrow Nifty: {last_valid_arrow_nifty}")
+        current_trend, _ = halftrend_entry(df_ht)
+
+        last_arrow = "HOLD"
+
+        # 🔍 ALWAYS SCAN FULL HISTORY (latest arrow)
+        for i in range(len(df_ht)-1, -1, -1):
+            _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
+
+            if arrow_i != "HOLD":
+                last_arrow = arrow_i
+                break
+
+        # 🧠 STORE
+        if last_arrow != "HOLD":
+            last_valid_arrow_nifty = last_arrow
+
+        print(f"🧠 Active Arrow Nifty: {last_valid_arrow_nifty}")
 
         # 📊 LOG ONLY IF CHANGE
         if current_trend != last_logged_trend_nifty or last_arrow != last_logged_arrow_nifty:
@@ -1874,14 +1882,21 @@ def nifty_loop():
         # 🚫 NO ARROW HISTORY (OPTIONAL ENTRY)
         now_ts = time.time()
 
-        if last_valid_arrow_nifty is None:
+        # =========================
+        # 🎯 FINAL SIGNAL (FIXED)
+        # =========================
+
+        if last_valid_arrow_nifty:
+            signal = last_valid_arrow_nifty
+        else:
+            # fallback only if NO arrow found anywhere
             if now_ts - last_no_arrow_log_time > 60:
-                print("⚡ No arrow yet — using trend for first trade")
+                print("⚡ No arrow found — using trend fallback")
                 last_no_arrow_log_time = now_ts
 
-            signal = current_trend   # 👈 KEY CHANGE
-        else:
-            signal = last_valid_arrow_nifty
+            signal = current_trend
+
+        print(f"🎯 FINAL SIGNAL → {signal} | TREND → {current_trend} | ARROW → {last_valid_arrow_nifty}")
 
         # 🔄 AUTO REVERSE
         if global_trade_active and last_running_signal and signal != last_running_signal:
@@ -1901,8 +1916,6 @@ def nifty_loop():
             time.sleep(3)
             continue
 
-        if signal != current_trend:
-            continue
 
         # 🚫 DUPLICATE
         if signal == last_executed_signal_nifty:
@@ -2018,19 +2031,21 @@ def crude_loop():
         if df_ht is None or len(df_ht) < 50:
             continue
 
-        current_trend, last_arrow = halftrend_entry(df_ht)
-        
-        if last_valid_arrow_crude is None:
+        current_trend, _ = halftrend_entry(df_ht)
 
-            # 🔍 SEARCH HISTORICAL ARROW (INCLUDING PREVIOUS DAY)
-            for i in range(len(df_ht)-1, -1, -1):
-                _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
-                if arrow_i != "HOLD":
-                    last_valid_arrow_crude = arrow_i
-                    print(f"📌 Using previous arrow: {arrow_i}")
-                    break
-                    
-            print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
+        last_arrow = "HOLD"
+
+        for i in range(len(df_ht)-1, -1, -1):
+            _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
+
+            if arrow_i != "HOLD":
+                last_arrow = arrow_i
+                break
+
+        if last_arrow != "HOLD":
+            last_valid_arrow_crude = last_arrow
+
+        print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
 
         if current_trend != last_logged_trend_crude or last_arrow != last_logged_arrow_crude:
             print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")

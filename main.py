@@ -1780,7 +1780,7 @@ def nifty_loop():
     print("🔥 NIFTY LOOP STARTED")
 
     while True:
-        now = datetime.datetime.now(IST).date()
+        now = datetime.datetime.now(IST)
 
         # ❌ AFTER 3:30 STOP NIFTY
         if now.hour > 15 or (now.hour == 15 and now.minute > 30):
@@ -1999,7 +1999,7 @@ def crude_loop():
     print("🔥 CRUDE LOOP STARTED")
 
     while True:
-        now = datetime.datetime.now(IST).date()
+        now = datetime.datetime.now(IST)
 
         # ❌ BEFORE 3:30 DON'T TRADE CRUDE
         if now.hour < 15 or (now.hour == 15 and now.minute <= 30):

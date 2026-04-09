@@ -1771,7 +1771,7 @@ def nifty_loop():
     global last_trend_nifty
     global last_valid_arrow_nifty
     global global_trade_active
-    
+    global nifty_trade_count
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1935,7 +1935,7 @@ def nifty_loop():
             if not filled_price:
                 continue
                 
-            global nifty_trade_count
+            
             nifty_trade_count += 1
 
             print(f"📊 NIFTY trades today: {nifty_trade_count}/3")
@@ -1984,6 +1984,7 @@ def crude_loop():
     global last_trend_crude
     global last_valid_arrow_crude
     global global_trade_active
+    global crude_trade_count
     
     if not ENABLE_CRUDE:
         return
@@ -2143,7 +2144,7 @@ def crude_loop():
                     trade_in_progress_crude = False
                 continue
                 
-            global crude_trade_count
+            
             crude_trade_count += 1
 
             print(f"📊 Crude trades today: {crude_trade_count}/2")

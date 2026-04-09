@@ -152,6 +152,11 @@ max_profit_reached = 0
 nifty_trade_count = 0
 crude_trade_count = 0
 last_reset_day = None
+last_no_arrow_log_time = 0
+last_logged_trend_nifty = None
+last_logged_arrow_nifty = None
+last_logged_trend_crude = None
+last_logged_arrow_crude = None
 
 def is_nifty_trading_time():
     now = datetime.datetime.now(IST)
@@ -1792,12 +1797,12 @@ def nifty_loop():
 
         global last_reset_day, nifty_trade_count, crude_trade_count
 
-        if last_reset_day != now:
-            print("🔄 Resetting daily trade counters")
-
+        if last_reset_day != today:
             nifty_trade_count = 0
             crude_trade_count = 0
-            last_reset_day = now
+            last_reset_day = today
+
+            print(f"🔄 Daily reset done: {today}")   # prints ONLY once ✅
 
         if portfolio_pnl < HARD_STOP_LOSS:
             send_message("🚨 HARD STOP — NIFTY")
@@ -1823,7 +1828,10 @@ def nifty_loop():
 
         current_trend, last_arrow = halftrend_entry(df_ht)
 
-        print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
+        if current_trend != last_logged_trend_nifty or last_arrow != last_logged_arrow_nifty:
+            print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
+            last_logged_trend_nifty = current_trend
+            last_logged_arrow_nifty = last_arrow
         
         # 🔄 TREND FLIP DETECTION FIRST
         if last_trend_nifty and current_trend != last_trend_nifty:
@@ -1855,8 +1863,12 @@ def nifty_loop():
             last_valid_arrow_nifty = last_arrow
 
         # 🚫 NO ARROW EVER FOUND
+        now_ts = time.time()
+
         if last_valid_arrow_nifty is None:
-            print("⏳ No arrow history yet...")
+            if now_ts - last_no_arrow_log_time > 60:   # print once per minute
+                print("⏳ No arrow history yet...")
+                last_no_arrow_log_time = now_ts
             continue
 
         # 🔥 USE LAST VALID ARROW (KEY CHANGE)
@@ -1977,7 +1989,7 @@ def nifty_loop():
         except Exception as e:
             print("❌ NIFTY ERROR:", e)
 
-        time.sleep(2)
+        time.sleep(3)
        
         
 #CRUDE LOOP
@@ -2011,12 +2023,12 @@ def crude_loop():
 
         global last_reset_day, nifty_trade_count, crude_trade_count
 
-        if last_reset_day != now:
-            print("🔄 Resetting daily trade counters")
-
+        if last_reset_day != today:
             nifty_trade_count = 0
             crude_trade_count = 0
-            last_reset_day = now
+            last_reset_day = today
+
+            print(f"🔄 Daily reset done: {today}")   # prints ONLY once ✅
 
         if portfolio_pnl < HARD_STOP_LOSS:
             send_message("🚨 HARD STOP — CRUDE")
@@ -2038,7 +2050,10 @@ def crude_loop():
 
         current_trend, last_arrow = halftrend_entry(df_ht)
 
-        print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
+        if current_trend != last_logged_trend_crude or last_arrow != last_logged_arrow_crude:
+            print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")
+            last_logged_trend_crude = current_trend
+            last_logged_arrow_crude = last_arrow
         
         # 🔄 TREND FLIP DETECTION FIRST
         if last_trend_crude and current_trend != last_trend_crude:
@@ -2192,7 +2207,7 @@ def crude_loop():
                 crude_active = False
                 trade_in_progress_crude = False
 
-        time.sleep(2)
+        time.sleep(3)
 
         
 def get_strike_mode(token):

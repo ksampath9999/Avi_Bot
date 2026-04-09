@@ -1766,6 +1766,8 @@ def halftrend_trend(df, amplitude=2):
 # THREADS
 # -----------------------------
 def nifty_loop():
+    
+    global last_running_signal, current_symbol, current_qty, current_exchange
     global nifty_active, last_trade_time_nifty
     global last_executed_signal_nifty, last_exit_time_nifty
     global last_log_time, trade_in_progress_nifty
@@ -1947,7 +1949,7 @@ def nifty_loop():
             last_exit_reason = None
 
             # ✅ STORE RUNNING TRADE (already added earlier)
-            global last_running_signal, current_symbol, current_qty, current_exchange
+            
 
             last_running_signal = signal
             current_symbol = symbol
@@ -1980,6 +1982,8 @@ def nifty_loop():
         
 #CRUDE LOOP
 def crude_loop():
+    
+    global last_running_signal, current_symbol, current_qty, current_exchange
     global crude_active, last_trade_time_crude
     global last_executed_signal_crude, last_log_time
     global trade_in_progress_crude
@@ -2157,7 +2161,7 @@ def crude_loop():
             last_exit_reason = None
 
             # ✅ STORE RUNNING TRADE
-            global last_running_signal, current_symbol, current_qty, current_exchange
+            
 
             last_running_signal = signal
             current_symbol = symbol

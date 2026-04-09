@@ -989,10 +989,10 @@ def find_option(signal, instrument):
             
         # 🎯 PREMIUM FILTER (INSTRUMENT BASED)
         if instrument == "NIFTY":
-            if p < 70 or p > 100:
+            if p < 60 or p > 80:
                 continue
         else:  # CRUDE
-            if p < 30 or p > 200:
+            if p < 30 or p > 100:
                 continue
 
         trade_value = p * lot_size
@@ -1525,31 +1525,42 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 def exit_position(symbol, qty, exchange):
 
     try:
-        print(f"🚪 EXIT ORDER: {symbol}")
+        # ===============================
+        # 🔍 VERIFY POSITION BEFORE EXIT
+        # ===============================
+        positions = kite.positions()["net"]
+        print(f"📊 Positions: {positions}")
+        found = False
+        for p in positions:
+            if p["tradingsymbol"] == symbol and p["quantity"] > 0:
+                found = True
+                break
 
-        ltp = safe_ltp(f"{exchange}:{symbol}")
+        if not found:
+            print(f"⚠️ No open position found for {symbol}")
+            return False
 
-        if ltp:
-            price = round(ltp * 0.999, 1)
-        else:
-            price = 0  # fallback
+        # ===============================
+        # 🚪 EXIT ORDER (MARKET)
+        # ===============================
+        print(f"🚪 EXITING: {symbol}, qty: {qty}")
 
-        kite.place_order(
-            variety="regular",
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
             exchange=exchange,
             tradingsymbol=symbol,
-            transaction_type="SELL",
+            transaction_type=kite.TRANSACTION_TYPE_SELL,
             quantity=qty,
-            order_type="LIMIT",
-            price=price,
-            product="MIS" if exchange == "NFO" else "NRML"
+            order_type=kite.ORDER_TYPE_MARKET,   # 🔥 IMPORTANT
+            product=kite.PRODUCT_MIS
         )
 
-        print("✅ Exit order placed")
+        print(f"✅ Exit order placed: {order_id}")
+        return True
 
     except Exception as e:
-        print("❌ Exit error:", e)
-        send_message(f"❌ Exit order failed: {symbol}")
+        print(f"❌ Exit order failed: {symbol} | Error: {e}")
+        return False
             
 
 def tune_strategy():
@@ -1821,6 +1832,18 @@ def nifty_loop():
             continue
 
         current_trend, last_arrow = halftrend_entry(df_ht)
+        
+        if last_valid_arrow_nifty is None:
+
+            # 🔍 SEARCH HISTORICAL ARROW (INCLUDING PREVIOUS DAY)
+            for i in range(len(df_ht)-1, -1, -1):
+                _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
+                if arrow_i != "HOLD":
+                    last_valid_arrow_nifty = arrow_i
+                    print(f"📌 Using previous arrow: {arrow_i}")
+                    break
+                    
+            print(f"🧠 Active Arrow Nifty: {last_valid_arrow_nifty}")
 
         # 📊 LOG ONLY IF CHANGE
         if current_trend != last_logged_trend_nifty or last_arrow != last_logged_arrow_nifty:
@@ -1996,6 +2019,18 @@ def crude_loop():
             continue
 
         current_trend, last_arrow = halftrend_entry(df_ht)
+        
+        if last_valid_arrow_crude is None:
+
+            # 🔍 SEARCH HISTORICAL ARROW (INCLUDING PREVIOUS DAY)
+            for i in range(len(df_ht)-1, -1, -1):
+                _, arrow_i = halftrend_entry(df_ht.iloc[:i+1])
+                if arrow_i != "HOLD":
+                    last_valid_arrow_crude = arrow_i
+                    print(f"📌 Using previous arrow: {arrow_i}")
+                    break
+                    
+            print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
 
         if current_trend != last_logged_trend_crude or last_arrow != last_logged_arrow_crude:
             print(f"📊 HT Trend: {current_trend} | Arrow: {last_arrow}")

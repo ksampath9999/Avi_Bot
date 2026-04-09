@@ -39,6 +39,11 @@ trade_in_progress_crude = False
 last_trend_nifty = None
 last_trend_crude = None
 
+last_valid_arrow_nifty = None
+last_valid_arrow_crude = None
+
+global_trade_active = False
+
 # -----------------------------
 # RISK VARIABLES
 # -----------------------------
@@ -105,8 +110,12 @@ last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
 ENABLE_CRUDE = True
 last_log_time = 0
-
+last_running_signal = None
 performance_log = []
+
+current_symbol = None
+current_qty = 0
+current_exchange = None
 
 adaptive_config = {
     "prob_threshold": 38,
@@ -137,7 +146,12 @@ strategy_weights = {
 
 exit_done = False
 partial_booked = False
+last_exit_reason = None
+max_profit_reached = 0
 
+nifty_trade_count = 0
+crude_trade_count = 0
+last_reset_day = None
 
 def is_nifty_trading_time():
     now = datetime.datetime.now(IST)
@@ -884,7 +898,7 @@ def find_option(signal, instrument):
         name = "CRUDEOIL"
         step = 100
         token = CRUDE_TOKEN
-        token_symbol = CRUDE_SYMBOL or get_crude_fut_symbol()
+        token_symbol = get_crude_fut_symbol()
         lot_size = 100
 
     # -----------------------------
@@ -920,7 +934,7 @@ def find_option(signal, instrument):
     if signal == "CALL":
         target_strike = atm + (shift * step)
     else:
-        target_strike = atm - (shift * step)
+        target_strike = atm + (shift * step)
 
     print(f"💰 Balance: {balance} | Target Strike: {target_strike}")
 
@@ -1239,6 +1253,8 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global portfolio_pnl, peak_portfolio, risk_off
     global max_drawdown, last_exit_time_nifty, last_exit_time_crude
     global nifty_active, crude_active
+    global exit_done
+    exit_done = False
 
     full_symbol = f"{exchange}:{symbol}"
     actual_qty = get_quantity(qty, exchange)
@@ -1282,19 +1298,55 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 peak = min(peak, ltp)
 
             current_pnl = profit * remaining_qty
-            
-            # 💰 REAL PARTIAL BOOKING
-            if not partial_booked and current_pnl >= 1000:
 
-                half_qty = remaining_qty // 2
+           # 💰 SMART PARTIAL BOOKING
+            if not partial_booked and current_pnl >= 1200:
 
-                if half_qty > 0:
-                    exit_position(symbol, half_qty, exchange)
+                # Skip partial if strong trend
+                if is_market_trending(
+                    CRUDE_TOKEN if instrument == "CRUDE" else config.NIFTY_TOKEN
+                ):
+                    print("🚀 Strong trend — skipping partial booking")
+                else:
+                    half_qty = remaining_qty // 2
 
-                    remaining_qty -= half_qty
-                    partial_booked = True
+                    if half_qty > 0:
+                        exit_position(symbol, half_qty, exchange)
 
-                    send_message(f"💰 Partial booked\n{symbol}")
+                        remaining_qty -= half_qty
+                        partial_booked = True
+
+                        send_message(f"💰 Partial booked\n{symbol}")
+
+            # ===============================
+            # 💰 GLOBAL PROFIT PROTECTION
+            # ===============================
+            global max_profit_reached
+
+            max_profit_reached = max(max_profit_reached, current_pnl)
+
+            if max_profit_reached >= 1000:
+
+                # 🎯 DYNAMIC LOCK
+                if max_profit_reached < 1500:
+                    lock_pct = 0.5
+                elif max_profit_reached < 3000:
+                    lock_pct = 0.7
+                else:
+                    lock_pct = 0.8
+
+                lock_level = max_profit_reached * lock_pct
+
+                print(f"💰 Lock Active → Peak: {max_profit_reached:.0f}, Lock: {lock_level:.0f}")
+
+                if current_pnl < lock_level:
+                    print("💰 Profit lock triggered — exit")
+
+                    if not exit_done:
+                        exit_position(symbol, remaining_qty, exchange)
+
+                    pnl = current_pnl
+                    break
 
             # ===============================
             # 🧠 ATR BASED TRAILING
@@ -1312,21 +1364,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             except:
                 atr_value = entry * 0.02
 
-            # ===============================
-            # 💰 DYNAMIC PROFIT LOCK
-            # ===============================
-            if current_pnl >= 1500:
-
-                lock_ratio = 0.70
-                lock_pnl = current_pnl * lock_ratio
-                lock_price_move = lock_pnl / remaining_qty
-
-                print(f"💰 Lock → PnL: {current_pnl:.0f}, Locked: {lock_pnl:.0f}")
-
-                if signal == "CALL":
-                    sl = max(sl, entry + lock_price_move)
-                else:
-                    sl = min(sl, entry - lock_price_move)
+            
 
             # ===============================
             # 🚀 ATR TRAILING (ADAPTIVE)
@@ -1382,11 +1420,16 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             # 🚨 HARD SL
             if profit < -risk:
-                pnl = profit * remaining_qty
+                global last_exit_reason
+                last_exit_reason = "SL"
+
+                print("🛑 HARD SL HIT")
+
                 if not exit_done:
                     exit_position(symbol, remaining_qty, exchange)
                     exit_done = True
-                send_message(f"🚨 HARD SL\n{symbol}")
+
+                pnl = profit * remaining_qty
                 break
 
             
@@ -1434,6 +1477,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             else:
                 crude_active = False
                 
+            global global_trade_active
+            global_trade_active = False
+                
             # 🔥 CRITICAL FIX (MISSING)
             global trade_in_progress_nifty, trade_in_progress_crude
 
@@ -1458,6 +1504,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             if len(performance_log) > 100:
                 performance_log.pop(0)
+                
+            global max_profit_reached
+            max_profit_reached = 0
 
         # 📊 STRATEGY LOG (OUTSIDE LOCK OK)
         if market_type in strategy_log:
@@ -1718,15 +1767,29 @@ def nifty_loop():
     global last_executed_signal_nifty, last_exit_time_nifty
     global last_log_time, trade_in_progress_nifty
     global last_trend_nifty
+    global last_valid_arrow_nifty
 
     print("🔥 NIFTY LOOP STARTED")
 
     while True:
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(IST).date()
 
-        if not is_nifty_trading_time():
-            print("🛑 NIFTY market closed — stopping loop")
-            break   # 🔥 stops only NIFTY thread
+        # ❌ AFTER 3:30 STOP NIFTY
+        if now.hour > 15 or (now.hour == 15 and now.minute > 30):
+            print("🛑 NIFTY time over — stopping")
+            break
+            
+        # 🗓️ DAILY RESET
+        
+
+        global last_reset_day, nifty_trade_count, crude_trade_count
+
+        if last_reset_day != now:
+            print("🔄 Resetting daily trade counters")
+
+            nifty_trade_count = 0
+            crude_trade_count = 0
+            last_reset_day = now
 
         if portfolio_pnl < HARD_STOP_LOSS:
             send_message("🚨 HARD STOP — NIFTY")
@@ -1759,6 +1822,7 @@ def nifty_loop():
             print(f"🔄 NIFTY TREND FLIP: {last_trend_nifty} → {current_trend}")
             last_executed_signal_nifty = None
             last_trade_time_nifty = 0
+            last_valid_arrow_nifty = None
 
         # ✅ UPDATE MEMORY
         last_trend_nifty = current_trend
@@ -1774,20 +1838,44 @@ def nifty_loop():
         if current_trend == "HOLD":
             continue
 
-        if last_arrow != "HOLD" and current_trend != last_arrow:
-            print("🚫 HT mismatch — skipping")
+        
+
+        
+
+        # ✅ STEP 1: STORE NEW ARROW
+        if last_arrow != "HOLD":
+            last_valid_arrow_nifty = last_arrow
+
+        # 🚫 NO ARROW EVER FOUND
+        if last_valid_arrow_nifty is None:
+            print("⏳ No arrow history yet...")
             continue
 
-        signal = current_trend
+        # 🔥 USE LAST VALID ARROW (KEY CHANGE)
+        signal = last_valid_arrow_nifty
         
-        # 🚫 BLOCK OLD SIGNALS
-        if signal != last_trend_nifty:
-            print("🚫 Outdated NIFTY signal blocked")
+        # 🔄 AUTO REVERSE
+        if global_trade_active and last_running_signal and signal != last_running_signal:
+            print("🔄 Opposite signal — reversing NIFTY")
+
+            try:
+                exit_position(current_symbol, current_qty, current_exchange)
+            except Exception as e:
+                print("Reverse error:", e)
+
+            with lock:
+                global global_trade_active
+                global_trade_active = False
+
+            time.sleep(10)
+            continue
+
+        # 🔥 SAFETY: TREND MUST MATCH SIGNAL
+        if signal != current_trend:
+            print("🚫 Trend mismatch with stored arrow")
             continue
         
-        # 🔥 TREND CONTINUATION ENTRY (NEW)
-        if last_arrow == "HOLD":
-            print("⚡ Continuation trade allowed (no arrow)")
+        
 
         # ===============================
         # 🚫 DUPLICATE CONTROL
@@ -1795,6 +1883,7 @@ def nifty_loop():
         if signal == last_executed_signal_nifty:
             if time.time() - last_trade_time_nifty < 300:
                 continue
+        
 
         # ===============================
         # 🎯 PROBABILITY FILTER
@@ -1812,15 +1901,27 @@ def nifty_loop():
         with lock:
             print(f"DEBUG → active: {nifty_active}, in_progress: {trade_in_progress_nifty}")
 
-            if nifty_active:
-                print("🚫 Trade blocked (NIFTY)")
+            if global_trade_active:
+                print("🚫 Trade blocked (GLOBAL LOCK)")
                 continue
-                
-        if signal != last_trend_nifty:
-            continue
+            
 
         try:
+            
+            # 🚫 NIFTY TRADE LIMIT
+            if nifty_trade_count >= 3:
+                print("🚫 NIFTY trade limit reached (3)")
+                time.sleep(10)
+                continue
+    
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
+            
+            # 📈 SMART RE-ENTRY FILTER
+            if last_exit_reason == "SL":
+                if not is_market_trending(config.NIFTY_TOKEN, df):
+                    print("🚫 Weak trend — skip re-entry")
+                    continue
+                print("✅ Strong trend — re-entry allowed")
 
             if not symbol or not price:
                 continue
@@ -1829,17 +1930,32 @@ def nifty_loop():
 
             if not filled_price:
                 continue
+                
+            global nifty_trade_count
+            nifty_trade_count += 1
 
-            # ✅ SET FLAGS ONLY AFTER SUCCESS
+            print(f"📊 NIFTY trades today: {nifty_trade_count}/3")
+
+            # ✅ RESET EXIT REASON
+            global last_exit_reason
+            last_exit_reason = None
+
+            # ✅ STORE RUNNING TRADE (already added earlier)
+            global last_running_signal, current_symbol, current_qty, current_exchange
+
+            last_running_signal = signal
+            current_symbol = symbol
+            current_qty = get_quantity(lot, exchange)
+            current_exchange = exchange
+
+            # ✅ SET FLAGS
             with lock:
                 nifty_active = True
                 trade_in_progress_nifty = True
+                global global_trade_active
+                global_trade_active = True
 
-            if not filled_price:
-                with lock:
-                    nifty_active = False
-                    trade_in_progress_nifty = False
-                continue
+            
 
             last_executed_signal_nifty = signal
             last_trade_time_nifty = time.time()
@@ -1862,6 +1978,7 @@ def crude_loop():
     global last_executed_signal_crude, last_log_time
     global trade_in_progress_crude
     global last_trend_crude
+    global last_valid_arrow_crude
 
     if not ENABLE_CRUDE:
         return
@@ -1869,12 +1986,24 @@ def crude_loop():
     print("🔥 CRUDE LOOP STARTED")
 
     while True:
-        now = datetime.datetime.now(IST)
+        now = datetime.datetime.now(IST).date()
 
-        if not is_crude_trading_time():
-            print("🛑 CRUDE market closed — waiting")
-            time.sleep(60)
+        # ❌ BEFORE 3:30 DON'T TRADE CRUDE
+        if now.hour < 15 or (now.hour == 15 and now.minute <= 30):
+            time.sleep(5)
             continue
+            
+                # 🗓️ DAILY RESET
+        
+
+        global last_reset_day, nifty_trade_count, crude_trade_count
+
+        if last_reset_day != now:
+            print("🔄 Resetting daily trade counters")
+
+            nifty_trade_count = 0
+            crude_trade_count = 0
+            last_reset_day = now
 
         if portfolio_pnl < HARD_STOP_LOSS:
             send_message("🚨 HARD STOP — CRUDE")
@@ -1903,6 +2032,7 @@ def crude_loop():
             print(f"🔄 CRUD TREND FLIP: {last_trend_crude} → {current_trend}")
             last_executed_signal_crude = None
             last_trade_time_crude = 0
+            last_valid_arrow_crude = None
 
         # ✅ UPDATE MEMORY
         last_trend_crude = current_trend
@@ -1918,16 +2048,43 @@ def crude_loop():
         if current_trend == "HOLD":
             continue
 
-        if last_arrow != "HOLD" and current_trend != last_arrow:
-            print("🚫 HT mismatch — skipping")
+        
+
+        
+
+        # ✅ STORE NEW ARROW
+        if last_arrow != "HOLD":
+            last_valid_arrow_crude = last_arrow
+
+        # 🚫 NO HISTORY
+        if last_valid_arrow_crude is None:
+            print("⏳ No crude arrow history yet...")
             continue
 
-        signal = current_trend
+        # 🔥 USE STORED ARROW
+        signal = last_valid_arrow_crude
         
-        # 🚫 BLOCK OLD SIGNALS
-        if signal != last_trend_crude:
-            print("🚫 Outdated CRUDE signal blocked")
+        # 🔄 AUTO REVERSE
+        if global_trade_active and last_running_signal and signal != last_running_signal:
+            print("🔄 Opposite signal — reversing CRUDE")
+
+            try:
+                exit_position(current_symbol, current_qty, current_exchange)
+            except Exception as e:
+                print("Reverse error:", e)
+
+            with lock:
+                global global_trade_active
+                global_trade_active = False
+
+            time.sleep(10)
             continue
+
+        # 🔥 TREND CONFIRMATION
+        if signal != current_trend:
+            print("🚫 CRUDE trend mismatch")
+            continue
+        
 
         # ===============================
         # 🚫 DUPLICATE CONTROL
@@ -1935,6 +2092,7 @@ def crude_loop():
         if signal == last_executed_signal_crude:
             if time.time() - last_trade_time_crude < 300:
                 continue
+           
 
         # ===============================
         # 🎯 PROBABILITY FILTER
@@ -1947,16 +2105,27 @@ def crude_loop():
         # 🔒 SINGLE LOCK
         # ===============================
         with lock:
-            if crude_active or trade_in_progress_crude:
-                print("🚫 Trade blocked (CRUDE)")
+            if global_trade_active:
+                print("🚫 Trade blocked (GLOBAL LOCK)")
                 continue
 
-            
-        if signal != last_trend_crude:
-            continue
 
         try:
+            
+            # 🚫 CRUDE TRADE LIMIT
+            if crude_trade_count >= 2:
+                print("🚫 CRUDE trade limit reached (2)")
+                time.sleep(10)
+                continue
+                
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
+            
+            # 📈 SMART RE-ENTRY FILTER
+            if last_exit_reason == "SL":
+                if not is_market_trending(CRUDE_TOKEN, df):
+                    print("🚫 Weak trend — skip re-entry")
+                    continue
+                print("✅ Strong trend — re-entry allowed")
 
             if not symbol or not price:
                 continue
@@ -1968,17 +2137,32 @@ def crude_loop():
                     crude_active = False
                     trade_in_progress_crude = False
                 continue
+                
+            global crude_trade_count
+            crude_trade_count += 1
 
-            # ✅ SET FLAGS ONLY AFTER SUCCESS
+            print(f"📊 Crude trades today: {crude_trade_count}/2")
+
+            # ✅ RESET EXIT REASON
+            global last_exit_reason
+            last_exit_reason = None
+
+            # ✅ STORE RUNNING TRADE
+            global last_running_signal, current_symbol, current_qty, current_exchange
+
+            last_running_signal = signal
+            current_symbol = symbol
+            current_qty = get_quantity(lot, exchange)
+            current_exchange = exchange
+
+            # ✅ SET FLAGS
             with lock:
                 crude_active = True
                 trade_in_progress_crude = True
+                global global_trade_active
+                global_trade_active = True
 
-            if not filled_price:
-                with lock:
-                    crude_active = False
-                    trade_in_progress_crude = False
-                continue
+           
 
             last_executed_signal_crude = signal
             last_trade_time_crude = time.time()

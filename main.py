@@ -1255,6 +1255,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global portfolio_pnl, peak_portfolio, risk_off
     global max_drawdown, last_exit_time_nifty, last_exit_time_crude
     global nifty_active, crude_active
+    global last_exit_reason
     global exit_done
     exit_done = False
 
@@ -1422,7 +1423,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             # 🚨 HARD SL
             if profit < -risk:
-                global last_exit_reason
+                
                 last_exit_reason = "SL"
 
                 print("🛑 HARD SL HIT")
@@ -1772,6 +1773,7 @@ def nifty_loop():
     global last_valid_arrow_nifty
     global global_trade_active
     global nifty_trade_count
+    global last_exit_reason
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1941,7 +1943,7 @@ def nifty_loop():
             print(f"📊 NIFTY trades today: {nifty_trade_count}/3")
 
             # ✅ RESET EXIT REASON
-            global last_exit_reason
+            
             last_exit_reason = None
 
             # ✅ STORE RUNNING TRADE (already added earlier)
@@ -1985,6 +1987,7 @@ def crude_loop():
     global last_valid_arrow_crude
     global global_trade_active
     global crude_trade_count
+    global last_exit_reason
     
     if not ENABLE_CRUDE:
         return
@@ -2150,7 +2153,7 @@ def crude_loop():
             print(f"📊 Crude trades today: {crude_trade_count}/2")
 
             # ✅ RESET EXIT REASON
-            global last_exit_reason
+            
             last_exit_reason = None
 
             # ✅ STORE RUNNING TRADE

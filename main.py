@@ -2077,8 +2077,6 @@ def crude_loop():
             time.sleep(3)
             continue
 
-        if signal != current_trend:
-            continue
 
         if signal == last_executed_signal_crude:
             if time.time() - last_trade_time_crude < 300:

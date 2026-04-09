@@ -1804,6 +1804,7 @@ def nifty_loop():
     global last_reset_day
     global last_logged_trend_nifty, last_logged_arrow_nifty
     global last_no_arrow_log_time
+    global last_arrow_index_nifty
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -2013,6 +2014,7 @@ def crude_loop():
     global crude_trade_count, last_exit_reason
     global last_reset_day
     global last_logged_trend_crude, last_logged_arrow_crude
+    global last_arrow_index_crude
 
     if not ENABLE_CRUDE:
         return

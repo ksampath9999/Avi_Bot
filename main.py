@@ -159,6 +159,8 @@ last_logged_trend_crude = None
 last_logged_arrow_crude = None
 last_arrow_index_nifty = None
 last_arrow_index_crude = None
+history_loaded_crude = False
+history_loaded_nifty = False
 
 def is_nifty_trading_time():
     now = datetime.datetime.now(IST)
@@ -1820,6 +1822,7 @@ def nifty_loop():
     global last_logged_trend_nifty, last_logged_arrow_nifty
     global last_arrow_index_nifty
     global last_no_arrow_log_time
+    global history_loaded_nifty
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1853,6 +1856,18 @@ def nifty_loop():
 
         # 🔥 HALF TREND
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
+        
+        if not history_loaded_nifty and last_valid_arrow_nifty is None:
+            print("🔍 Loading previous arrow from history...")
+
+            for i in range(len(df_ht)-1, -1, -1):
+                _, hist_arrow, _ = halftrend_entry(df_ht.iloc[:i+1])
+                if hist_arrow != "HOLD":
+                    last_valid_arrow_nifty = hist_arrow
+                    print(f"✅ Found previous arrow: {hist_arrow}")
+                    break
+
+            history_loaded_nifty = True
 
         # 🚫 DUPLICATE ARROW FILTER
         if arrow_index is not None and arrow_index == last_arrow_index_nifty:
@@ -1974,6 +1989,7 @@ def crude_loop():
     global last_logged_trend_crude, last_logged_arrow_crude
     global last_arrow_index_crude
     global last_no_arrow_log_time
+    global history_loaded_crude
 
     print("🔥 CRUDE LOOP STARTED")
 
@@ -1996,6 +2012,21 @@ def crude_loop():
 
         # 🔥 HALF TREND
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
+        
+        # =========================
+        # 🔍 LOAD LAST ARROW FROM HISTORY (RUN ONCE)
+        # =========================
+        if not history_loaded_crude and last_valid_arrow_crude is None:
+            print("🔍 Loading previous arrow from history...")
+
+            for i in range(len(df_ht)-1, -1, -1):
+                _, hist_arrow, _ = halftrend_entry(df_ht.iloc[:i+1])
+                if hist_arrow != "HOLD":
+                    last_valid_arrow_crude = hist_arrow
+                    print(f"✅ Found previous arrow: {hist_arrow}")
+                    break
+
+            history_loaded_crude = True
 
         # 🚫 DUPLICATE FILTER
         if arrow_index is not None and arrow_index == last_arrow_index_crude:

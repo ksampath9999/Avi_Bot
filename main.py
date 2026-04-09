@@ -1880,7 +1880,7 @@ def nifty_loop():
 
         last_trend_nifty = current_trend
 
-        prev_trend, arrow_index = halftrend_entry(df_ht.iloc[:-1])
+        prev_trend, _, _ = halftrend_entry(df_ht.iloc[:-1])
         if prev_trend != current_trend:
             continue
 
@@ -2085,7 +2085,7 @@ def crude_loop():
 
         last_trend_crude = current_trend
 
-        prev_trend, arrow_index = halftrend_entry(df_ht.iloc[:-1])
+        prev_trend, _, _ = halftrend_entry(df_ht.iloc[:-1])
         if prev_trend != current_trend:
             continue
 

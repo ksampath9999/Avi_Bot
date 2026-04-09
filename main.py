@@ -1247,7 +1247,8 @@ def update_exit_time(instrument):
 # TRADE MGMT
 # -----------------------------
 def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, market_type):
-
+    
+    global max_profit_reached
     global daily_pnl, trade_count, last_loss_time
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio, risk_off
@@ -1321,7 +1322,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # ===============================
             # 💰 GLOBAL PROFIT PROTECTION
             # ===============================
-            global max_profit_reached
+            
 
             max_profit_reached = max(max_profit_reached, current_pnl)
 
@@ -1505,7 +1506,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             if len(performance_log) > 100:
                 performance_log.pop(0)
                 
-            global max_profit_reached
+            
             max_profit_reached = 0
 
         # 📊 STRATEGY LOG (OUTSIDE LOCK OK)

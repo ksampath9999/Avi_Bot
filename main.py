@@ -218,7 +218,7 @@ def halftrend_entry(df, amplitude=2):
 
     try:
         if df is None or len(df) < 30:
-            return "HOLD", "HOLD"
+            return "HOLD", "HOLD", None
 
         df = df.copy()
 
@@ -1861,7 +1861,13 @@ def nifty_loop():
             print("🔍 Loading previous arrow from history...")
 
             for i in range(len(df_ht)-1, -1, -1):
-                _, hist_arrow, _ = halftrend_entry(df_ht.iloc[:i+1])
+                result = halftrend_entry(df_ht.iloc[:i+1])
+
+                if len(result) == 3:
+                    _, hist_arrow, _ = result
+                else:
+                    _, hist_arrow = result
+                    
                 if hist_arrow != "HOLD":
                     last_valid_arrow_nifty = hist_arrow
                     print(f"✅ Found previous arrow: {hist_arrow}")
@@ -2020,7 +2026,13 @@ def crude_loop():
             print("🔍 Loading previous arrow from history...")
 
             for i in range(len(df_ht)-1, -1, -1):
-                _, hist_arrow, _ = halftrend_entry(df_ht.iloc[:i+1])
+                result = halftrend_entry(df_ht.iloc[:i+1])
+
+                if len(result) == 3:
+                    _, hist_arrow, _ = result
+                else:
+                    _, hist_arrow = result
+                    
                 if hist_arrow != "HOLD":
                     last_valid_arrow_crude = hist_arrow
                     print(f"✅ Found previous arrow: {hist_arrow}")

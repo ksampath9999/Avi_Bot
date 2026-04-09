@@ -232,8 +232,8 @@ def halftrend_entry(df, amplitude=2):
         maxLowPrice = low[0]
         minHighPrice = high[0]
 
-        last_arrow = None
-        last_arrow_index = None   # 🔥 IMPORTANT CHANGE
+        last_arrow = "HOLD"
+        last_arrow_index = None
 
         for i in range(2, len(df)):
 
@@ -261,9 +261,7 @@ def halftrend_entry(df, amplitude=2):
                     nextTrend = 1
                     maxLowPrice = lowPrice
 
-            # =========================
-            # 🔥 STORE LAST VALID ARROW (DO NOT RESET)
-            # =========================
+            # 🔥 ONLY STORE LATEST ARROW
             if trend == 0 and prev_trend == 1:
                 last_arrow = "CALL"
                 last_arrow_index = i
@@ -272,14 +270,9 @@ def halftrend_entry(df, amplitude=2):
                 last_arrow = "PUT"
                 last_arrow_index = i
 
-        # 🔥 CURRENT TREND
         current_trend = "CALL" if trend == 0 else "PUT"
 
-        # 🔥 FINAL ARROW FIX
-        if last_arrow is None:
-            last_arrow = "HOLD"
-
-        return current_trend, last_arrow, last_arrow_index # return index of last arrow
+        return current_trend, last_arrow, last_arrow_index
 
     except Exception as e:
         print("HalfTrend entry error:", e)
@@ -1857,23 +1850,11 @@ def nifty_loop():
         # 🔥 HALF TREND
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
         
-        if not history_loaded_nifty and last_valid_arrow_nifty is None:
-            print("🔍 Loading previous arrow from history...")
-
-            for i in range(len(df_ht)-1, -1, -1):
-                result = halftrend_entry(df_ht.iloc[:i+1])
-
-                if len(result) == 3:
-                    _, hist_arrow, _ = result
-                else:
-                    _, hist_arrow = result
-                    
-                if hist_arrow != "HOLD":
-                    last_valid_arrow_nifty = hist_arrow
-                    print(f"✅ Found previous arrow: {hist_arrow}")
-                    break
-
-            history_loaded_nifty = True
+        # 🔥 DIRECT USE (NO HISTORY LOOP)
+        if last_valid_arrow_nifty is None and last_arrow != "HOLD":
+            last_valid_arrow_nifty = last_arrow
+        
+  
 
         # 🚫 DUPLICATE ARROW FILTER
         if arrow_index is not None and arrow_index == last_arrow_index_nifty:
@@ -2018,27 +1999,10 @@ def crude_loop():
 
         # 🔥 HALF TREND
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
+        # 🔥 DIRECT USE (NO HISTORY LOOP)
+        if last_valid_arrow_crude is None and last_arrow != "HOLD":
+            last_valid_arrow_crude = last_arrow
         
-        # =========================
-        # 🔍 LOAD LAST ARROW FROM HISTORY (RUN ONCE)
-        # =========================
-        if not history_loaded_crude and last_valid_arrow_crude is None:
-            print("🔍 Loading previous arrow from history...")
-
-            for i in range(len(df_ht)-1, -1, -1):
-                result = halftrend_entry(df_ht.iloc[:i+1])
-
-                if len(result) == 3:
-                    _, hist_arrow, _ = result
-                else:
-                    _, hist_arrow = result
-                    
-                if hist_arrow != "HOLD":
-                    last_valid_arrow_crude = hist_arrow
-                    print(f"✅ Found previous arrow: {hist_arrow}")
-                    break
-
-            history_loaded_crude = True
 
         # 🚫 DUPLICATE FILTER
         if arrow_index is not None and arrow_index == last_arrow_index_crude:

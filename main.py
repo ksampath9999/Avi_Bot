@@ -1982,9 +1982,9 @@ def nifty_loop():
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
             if not filled_price:
-            with lock:
-                global_trade_active = False
-            continue
+                with lock:
+                    global_trade_active = False
+                continue
                 
 
             # ✅ SUCCESS

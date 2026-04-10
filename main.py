@@ -214,13 +214,11 @@ def prepare_indicators(df):
 # =========================
 # 🔥 FIXED HALF TREND (PRO)
 # =========================
-def halftrend_entry(df, amplitude=2):
+def halftrend_entry(df, amplitude=2, channel_deviation=2):
 
     try:
-        if df is None or len(df) < 30:
+        if df is None or len(df) < 50:
             return "HOLD", "HOLD", None
-
-        df = df.copy()
 
         high = df["high"].values
         low = df["low"].values
@@ -229,19 +227,20 @@ def halftrend_entry(df, amplitude=2):
         trend = 0
         nextTrend = 0
 
-        maxLowPrice = low[0]
-        minHighPrice = high[0]
+        maxLowPrice = low[1]
+        minHighPrice = high[1]
 
         last_arrow = "HOLD"
         last_arrow_index = None
 
         for i in range(2, len(df)):
 
-            highPrice = max(high[i-amplitude:i+1])
-            lowPrice = min(low[i-amplitude:i+1])
+            # === Pine Logic ===
+            highPrice = high[i - np.argmax(high[i-amplitude:i+1])]
+            lowPrice = low[i - np.argmin(low[i-amplitude:i+1])]
 
-            highma = df["high"].iloc[i-amplitude:i+1].mean()
-            lowma = df["low"].iloc[i-amplitude:i+1].mean()
+            highma = np.mean(high[i-amplitude:i+1])
+            lowma = np.mean(low[i-amplitude:i+1])
 
             prev_trend = trend
 
@@ -261,7 +260,7 @@ def halftrend_entry(df, amplitude=2):
                     nextTrend = 1
                     maxLowPrice = lowPrice
 
-            # 🔥 ONLY STORE LATEST ARROW
+            # === EXACT ARROW MATCH ===
             if trend == 0 and prev_trend == 1:
                 last_arrow = "CALL"
                 last_arrow_index = i
@@ -275,7 +274,7 @@ def halftrend_entry(df, amplitude=2):
         return current_trend, last_arrow, last_arrow_index
 
     except Exception as e:
-        print("HalfTrend entry error:", e)
+        print("HalfTrend error:", e)
         return "HOLD", "HOLD", None
     
 def detect_market_type(df):

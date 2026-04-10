@@ -214,11 +214,16 @@ def prepare_indicators(df):
 # =========================
 # 🔥 FIXED HALF TREND (PRO)
 # =========================
+import numpy as np
+
 def halftrend_entry(df, amplitude=2, channel_deviation=2):
 
     try:
+        # =========================
+        # 🚫 SAFETY CHECK
+        # =========================
         if df is None or len(df) < 50:
-            return "CALL", "HOLD", None
+            return None, None, None
 
         high = df["high"].values
         low = df["low"].values
@@ -233,16 +238,23 @@ def halftrend_entry(df, amplitude=2, channel_deviation=2):
         last_arrow = "HOLD"
         last_arrow_index = None
 
+        # 🔥 STORE TREND HISTORY (CRITICAL FIX)
+        trend_history = []
+
+        # =========================
+        # 🔁 MAIN LOOP
+        # =========================
         for i in range(2, len(df)):
 
-            # === Pine Logic ===
-            highPrice = high[i - np.argmax(high[i-amplitude:i+1])]
-            lowPrice = low[i - np.argmin(low[i-amplitude:i+1])]
+            # === Pine-style extremes ===
+            high_slice = high[i-amplitude:i+1]
+            low_slice = low[i-amplitude:i+1]
 
-            highma = np.mean(high[i-amplitude:i+1])
-            lowma = np.mean(low[i-amplitude:i+1])
+            highPrice = high_slice[np.argmax(high_slice)]
+            lowPrice = low_slice[np.argmin(low_slice)]
 
-            prev_trend = trend
+            highma = np.mean(high_slice)
+            lowma = np.mean(low_slice)
 
             if nextTrend == 1:
                 maxLowPrice = max(lowPrice, maxLowPrice)
@@ -260,15 +272,27 @@ def halftrend_entry(df, amplitude=2, channel_deviation=2):
                     nextTrend = 1
                     maxLowPrice = lowPrice
 
-            # === EXACT ARROW MATCH ===
-            if trend == 0 and prev_trend == 1:
-                last_arrow = "CALL"
-                last_arrow_index = i
+            # 🔥 SAVE TREND STATE
+            trend_history.append(trend)
 
-            elif trend == 1 and prev_trend == 0:
-                last_arrow = "PUT"
-                last_arrow_index = i
+        # =========================
+        # 🔥 DETECT LAST ARROW (CORRECT WAY)
+        # =========================
+        for j in range(len(trend_history)-1, 0, -1):
 
+            if trend_history[j] != trend_history[j-1]:
+
+                if trend_history[j] == 0:
+                    last_arrow = "CALL"
+                else:
+                    last_arrow = "PUT"
+
+                last_arrow_index = j
+                break
+
+        # =========================
+        # 🎯 FINAL TREND
+        # =========================
         current_trend = "CALL" if trend == 0 else "PUT"
 
         return current_trend, last_arrow, last_arrow_index

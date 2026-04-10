@@ -974,6 +974,8 @@ def get_crude_fut_symbol():
 # OPTION SELECTOR
 # -----------------------------
 def find_option(signal, instrument):
+    
+    print("🔍 Entered find_option")
 
     symbol = None
     price = None
@@ -1062,7 +1064,7 @@ def find_option(signal, instrument):
     candidates = []
     valid_candidates = []
 
-    for i in opts:
+    for i in opts[:50]:
 
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue
@@ -1115,7 +1117,7 @@ def find_option(signal, instrument):
         
         
     # 🔁 RELAX RANGE IF NOTHING FOUND
-    for i in opts:
+    for i in opts[:50]:
 
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue
@@ -1162,7 +1164,7 @@ def find_option(signal, instrument):
     best_price = None
     min_diff = float("inf")
 
-    for i in opts:
+    for i in opts[:50]:
 
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue

@@ -1993,6 +1993,17 @@ def crude_loop():
             signal = None
 
         print(f"📊 HT Signal Crude: {signal}")
+        
+        print(f"📊 HT Signal Crude: {signal}")
+
+        # 🔥 DEBUG BLOCK (ADD HERE)
+        print(f"""
+        📊 HALF TREND DEBUG (CRUDE)
+        Trend: {"CALL" if last['trend']==0 else "PUT"}
+        Buy: {last['buy']}
+        Sell: {last['sell']}
+        Close: {last['close']}
+        """)
 
 
         if signal is None:

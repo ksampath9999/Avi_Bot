@@ -39,9 +39,6 @@ trade_in_progress_crude = False
 last_trend_nifty = None
 last_trend_crude = None
 
-last_valid_arrow_nifty = None
-last_valid_arrow_crude = None
-
 global_trade_active = False
 
 # -----------------------------
@@ -214,92 +211,158 @@ def prepare_indicators(df):
 # =========================
 # 🔥 FIXED HALF TREND (PRO)
 # =========================
+import pandas as pd
 import numpy as np
 
-def halftrend_entry(df, amplitude=2, channel_deviation=2):
+# =========================
+# ATR (same as TradingView)
+# =========================
+def ATR(df, period=100):
+    high = df['high']
+    low = df['low']
+    close = df['close']
 
-    try:
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+# =========================
+# FULL HALF TREND (TV MATCH)
+# =========================
+def halftrend_tv(df, amplitude=2, channel_deviation=2):
+
+    df = df.copy()
+
+    df['atr'] = ATR(df, 100)
+    df['atr2'] = df['atr'] / 2
+    df['dev'] = channel_deviation * df['atr2']
+
+    trend = [0]
+    nextTrend = [0]
+
+    maxLowPrice = [df['low'].iloc[0]]
+    minHighPrice = [df['high'].iloc[0]]
+
+    up = [0]
+    down = [0]
+
+    atrHigh = [np.nan]
+    atrLow = [np.nan]
+
+    arrowUp = [np.nan]
+    arrowDown = [np.nan]
+
+    for i in range(1, len(df)):
+
+        high = df['high'].iloc[i]
+        low = df['low'].iloc[i]
+        close = df['close'].iloc[i]
+
+        highPrice = df['high'].iloc[max(0, i-amplitude):i+1].max()
+        lowPrice = df['low'].iloc[max(0, i-amplitude):i+1].min()
+
+        highma = df['high'].iloc[max(0, i-amplitude):i+1].mean()
+        lowma = df['low'].iloc[max(0, i-amplitude):i+1].mean()
+
+        prev_trend = trend[-1]
+        prev_nextTrend = nextTrend[-1]
+
+        prev_maxLow = maxLowPrice[-1]
+        prev_minHigh = minHighPrice[-1]
+
+        curr_trend = prev_trend
+        curr_nextTrend = prev_nextTrend
+
+        curr_maxLow = prev_maxLow
+        curr_minHigh = prev_minHigh
+
+        curr_up = up[-1]
+        curr_down = down[-1]
+
+        curr_arrowUp = np.nan
+        curr_arrowDown = np.nan
+
         # =========================
-        # 🚫 SAFETY CHECK
+        # TREND LOGIC (same as TV)
         # =========================
-        if df is None or len(df) < 50:
-            return None, None, None
+        if prev_nextTrend == 1:
+            curr_maxLow = max(lowPrice, prev_maxLow)
 
-        high = df["high"].values
-        low = df["low"].values
-        close = df["close"].values
+            if highma < curr_maxLow and close < df['low'].iloc[i-1]:
+                curr_trend = 1
+                curr_nextTrend = 0
+                curr_minHigh = highPrice
 
-        trend = 0
-        nextTrend = 0
+        else:
+            curr_minHigh = min(highPrice, prev_minHigh)
 
-        maxLowPrice = low[1]
-        minHighPrice = high[1]
-
-        last_arrow = "HOLD"
-        last_arrow_index = None
-
-        # 🔥 STORE TREND HISTORY (CRITICAL FIX)
-        trend_history = []
+            if lowma > curr_minHigh and close > df['high'].iloc[i-1]:
+                curr_trend = 0
+                curr_nextTrend = 1
+                curr_maxLow = lowPrice
 
         # =========================
-        # 🔁 MAIN LOOP
+        # UP / DOWN + ARROWS
         # =========================
-        for i in range(2, len(df)):
+        if curr_trend == 0:
 
-            # === Pine-style extremes ===
-            high_slice = high[i-amplitude:i+1]
-            low_slice = low[i-amplitude:i+1]
-
-            highPrice = high_slice[np.argmax(high_slice)]
-            lowPrice = low_slice[np.argmin(low_slice)]
-
-            highma = np.mean(high_slice)
-            lowma = np.mean(low_slice)
-
-            if nextTrend == 1:
-                maxLowPrice = max(lowPrice, maxLowPrice)
-
-                if highma < maxLowPrice and close[i] < low[i-1]:
-                    trend = 1
-                    nextTrend = 0
-                    minHighPrice = highPrice
-
+            if prev_trend == 1:
+                curr_up = down[-1]
+                curr_arrowUp = curr_up - df['atr2'].iloc[i]
             else:
-                minHighPrice = min(highPrice, minHighPrice)
+                curr_up = max(curr_maxLow, up[-1])
 
-                if lowma > minHighPrice and close[i] > high[i-1]:
-                    trend = 0
-                    nextTrend = 1
-                    maxLowPrice = lowPrice
+            curr_atrHigh = curr_up + df['dev'].iloc[i]
+            curr_atrLow = curr_up - df['dev'].iloc[i]
 
-            # 🔥 SAVE TREND STATE
-            trend_history.append(trend)
+        else:
 
-        # =========================
-        # 🔥 DETECT LAST ARROW (CORRECT WAY)
-        # =========================
-        for j in range(len(trend_history)-1, 0, -1):
+            if prev_trend == 0:
+                curr_down = up[-1]
+                curr_arrowDown = curr_down + df['atr2'].iloc[i]
+            else:
+                curr_down = min(curr_minHigh, down[-1])
 
-            if trend_history[j] != trend_history[j-1]:
-
-                if trend_history[j] == 0:
-                    last_arrow = "CALL"
-                else:
-                    last_arrow = "PUT"
-
-                last_arrow_index = j
-                break
+            curr_atrHigh = curr_down + df['dev'].iloc[i]
+            curr_atrLow = curr_down - df['dev'].iloc[i]
 
         # =========================
-        # 🎯 FINAL TREND
+        # STORE
         # =========================
-        current_trend = "CALL" if trend == 0 else "PUT"
+        trend.append(curr_trend)
+        nextTrend.append(curr_nextTrend)
 
-        return current_trend, last_arrow, last_arrow_index
+        maxLowPrice.append(curr_maxLow)
+        minHighPrice.append(curr_minHigh)
 
-    except Exception as e:
-        print("HalfTrend error:", e)
-        return None, None, None
+        up.append(curr_up)
+        down.append(curr_down)
+
+        atrHigh.append(curr_atrHigh)
+        atrLow.append(curr_atrLow)
+
+        arrowUp.append(curr_arrowUp)
+        arrowDown.append(curr_arrowDown)
+
+    # =========================
+    # FINAL OUTPUT
+    # =========================
+    df['trend'] = trend
+    df['ht'] = np.where(df['trend'] == 0, up, down)
+    df['atrHigh'] = atrHigh
+    df['atrLow'] = atrLow
+    df['arrowUp'] = arrowUp
+    df['arrowDown'] = arrowDown
+
+    # 🔥 TRUE TV SIGNALS
+    df['buy'] = (~pd.isna(df['arrowUp'])) & (df['trend'] == 0) & (df['trend'].shift(1) == 1)
+    df['sell'] = (~pd.isna(df['arrowDown'])) & (df['trend'] == 1) & (df['trend'].shift(1) == 0)
+
+    return df
     
 def detect_market_type(df):
 
@@ -1019,7 +1082,6 @@ def find_option(signal, instrument):
         if p is None or p <= 0:
             continue
             
-        p = opt["last_price"]
 
         # 🎯 PREMIUM FILTER (STRICT)
         if instrument == "NIFTY":
@@ -1030,7 +1092,7 @@ def find_option(signal, instrument):
                 continue
 
         # ✅ ONLY ADD FILTERED OPTIONS
-        valid_candidates.append(opt)
+        valid_candidates.append(i)
 
         trade_value = p * lot_size
 
@@ -1435,9 +1497,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 else:
                     sl = min(sl, peak + (atr_value * 0.8))
 
-            # ===============================
-            # 🔄 HALF TREND EXIT (CONFIRMED)
-            # ===============================
+            # 🔥 HALF TREND EXIT (NEW)
             try:
                 df_ht_exit = get_cached_data(
                     CRUDE_TOKEN if instrument == "CRUDE" else config.NIFTY_TOKEN,
@@ -1445,25 +1505,24 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     120
                 )
 
-                ht1 = halftrend_trend(df_ht_exit.iloc[:-1])
-                ht2 = halftrend_trend(df_ht_exit)
+                ht_df_exit = halftrend_tv(df_ht_exit)
 
-                if ht1 == ht2:
-                    if signal == "CALL" and ht2 == "PUT":
-                        if not exit_done:
-                            exit_position(symbol, remaining_qty, exchange)
-                            exit_done = True
-                        print("🔄 Confirmed HalfTrend Exit")
-                        pnl = current_pnl
-                        break
+                last_exit = ht_df_exit.iloc[-2]
 
-                    if signal == "PUT" and ht2 == "CALL":
-                        if not exit_done:
-                            exit_position(symbol, remaining_qty, exchange)
-                            exit_done = True
-                        print("🔄 Confirmed HalfTrend Exit")
-                        pnl = current_pnl
-                        break
+                exit_signal = None
+                if last_exit['buy']:
+                    exit_signal = "CALL"
+                elif last_exit['sell']:
+                    exit_signal = "PUT"
+
+                if exit_signal and exit_signal != signal:
+                    if not exit_done:
+                        exit_position(symbol, remaining_qty, exchange)
+                        exit_done = True
+
+                    print("🔄 HalfTrend Exit Triggered")
+                    pnl = current_pnl
+                    break
 
             except Exception as e:
                 print("HT exit error:", e)
@@ -1770,60 +1829,6 @@ def ai_trade_filter(token, signal, df):
 
     return True
     
-    
-def halftrend_trend(df, amplitude=2):
-
-    try:
-        if df is None or len(df) < 20:
-            return "HOLD"
-
-        df = df.copy()
-
-        high = df["high"].values
-        low = df["low"].values
-        close = df["close"].values
-
-        trend = 0
-        nextTrend = 0
-
-        maxLowPrice = low[0]
-        minHighPrice = high[0]
-
-        for i in range(2, len(df)):
-
-            highPrice = max(high[i-amplitude:i+1])
-            lowPrice = min(low[i-amplitude:i+1])
-
-            highma = df["high"].iloc[i-amplitude:i+1].mean()
-            lowma = df["low"].iloc[i-amplitude:i+1].mean()
-
-            if nextTrend == 1:
-                maxLowPrice = max(lowPrice, maxLowPrice)
-
-                if highma < maxLowPrice and close[i] < low[i-1]:
-                    trend = 1
-                    nextTrend = 0
-                    minHighPrice = highPrice
-
-            else:
-                minHighPrice = min(highPrice, minHighPrice)
-
-                if lowma > minHighPrice and close[i] > high[i-1]:
-                    trend = 0
-                    nextTrend = 1
-                    maxLowPrice = lowPrice
-
-        # 🔥 STABLE TREND OUTPUT (LESS NOISE)
-        if len(df) >= 3:
-            if trend == 0:
-                return "CALL"
-            elif trend == 1:
-                return "PUT"
-
-        return "HOLD"
-
-    except:
-        return "HOLD"
  
  
 # -----------------------------
@@ -1836,8 +1841,7 @@ def halftrend_trend(df, amplitude=2):
 def nifty_loop():
 
     global last_running_signal, current_symbol, current_qty, current_exchange
-    global last_executed_signal_nifty, last_valid_arrow_nifty
-    global last_arrow_index_nifty, global_trade_active
+    global last_executed_signal_nifty, last_arrow_index_nifty, global_trade_active
 
     print("🔥 NIFTY LOOP STARTED")
 
@@ -1858,35 +1862,30 @@ def nifty_loop():
 
         df = prepare_indicators(df)
 
-        # 🔥 HALF TREND
-        current_trend, last_arrow, arrow_index = halftrend_entry(df_ht.iloc[:-1])
+        # 🔥 FULL TV HALF TREND
+        ht_df = halftrend_tv(df_ht)
 
-        if current_trend is None:
+        # ⚠️ USE CLOSED CANDLE ONLY
+        last = ht_df.iloc[-2]
+
+        if last['buy']:
+            signal = "CALL"
+        elif last['sell']:
+            signal = "PUT"
+        else:
+            signal = None
+
+        print(f"📊 HT Signal: {signal}")
+
+        if signal is None:
             time.sleep(2)
             continue
 
-        # 🚫 DUPLICATE ARROW FILTER
-        if arrow_index is not None and arrow_index == last_arrow_index_nifty:
-            last_arrow = "HOLD"
-        elif arrow_index is not None:
-            last_arrow_index_nifty = arrow_index
+        # 🔥 DEFINE TREND FROM HALF TREND
+        current_trend = "CALL" if last['trend'] == 0 else "PUT"
 
-        # 🔥 UPDATE ARROW FIRST
-        if last_arrow != "HOLD":
-            print(f"🟢 New Arrow Detected: {last_arrow}")
-            last_valid_arrow_nifty = last_arrow
-            last_executed_signal_nifty = None
-
-        print(f"🧠 Active Arrow Nifty: {last_valid_arrow_nifty}")
-
-        # 🎯 FINAL SIGNAL (ARROW DOMINANT)
-        if last_valid_arrow_nifty:
-            signal = last_valid_arrow_nifty
-        else:
-            print("⚡ No arrow — using trend fallback")
-            signal = current_trend
-
-        if signal == "HOLD":
+        if signal != current_trend:
+            print(f"⚠️ Signal {signal} against trend {current_trend} — skipping")
             continue
 
         # 🚫 BLOCK DUPLICATE
@@ -1896,7 +1895,7 @@ def nifty_loop():
         # 🔁 EXIT ON SIGNAL FLIP
         if global_trade_active and last_running_signal and signal != last_running_signal:
 
-            print(f"🔁 Signal Flip: {last_running_signal} → {signal}")
+            print(f"🔁 Flip: {last_running_signal} → {signal}")
 
             exit_position(current_symbol, current_qty, current_exchange)
 
@@ -1909,10 +1908,14 @@ def nifty_loop():
             continue
 
         try:
-
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
             if not symbol:
+                continue
+                
+            # 🚫 SAFETY CHECK (ADD HERE)
+            if global_trade_active:
+                print("🚫 Nifty Trade already active — skipping")
                 continue
 
             with lock:
@@ -1921,13 +1924,19 @@ def nifty_loop():
                 global_trade_active = True
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
+            
+            threading.Thread(
+                target=run_trade_wrapper,
+                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, 0, "TREND"),
+                daemon=True
+            ).start()
 
             if not filled_price:
                 with lock:
                     global_trade_active = False
                 continue
 
-            print(f"🎯 FINAL SIGNAL → {signal}")
+            print(f"🎯 TRADE → {signal}")
 
             last_running_signal = signal
             last_executed_signal_nifty = signal
@@ -1949,8 +1958,7 @@ def nifty_loop():
 def crude_loop():
 
     global last_running_signal, current_symbol, current_qty, current_exchange
-    global last_executed_signal_crude, last_valid_arrow_crude
-    global last_arrow_index_crude, global_trade_active
+    global last_executed_signal_crude, last_arrow_index_crude, global_trade_active
 
     print("🔥 CRUDE LOOP STARTED")
 
@@ -1971,35 +1979,31 @@ def crude_loop():
 
         df = prepare_indicators(df)
 
-        # 🔥 HALF TREND
-        current_trend, last_arrow, arrow_index = halftrend_entry(df_ht.iloc[:-1])
+        # 🔥 FULL TV HALF TREND
+        ht_df = halftrend_tv(df_ht)
 
-        if current_trend is None:
+        # ⚠️ USE CLOSED CANDLE ONLY
+        last = ht_df.iloc[-2]
+
+        if last['buy']:
+            signal = "CALL"
+        elif last['sell']:
+            signal = "PUT"
+        else:
+            signal = None
+
+        print(f"📊 HT Signal Crude: {signal}")
+
+
+        if signal is None:
             time.sleep(2)
             continue
 
-        # 🚫 DUPLICATE ARROW FILTER
-        if arrow_index is not None and arrow_index == last_arrow_index_crude:
-            last_arrow = "HOLD"
-        elif arrow_index is not None:
-            last_arrow_index_crude = arrow_index
+        # 🔥 DEFINE TREND FROM HALF TREND
+        current_trend = "CALL" if last['trend'] == 0 else "PUT"
 
-        # 🔥 UPDATE ARROW FIRST
-        if last_arrow != "HOLD":
-            print(f"🟢 New Arrow Detected: {last_arrow}")
-            last_valid_arrow_crude = last_arrow
-            last_executed_signal_crude = None
-
-        print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
-
-        # 🎯 FINAL SIGNAL (ARROW DOMINANT)
-        if last_valid_arrow_crude:
-            signal = last_valid_arrow_crude
-        else:
-            print("⚡ No arrow — using trend fallback")
-            signal = current_trend
-
-        if signal == "HOLD":
+        if signal != current_trend:
+            print(f"⚠️ Signal {signal} against trend {current_trend} — skipping")
             continue
 
         # 🚫 BLOCK DUPLICATE
@@ -2009,7 +2013,7 @@ def crude_loop():
         # 🔁 EXIT ON SIGNAL FLIP
         if global_trade_active and last_running_signal and signal != last_running_signal:
 
-            print(f"🔁 Signal Flip: {last_running_signal} → {signal}")
+            print(f"🔁 Flip: {last_running_signal} → {signal}")
 
             exit_position(current_symbol, current_qty, current_exchange)
 
@@ -2022,13 +2026,16 @@ def crude_loop():
             continue
 
         try:
-
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
             if not symbol:
                 continue
+                
+            # 🚫 SAFETY CHECK (ADD HERE)
+            if global_trade_active:
+                print("🚫 Crude Trade already active — skipping")
+                continue
 
-            # 🚫 FINAL PRICE FILTER
             if not (30 <= price <= 100):
                 print(f"🚫 Price out of range: {price}")
                 continue
@@ -2039,13 +2046,19 @@ def crude_loop():
                 global_trade_active = True
 
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
+            
+            threading.Thread(
+                target=run_trade_wrapper,
+                args=(symbol, filled_price, lot, exchange, "CRUDE", signal, 0, "TREND"),
+                daemon=True
+            ).start()
 
             if not filled_price:
                 with lock:
                     global_trade_active = False
                 continue
 
-            print(f"🎯 FINAL SIGNAL → {signal}")
+            print(f"🎯 TRADE → {signal}")
 
             last_running_signal = signal
             last_executed_signal_crude = signal

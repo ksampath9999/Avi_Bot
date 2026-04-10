@@ -1066,7 +1066,7 @@ def find_option(signal, instrument):
     candidates = []
     valid_candidates = []
 
-    for i in opts[:50]:
+    for i in opts[]:
 
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue
@@ -1119,7 +1119,7 @@ def find_option(signal, instrument):
         
         
     # 🔁 RELAX RANGE IF NOTHING FOUND
-    for i in opts[:50]:
+    for i in opts[]:
 
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue
@@ -1166,7 +1166,7 @@ def find_option(signal, instrument):
     best_price = None
     min_diff = float("inf")
 
-    for i in opts[:50]:
+    for i in opts[]:
 
         if i["expiry"] != expiry or i["instrument_type"] != opt_type:
             continue

@@ -1848,53 +1848,31 @@ def nifty_loop():
         df = prepare_indicators(df)
 
         # 🔥 HALF TREND
-        # 🔥 USE ONLY CLOSED CANDLES (CRITICAL FIX)
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht.iloc[:-1])
-        
-        # =========================
-        # 🔥 INITIAL ARROW FIX (CRITICAL)
-        # =========================
-        if last_arrow != "HOLD":
-            last_valid_arrow_nifty = last_arrow
 
-        elif last_valid_arrow_nifty is None:
-            # 🔥 FIRST TIME → USE TREND
-            print("⚡ No arrow yet — using trend as initial signal")
-            last_valid_arrow_nifty = current_trend
-        
-  
-
-        # 🚫 DUPLICATE ARROW FILTER
+        # 🚫 DUPLICATE FILTER
         if arrow_index is not None and arrow_index == last_arrow_index_nifty:
             last_arrow = "HOLD"
         elif arrow_index is not None:
             last_arrow_index_nifty = arrow_index
 
+        # =========================
+        # 🔥 UPDATE ARROW FIRST (MOVE HERE)
+        # =========================
         if last_arrow != "HOLD":
+            print(f"🟢 New Arrow Detected: {last_arrow}")
             last_valid_arrow_nifty = last_arrow
-            last_executed_signal_nifty = None
+            last_executed_signal_nifty = None   # 🔥 IMPORTANT RESET
 
-        now_ts = time.time()
-
-        if now_ts - last_no_arrow_log_time > 40:
-            print(f"🧠 Active Arrow Nifty: {last_valid_arrow_nifty}")
-            last_no_arrow_log_time = now_ts
-
-        # 🔄 TREND FLIP RESET (NO ARROW RESET)
-        if last_trend_nifty and current_trend != last_trend_nifty:
-            last_executed_signal_nifty = None
-            last_trade_time_nifty = 0
-
-        last_trend_nifty = current_trend
+        print(f"🧠 Active Arrow Nifty: {last_valid_arrow_nifty}")
 
         # =========================
-        # 🎯 FINAL SIGNAL (FIXED)
+        # 🎯 FINAL SIGNAL
         # =========================
         if last_arrow != "HOLD":
             signal = last_arrow
 
         elif last_valid_arrow_nifty and current_trend != last_valid_arrow_nifty:
-            print("⚡ Trend flip — switching to trend")
             signal = current_trend
             last_valid_arrow_nifty = current_trend
 
@@ -2014,20 +1992,7 @@ def crude_loop():
         df = prepare_indicators(df)
 
         # 🔥 HALF TREND
-        # 🔥 USE ONLY CLOSED CANDLES (CRITICAL FIX)
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht.iloc[:-1])
-        
-        # =========================
-        # 🔥 INITIAL ARROW FIX (CRITICAL)
-        # =========================
-        if last_arrow != "HOLD":
-            last_valid_arrow_crude = last_arrow
-
-        elif last_valid_arrow_crude is None:
-            # 🔥 FIRST TIME → USE TREND
-            print("⚡ No arrow yet — using trend as initial signal")
-            last_valid_arrow_crude = current_trend
-        
 
         # 🚫 DUPLICATE FILTER
         if arrow_index is not None and arrow_index == last_arrow_index_crude:
@@ -2035,31 +2000,23 @@ def crude_loop():
         elif arrow_index is not None:
             last_arrow_index_crude = arrow_index
 
+        # =========================
+        # 🔥 UPDATE ARROW FIRST (MOVE HERE)
+        # =========================
         if last_arrow != "HOLD":
+            print(f"🟢 New Arrow Detected: {last_arrow}")
             last_valid_arrow_crude = last_arrow
-            last_executed_signal_crude = None   # 🔥 RESET EXECUTION
+            last_executed_signal_crude = None   # 🔥 IMPORTANT RESET
 
-        now_ts = time.time()
-
-        if now_ts - last_no_arrow_log_time > 40:
-            print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
-            last_no_arrow_log_time = now_ts
-
-        # 🔄 TREND RESET
-        if last_trend_crude and current_trend != last_trend_crude:
-            last_executed_signal_crude = None
-            last_trade_time_crude = 0
-
-        last_trend_crude = current_trend
+        print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
 
         # =========================
-        # 🎯 FINAL SIGNAL (CRITICAL FIX)
+        # 🎯 FINAL SIGNAL
         # =========================
         if last_arrow != "HOLD":
             signal = last_arrow
 
         elif last_valid_arrow_crude and current_trend != last_valid_arrow_crude:
-            print("⚡ Trend flip detected — switching to trend")
             signal = current_trend
             last_valid_arrow_crude = current_trend
 

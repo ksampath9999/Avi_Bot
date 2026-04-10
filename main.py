@@ -1883,7 +1883,7 @@ def nifty_loop():
             last_valid_arrow_nifty = last_arrow
             last_executed_signal_nifty = None   # 🔥 IMPORTANT RESET
 
-        print(f"🧠 Active Arrow Nifty: {last_valid_arrow_nifty}")
+       
 
         # =========================
         # 🎯 FINAL SIGNAL (STRONG FIX)
@@ -2053,7 +2053,7 @@ def crude_loop():
             last_valid_arrow_crude = last_arrow
             last_executed_signal_crude = None   # 🔥 IMPORTANT RESET
 
-        print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
+
 
         # =========================
         # 🎯 FINAL SIGNAL (STRONG FIX)

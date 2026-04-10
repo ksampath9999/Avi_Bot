@@ -158,6 +158,8 @@ last_arrow_index_nifty = None
 last_arrow_index_crude = None
 history_loaded_crude = False
 history_loaded_nifty = False
+last_weak_log_time = 0
+last_status = None
 
 def is_nifty_trading_time():
     now = datetime.datetime.now(IST)
@@ -1895,7 +1897,16 @@ def nifty_loop():
                 print(f"⚡ Trend Trade: {signal}")
 
             else:
-                print("⚠️ Weak momentum — skipping")
+                # 🔥 RATE-LIMITED LOGGING
+                global last_weak_log_time, last_status
+
+                status = "WEAK_NIFTY"
+
+                if last_status != status or time.time() - last_weak_log_time > 30:
+                    print("⚠️ Weak momentum — skipping (NIFTY)")
+                    last_status = status
+                    last_weak_log_time = time.time()
+
                 time.sleep(2)
                 continue
             
@@ -2032,7 +2043,16 @@ def crude_loop():
                 print(f"⚡ Trend Trade: {signal}")
 
             else:
-                print("⚠️ Weak momentum — skipping")
+                # 🔥 RATE-LIMITED LOGGING
+                global last_weak_log_time, last_status
+
+                status = "WEAK_CRUDE"
+
+                if last_status != status or time.time() - last_weak_log_time > 30:
+                    print("⚠️ Weak momentum — skipping (CRUDE)")
+                    last_status = status
+                    last_weak_log_time = time.time()
+
                 time.sleep(2)
                 continue
             

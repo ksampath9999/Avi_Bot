@@ -1879,23 +1879,23 @@ def nifty_loop():
 
         if signal is None:
 
-        # 🔥 TREND FALLBACK
-        trend_signal = "CALL" if last['trend'] == 0 else "PUT"
+            # 🔥 TREND FALLBACK
+            trend_signal = "CALL" if last['trend'] == 0 else "PUT"
 
-        # 🔥 LIGHT MOMENTUM FILTER (BEST)
-        prev_close = df.iloc[-2]['close']
-        curr_close = df.iloc[-1]['close']
+            # 🔥 LIGHT MOMENTUM FILTER (BEST)
+            prev_close = df.iloc[-2]['close']
+            curr_close = df.iloc[-1]['close']
 
-        if (trend_signal == "CALL" and curr_close > prev_close) or \
-           (trend_signal == "PUT" and curr_close < prev_close):
+            if (trend_signal == "CALL" and curr_close > prev_close) or \
+               (trend_signal == "PUT" and curr_close < prev_close):
 
-            signal = trend_signal
-            print(f"⚡ Trend Trade: {signal}")
+                signal = trend_signal
+                print(f"⚡ Trend Trade: {signal}")
 
-        else:
-            print("⚠️ Weak momentum — skipping")
-            time.sleep(2)
-            continue
+            else:
+                print("⚠️ Weak momentum — skipping")
+                time.sleep(2)
+                continue
             
         # 🚫 Avoid duplicate trend trades
         if signal == last_executed_signal_nifty:
@@ -2016,23 +2016,23 @@ def crude_loop():
 
         if signal is None:
 
-        # 🔥 TREND FALLBACK
-        trend_signal = "CALL" if last['trend'] == 0 else "PUT"
+            # 🔥 TREND FALLBACK
+            trend_signal = "CALL" if last['trend'] == 0 else "PUT"
 
-        # 🔥 LIGHT MOMENTUM FILTER (BEST)
-        prev_close = df.iloc[-2]['close']
-        curr_close = df.iloc[-1]['close']
+            # 🔥 LIGHT MOMENTUM FILTER (BEST)
+            prev_close = df.iloc[-2]['close']
+            curr_close = df.iloc[-1]['close']
 
-        if (trend_signal == "CALL" and curr_close > prev_close) or \
-           (trend_signal == "PUT" and curr_close < prev_close):
+            if (trend_signal == "CALL" and curr_close > prev_close) or \
+               (trend_signal == "PUT" and curr_close < prev_close):
 
-            signal = trend_signal
-            print(f"⚡ Trend Trade: {signal}")
+                signal = trend_signal
+                print(f"⚡ Trend Trade: {signal}")
 
-        else:
-            print("⚠️ Weak momentum — skipping")
-            time.sleep(2)
-            continue
+            else:
+                print("⚠️ Weak momentum — skipping")
+                time.sleep(2)
+                continue
             
         # 🚫 Avoid duplicate trend trades
         if signal == last_executed_signal_crude:

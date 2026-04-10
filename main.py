@@ -1877,7 +1877,7 @@ def nifty_loop():
 
         print(f"📊 HT Signal: {signal}")
 
-         if signal is None:
+        if signal is None:
 
             # 🔥 FALLBACK TO TREND
             trend_signal = "CALL" if last['trend'] == 0 else "PUT"

@@ -1866,12 +1866,14 @@ def nifty_loop():
         print(f"🧠 Active Arrow Nifty: {last_valid_arrow_nifty}")
 
         # =========================
-        # 🎯 FINAL SIGNAL
+        # 🎯 FINAL SIGNAL (STRONG FIX)
         # =========================
+
         if last_arrow != "HOLD":
             signal = last_arrow
 
         elif last_valid_arrow_nifty and current_trend != last_valid_arrow_nifty:
+            print("⚡ Trend flip — switching to trend")
             signal = current_trend
             last_valid_arrow_nifty = current_trend
 
@@ -1879,9 +1881,19 @@ def nifty_loop():
             signal = last_valid_arrow_nifty
 
         else:
+            # 🔥 NEVER RETURN HOLD
+            print("⚡ No arrow — using trend fallback")
             signal = current_trend
 
         print(f"🎯 FINAL SIGNAL → {signal}")
+        
+        # =========================
+        # 🚫 BLOCK HOLD SIGNAL (CRITICAL FIX)
+        # =========================
+        if signal == "HOLD":
+            print("⏳ HOLD signal — skipping trade")
+            time.sleep(2)
+            continue
 
         # =========================
         # 🔥 FORCE TREND ALIGNMENT (ADD HERE)
@@ -2010,12 +2022,14 @@ def crude_loop():
         print(f"🧠 Active Arrow Crude: {last_valid_arrow_crude}")
 
         # =========================
-        # 🎯 FINAL SIGNAL
+        # 🎯 FINAL SIGNAL (STRONG FIX)
         # =========================
+
         if last_arrow != "HOLD":
             signal = last_arrow
 
         elif last_valid_arrow_crude and current_trend != last_valid_arrow_crude:
+            print("⚡ Trend flip — switching to trend")
             signal = current_trend
             last_valid_arrow_crude = current_trend
 
@@ -2023,9 +2037,22 @@ def crude_loop():
             signal = last_valid_arrow_crude
 
         else:
+            # 🔥 NEVER RETURN HOLD
+            print("⚡ No arrow — using trend fallback")
             signal = current_trend
             
         print(f"🎯 FINAL SIGNAL → {signal}")
+        
+        
+        # =========================
+        # 🚫 BLOCK HOLD SIGNAL (CRITICAL FIX)
+        # =========================
+        if signal == "HOLD":
+            print("⏳ HOLD signal — skipping trade")
+            time.sleep(2)
+            continue
+        
+        
 
         # =========================
         # 🔥 FORCE TREND ALIGNMENT (ADD HERE)

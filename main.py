@@ -1848,7 +1848,8 @@ def nifty_loop():
         df = prepare_indicators(df)
 
         # 🔥 HALF TREND
-        current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
+        # 🔥 USE ONLY CLOSED CANDLES (CRITICAL FIX)
+        current_trend, last_arrow, arrow_index = halftrend_entry(df_ht.iloc[:-1])
         
         # =========================
         # 🔥 INITIAL ARROW FIX (CRITICAL)
@@ -1904,6 +1905,14 @@ def nifty_loop():
             signal = current_trend
 
         print(f"🎯 FINAL SIGNAL → {signal}")
+
+        # =========================
+        # 🔥 FORCE TREND ALIGNMENT (ADD HERE)
+        # =========================
+        if last_arrow == "HOLD" and signal != current_trend:
+            print("⚠️ Aligning signal with trend (no arrow yet)")
+            signal = current_trend
+            last_valid_arrow_nifty = current_trend
 
         # 🚫 DUPLICATE TRADE BLOCK
         if signal == last_executed_signal_nifty:
@@ -2005,7 +2014,8 @@ def crude_loop():
         df = prepare_indicators(df)
 
         # 🔥 HALF TREND
-        current_trend, last_arrow, arrow_index = halftrend_entry(df_ht)
+        # 🔥 USE ONLY CLOSED CANDLES (CRITICAL FIX)
+        current_trend, last_arrow, arrow_index = halftrend_entry(df_ht.iloc[:-1])
         
         # =========================
         # 🔥 INITIAL ARROW FIX (CRITICAL)
@@ -2058,6 +2068,16 @@ def crude_loop():
 
         else:
             signal = current_trend
+            
+        print(f"🎯 FINAL SIGNAL → {signal}")
+
+        # =========================
+        # 🔥 FORCE TREND ALIGNMENT (ADD HERE)
+        # =========================
+        if last_arrow == "HOLD" and signal != current_trend:
+            print("⚠️ Aligning signal with trend (no arrow yet)")
+            signal = current_trend
+            last_valid_arrow_crude = current_trend
 
 
         # 🚫 DUPLICATE

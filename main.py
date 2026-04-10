@@ -1877,8 +1877,23 @@ def nifty_loop():
 
         print(f"📊 HT Signal: {signal}")
 
-        if signal is None:
-            time.sleep(2)
+         if signal is None:
+
+            # 🔥 FALLBACK TO TREND
+            trend_signal = "CALL" if last['trend'] == 0 else "PUT"
+
+            # 🔥 PRO FILTER (CONFIRM ENTRY)
+            if confirm_entry(config.NIFTY_TOKEN, trend_signal, df):
+                signal = trend_signal
+                print(f"⚡ Confirmed Trend Trade: {signal}")
+            else:
+                print("⚠️ Weak trend — skipping")
+                time.sleep(2)
+                continue
+            
+        # 🚫 Avoid duplicate trend trades
+        if signal == last_executed_signal_nifty:
+            print("🚫 Same trend already traded — skipping")
             continue
 
         # 🔥 DEFINE TREND FROM HALF TREND
@@ -1992,22 +2007,24 @@ def crude_loop():
         else:
             signal = None
 
-        print(f"📊 HT Signal Crude: {signal}")
-        
-        print(f"📊 HT Signal Crude: {signal}")
-
-        # 🔥 DEBUG BLOCK (ADD HERE)
-        print(f"""
-        📊 HALF TREND DEBUG (CRUDE)
-        Trend: {"CALL" if last['trend']==0 else "PUT"}
-        Buy: {last['buy']}
-        Sell: {last['sell']}
-        Close: {last['close']}
-        """)
-
 
         if signal is None:
-            time.sleep(2)
+
+            # 🔥 FALLBACK TO TREND
+            trend_signal = "CALL" if last['trend'] == 0 else "PUT"
+
+            # 🔥 PRO FILTER (CONFIRM ENTRY)
+            if confirm_entry(CRUDE_TOKEN, trend_signal, df):
+                signal = trend_signal
+                print(f"⚡ Confirmed Trend Trade: {signal}")
+            else:
+                print("⚠️ Weak trend — skipping")
+                time.sleep(2)
+                continue
+            
+        # 🚫 Avoid duplicate trend trades
+        if signal == last_executed_signal_crude:
+            print("🚫 Same trend already traded — skipping")
             continue
 
         # 🔥 DEFINE TREND FROM HALF TREND

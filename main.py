@@ -218,7 +218,7 @@ def halftrend_entry(df, amplitude=2, channel_deviation=2):
 
     try:
         if df is None or len(df) < 50:
-            return "HOLD", "HOLD", None
+            return "CALL", "HOLD", None
 
         high = df["high"].values
         low = df["low"].values
@@ -275,7 +275,7 @@ def halftrend_entry(df, amplitude=2, channel_deviation=2):
 
     except Exception as e:
         print("HalfTrend error:", e)
-        return "HOLD", "HOLD", None
+        return None, None, None
     
 def detect_market_type(df):
 
@@ -1848,6 +1848,26 @@ def nifty_loop():
 
         # 🔥 HALF TREND
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht.iloc[:-1])
+        
+        if current_trend is None:
+            print("⚠️ HalfTrend failed — skipping")
+            time.sleep(2)
+            continue
+        
+        # =========================
+        # 🚫 HANDLE HT FAILURE SAFELY
+        # =========================
+        if current_trend is None:
+            print("⚠️ HalfTrend failed — skipping cycle")
+            time.sleep(2)
+            continue
+        
+        # =========================
+        # 🔥 NEVER ALLOW HOLD TREND
+        # =========================
+        if current_trend == "HOLD":
+            print("⚠️ Invalid trend — forcing CALL fallback")
+            current_trend = "CALL"
 
         # 🚫 DUPLICATE FILTER
         if arrow_index is not None and arrow_index == last_arrow_index_nifty:
@@ -1886,6 +1906,13 @@ def nifty_loop():
             signal = current_trend
 
         print(f"🎯 FINAL SIGNAL → {signal}")
+        
+        # =========================
+        # 🔥 FINAL SAFETY (NO HOLD)
+        # =========================
+        if signal == "HOLD":
+            print("⚠️ HOLD detected — forcing trend")
+            signal = current_trend
         
         # =========================
         # 🚫 BLOCK HOLD SIGNAL (CRITICAL FIX)
@@ -2004,6 +2031,13 @@ def crude_loop():
 
         # 🔥 HALF TREND
         current_trend, last_arrow, arrow_index = halftrend_entry(df_ht.iloc[:-1])
+        
+        # =========================
+        # 🔥 NEVER ALLOW HOLD TREND
+        # =========================
+        if current_trend == "HOLD":
+            print("⚠️ Invalid trend — forcing CALL fallback")
+            current_trend = "CALL"
 
         # 🚫 DUPLICATE FILTER
         if arrow_index is not None and arrow_index == last_arrow_index_crude:
@@ -2042,6 +2076,13 @@ def crude_loop():
             signal = current_trend
             
         print(f"🎯 FINAL SIGNAL → {signal}")
+        
+        # =========================
+        # 🔥 FINAL SAFETY (NO HOLD)
+        # =========================
+        if signal == "HOLD":
+            print("⚠️ HOLD detected — forcing trend")
+            signal = current_trend
         
         
         # =========================

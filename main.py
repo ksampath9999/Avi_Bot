@@ -10,7 +10,7 @@ from telegram_bot import send_message
 import csv
 import os
 import json
-
+from datetime import datetime, timedelta
 
 if not os.path.exists("trade_log.csv"):
     with open("trade_log.csv", "w") as f:
@@ -706,7 +706,7 @@ def can_trade():
 
 def pivot_signal(token):
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
         df = get_cached_data(token, "5minute", 20)
         
         
@@ -726,7 +726,7 @@ def pivot_signal(token):
 
 def momentum_signal(token):
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
         df = get_cached_data(token, "5minute", 20)
         
         
@@ -753,7 +753,7 @@ def momentum_signal(token):
 def get_crude_signal(token):
     
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
 
@@ -923,7 +923,7 @@ def score_option(symbol, exchange, token, signal, df=None):
         # -----------------------------
         # 📈 MOMENTUM BOOST
         # -----------------------------
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         if df is None or len(df) < 10:
             return 0
@@ -1938,7 +1938,7 @@ def nifty_loop():
         # ⚠️ USE CLOSED CANDLE ONLY
         last = ht_df.iloc[-2]
         
-        if DEBUG and datetime.datetime.now().second < 2:
+        if DEBUG and datetime.now().second < 2:
             verify_halftrend(ht_df, name="NIFTY", bars=5)
 
         if last['buy']:
@@ -2091,7 +2091,7 @@ def crude_loop():
         # ⚠️ USE CLOSED CANDLE ONLY
         last = ht_df.iloc[-2]
         
-        if DEBUG and datetime.datetime.now().second < 2:
+        if DEBUG and datetime.now().second < 2:
             verify_halftrend(ht_df, name="CRUDE", bars=5)
 
         if last['buy']:
@@ -2215,7 +2215,7 @@ def crude_loop():
 def get_strike_mode(token):
 
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
 
@@ -2419,7 +2419,7 @@ def is_strong_trend_day(token, df=None):
 def is_reversal_trap(token, signal):
 
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
         
@@ -2469,7 +2469,7 @@ def is_reversal_trap(token, signal):
 def is_news_volatility(token):
 
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
         
@@ -2596,7 +2596,7 @@ def get_trade_confidence(token, signal, df=None, strong_trend=False):
 def is_false_breakout(token, signal):
 
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
         
@@ -2704,7 +2704,7 @@ def get_market_session(instrument):
 
 def vwap_signal(token, df=None):
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         if df is None:
             df = get_cached_data(token, "5minute", 20)
@@ -2730,7 +2730,7 @@ def vwap_signal(token, df=None):
         
 def breakout_signal(token, df=None):
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         if df is None:
             df = get_cached_data(token, "5minute", 20)
@@ -2755,7 +2755,7 @@ def breakout_signal(token, df=None):
 def pullback_signal(token, df=None):
 
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         if df is None:
             df = get_cached_data(token, "5minute", 20)
@@ -3024,7 +3024,7 @@ def portfolio_safe():
     
 def is_low_range_market(token):
     try:
-        now = datetime.datetime.now()
+        now = datetime.now()
 
         df = get_cached_data(token, "5minute", 20)
         
@@ -3160,7 +3160,7 @@ def backtest_full(token, instrument, days=5):
 
     print(f"📊 Running backtest for {instrument}")
 
-    now = datetime.datetime.now()
+    now = datetime.now()
 
     df = pd.DataFrame(kite.historical_data(
         token,
@@ -3420,7 +3420,7 @@ if __name__ == "__main__":
         CRUDE_SYMBOL = None
 
         while True:
-            now = datetime.datetime.now()
+            now = datetime.now())
 
             if now.hour == 9 and now.minute < 5:
                 print("🔄 Refreshing tokens...")

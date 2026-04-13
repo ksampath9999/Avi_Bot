@@ -1122,7 +1122,7 @@ def find_option(signal, instrument):
             strike_shift = 12
             max_price = 70
         elif balance < 10000:
-            strike_shift = 10
+            strike_shift = 14
             max_price = 120
         elif balance < 20000:
             strike_shift = 8

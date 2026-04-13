@@ -1058,8 +1058,9 @@ def get_crude_fut_symbol():
 # -----------------------------
 # OPTION SELECTOR
 # -----------------------------
+
+
 def find_option(signal, instrument):
-    
     print("🔍 Entered find_option")
 
     symbol = None
@@ -1069,9 +1070,9 @@ def find_option(signal, instrument):
 
     global CRUDE_SYMBOL
 
-    # -----------------------------
+    # =============================
     # CONFIG
-    # -----------------------------
+    # =============================
     if instrument == "NIFTY":
         exchange = "NFO"
         name = "NIFTY"
@@ -1087,9 +1088,9 @@ def find_option(signal, instrument):
         token_symbol = get_crude_fut_symbol()
         lot_size = 100
 
-    # -----------------------------
+    # =============================
     # DATA
-    # -----------------------------
+    # =============================
     df = get_cached_data(token, "5minute", 150)
     if df is None or df.empty:
         return None, None, None, None
@@ -1098,69 +1099,68 @@ def find_option(signal, instrument):
     if ltp is None or ltp <= 0:
         return None, None, None, None
 
-    # -----------------------------
-    # ATM
-    # -----------------------------
     atm = round(ltp / step) * step
 
-    # -----------------------------
-    # 💰 BALANCE BASED STRIKE LOGIC
-    # -----------------------------
+    # =============================
+    # 💰 BALANCE BASED SETTINGS
+    # =============================
     balance = get_balance(instrument) or 10000
 
-    if balance < 10000:
-        shift = 2   # far OTM
-    elif balance < 15000:
-        shift = 1   # OTM
-    elif balance < 25000:
-        shift = 0   # ATM
+    if balance < 5000:
+        strike_shift = 2
+        max_price = 60
+    elif balance < 10000:
+        strike_shift = 1
+        max_price = 120
+    elif balance < 20000:
+        strike_shift = 0
+        max_price = 200
     else:
-        shift = -1  # ITM
+        strike_shift = -1
+        max_price = 300
 
+    # Strike direction
     if signal == "CALL":
-        target_strike = atm + (shift * step)
+        target_strike = atm + (strike_shift * step)
+        opt_type = "CE"
     else:
-        target_strike = atm + (shift * step)
+        target_strike = atm + (strike_shift * step)
+        opt_type = "PE"
 
-    print(f"💰 Balance: {balance} | Target Strike: {target_strike}")
+    print(f"💰 Balance: {balance} | Target Strike: {target_strike} | Max Premium: {max_price}")
 
-    # -----------------------------
-    # INSTRUMENTS
-    # -----------------------------
+    # =============================
+    # LOAD INSTRUMENTS
+    # =============================
     instruments = get_instruments_cached(exchange)
     today = datetime.now().date()
 
     opts = [
         i for i in instruments
         if i["name"] == name
-        and i["instrument_type"] in ["CE", "PE"]
-        and i["expiry"] >= today   # 🔥 STRICT EXPIRY
+        and i["instrument_type"] == opt_type
+        and i["expiry"] >= today
     ]
 
     if not opts:
         return None, None, None, None
 
     expiry = sorted(set(i["expiry"] for i in opts))[0]
-    opt_type = "CE" if signal == "CALL" else "PE"
 
-    # -----------------------------
-    # 🎯 SELECT CLOSEST STRIKE
-    # -----------------------------
+    # =============================
+    # PRIMARY SELECTION
+    # =============================
     candidates = []
-    valid_candidates = []
 
-    for i in opts[:30]:
-
-        if i["expiry"] != expiry or i["instrument_type"] != opt_type:
+    for i in opts[:20]:   # reduced API load
+        if i["expiry"] != expiry:
             continue
 
         try:
             strike = int(i["strike"])
         except:
             continue
-            
 
-        # sort based on closeness to target
         diff = abs(strike - target_strike)
 
         sym = f"{exchange}:{i['tradingsymbol']}"
@@ -1168,28 +1168,16 @@ def find_option(signal, instrument):
 
         if p is None or p <= 0:
             continue
-            
 
-        # 🎯 PREMIUM FILTER (STRICT)
-        if instrument == "NIFTY":
-            if p < 60 or p > 80:
-                continue
-        else:  # CRUDE
-            if p < 30 or p > 100:
-                continue
-
-        # ✅ ONLY ADD FILTERED OPTIONS
-        valid_candidates.append(i)
+        # Dynamic premium filter
+        if p < 20 or p > max_price:
+            continue
 
         trade_value = p * lot_size
 
-        # 🔥 SAFETY: skip too costly trades
-        if instrument == "NIFTY":
-            if trade_value > balance * 0.9:
-                continue
-        else:  # CRUDE
-            if trade_value > balance * 1.2:
-                continue
+        # Affordability
+        if trade_value > balance * 0.95:
+            continue
 
         score = score_option(i["tradingsymbol"], exchange, token, signal, df)
 
@@ -1199,59 +1187,34 @@ def find_option(signal, instrument):
             "score": score,
             "diff": diff
         })
-        
-        
-    # 🔁 RELAX RANGE IF NOTHING FOUND
-    for i in opts[:30]:
 
-        if i["expiry"] != expiry or i["instrument_type"] != opt_type:
-            continue
-
-        try:
-            strike = int(i["strike"])
-        except:
-            continue
-
-        sym = f"{exchange}:{i['tradingsymbol']}"
-        p = safe_ltp(sym)
-
-        
-
-        if p is None or p <= 0:
-            continue
-
-        if 50 <= p <= 120:
-            candidates.append({
-                "symbol": i["tradingsymbol"],
-                "price": p,
-                "score": 0,
-                "diff": abs(int(i["strike"]) - target_strike)
-            })
-            
+    # =============================
+    # BEST PICK
+    # =============================
     print(f"📊 Candidates found: {len(candidates)}")
+
     if candidates:
-        # 🔥 BEST = score + closeness
-        best = sorted(candidates, key=lambda x: (x["diff"], -x["score"]))[0]
+        best = sorted(
+            candidates,
+            key=lambda x: (x["diff"], -x["score"], abs(x["price"] - max_price))
+        )[0]
 
         print(f"🏆 Selected: {best['symbol']} @ {best['price']}")
 
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
-        
+
         return best["symbol"], best["price"], lot, exchange
 
-    # -----------------------------
-    # 🚑 FALLBACK (ANY CLOSE OPTION)
-    # -----------------------------
+    # =============================
+    # RELAXED FALLBACK
+    # =============================
     print("⚠️ No ideal candidate — fallback")
 
-    best = None
-    best_price = None
-    min_diff = float("inf")
+    fallback = []
 
-    for i in opts[:30]:
-
-        if i["expiry"] != expiry or i["instrument_type"] != opt_type:
+    for i in opts[:20]:
+        if i["expiry"] != expiry:
             continue
 
         try:
@@ -1259,32 +1222,36 @@ def find_option(signal, instrument):
         except:
             continue
 
-        diff = abs(strike - atm)
-
         sym = f"{exchange}:{i['tradingsymbol']}"
         p = safe_ltp(sym)
 
         if p is None or p <= 0:
             continue
 
-        if p * lot_size > balance * 0.9:
-            continue
+        if 20 <= p <= max_price * 1.2:
+            fallback.append({
+                "symbol": i["tradingsymbol"],
+                "price": p,
+                "diff": abs(strike - atm)
+            })
 
-        if diff < min_diff:
-            min_diff = diff
-            best = i["tradingsymbol"]
-            best_price = p
+    if fallback:
+        best = sorted(fallback, key=lambda x: x["diff"])[0]
 
-    if best:
-        print(f"✅ Fallback: {best} @ {best_price}")
+        print(f"✅ Fallback: {best['symbol']} @ {best['price']}")
 
         strong_trend = is_market_trending(token, df)
-        lot = calculate_lots(best_price, exchange, instrument, strong_trend)
+        lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
 
-        return best, best_price, lot, exchange
+        return best["symbol"], best["price"], lot, exchange
 
     print("❌ No valid option found")
     return None, None, None, None
+    
+    
+
+
+
 # -----------------------------
 # ORDER
 # -----------------------------

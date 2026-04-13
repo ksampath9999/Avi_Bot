@@ -1911,16 +1911,17 @@ def nifty_loop():
     global last_running_signal, current_symbol, current_qty, current_exchange
     global last_executed_signal_nifty, last_arrow_index_nifty, global_trade_active
 
-    print("🔥 NIFTY LOOP STARTED")
+    
 
     while True:
-
+        print("🔥 NIFTY LOOP STARTED")
         now_dt = datetime.datetime.now(IST)
 
         if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
             print("🛑 NIFTY time over — stopping")
             break
-
+            
+        print("1️⃣ Fetching candle data")
         df = get_cached_data(config.NIFTY_TOKEN, "5minute", 120)
         df_ht = get_cached_data(config.NIFTY_TOKEN, "15minute", 120)
 
@@ -1929,8 +1930,9 @@ def nifty_loop():
             continue
 
         df = prepare_indicators(df)
-
+        print("2️⃣ Running HalfTrend")
         # 🔥 FULL TV HALF TREND
+        print("3️⃣ Reading signal")
         ht_df = halftrend_tv(df_ht)
 
         # ⚠️ USE CLOSED CANDLE ONLY
@@ -2009,8 +2011,9 @@ def nifty_loop():
             continue
 
         try:
+            print("4️⃣ Finding option")
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
-
+            print("5️⃣ Ready for order")
             if not symbol:
                 continue
                 
@@ -2063,10 +2066,10 @@ def crude_loop():
     global last_running_signal, current_symbol, current_qty, current_exchange
     global last_executed_signal_crude, last_arrow_index_crude, global_trade_active
 
-    print("🔥 CRUDE LOOP STARTED")
+    
 
     while True:
-
+        print("🔥 CRUDE LOOP STARTED")
         now_dt = datetime.datetime.now(IST)
 
         if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):

@@ -1891,9 +1891,8 @@ def ai_trade_filter(token, signal, df):
 # =========================
 # 🔥 NIFTY LOOP (UPDATED)
 # =========================
-# =========================
-# 🔥 NIFTY LOOP (FINAL POLISHED)
-# =========================
+
+
 def nifty_loop():
     global last_running_signal, current_symbol, current_qty, current_exchange
     global last_executed_signal_nifty, global_trade_active
@@ -1909,12 +1908,15 @@ def nifty_loop():
                 print("🛑 NIFTY time over — stopping")
                 break
 
-            # ✅ Cache refresh every 30 sec (15m strategy)
+            # =====================================
+            # Refresh cache (15m only)
+            # =====================================
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
-                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 200)
+                cached_nifty_df = get_cached_data(
+                    config.NIFTY_TOKEN, "15minute", 200
+                )
                 last_fetch_nifty = time.time()
 
-            # ✅ None safety
             if cached_nifty_df is None:
                 time.sleep(10)
                 continue
@@ -1925,7 +1927,9 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
+            # =====================================
             # Indicators + HalfTrend
+            # =====================================
             df = prepare_indicators(df)
             ht_df = halftrend_tv(df, amplitude=2, channel_deviation=2)
 
@@ -1933,36 +1937,37 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
-            # Closed candle only
+            # Last CLOSED candle only
             last = ht_df.iloc[-2]
 
             if DEBUG:
                 verify_halftrend(ht_df, name="NIFTY", bars=5)
 
-            # =====================
-            # Signal Detection
-            # =====================
+            # =====================================
+            # Fresh Arrow Signal
+            # =====================================
+            signal = None
+
             if last["buy"]:
                 signal = "CALL"
             elif last["sell"]:
                 signal = "PUT"
-            else:
-                signal = None
 
-            # =====================
-            # Trend Fallback
-            # =====================
+            # =====================================
+            # Trend fallback (same 15m candle logic)
+            # =====================================
             if signal is None:
                 trend_signal = "CALL" if last["trend"] == 0 else "PUT"
 
-                prev_close = df.iloc[-2]["close"]
-                curr_close = df.iloc[-1]["close"]
+                prev_close = df.iloc[-3]["close"]
+                curr_close = df.iloc[-2]["close"]
 
-                if (trend_signal == "CALL" and curr_close > prev_close) or \
-                   (trend_signal == "PUT" and curr_close < prev_close):
+                if (trend_signal == "CALL" and curr_close >= prev_close) or \
+                   (trend_signal == "PUT" and curr_close <= prev_close):
                     signal = trend_signal
                 else:
                     status = "WEAK_NIFTY"
+
                     if last_status != status or time.time() - last_weak_log_time > 30:
                         print("⚠️ Weak momentum — skipping (NIFTY)")
                         last_status = status
@@ -1971,20 +1976,25 @@ def nifty_loop():
                     time.sleep(10)
                     continue
 
-            # Prevent duplicate same-side trade
+            # =====================================
+            # Avoid duplicate same-side trade
+            # =====================================
             if signal == last_executed_signal_nifty:
                 time.sleep(10)
                 continue
 
+            # =====================================
             # Trend confirmation
+            # =====================================
             current_trend = "CALL" if last["trend"] == 0 else "PUT"
+
             if signal != current_trend:
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Flip Exit
-            # =====================
+            # =====================================
+            # Flip exit
+            # =====================================
             if global_trade_active and last_running_signal and signal != last_running_signal:
                 print(f"🔁 NIFTY Flip: {last_running_signal} → {signal}")
 
@@ -1999,18 +2009,20 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Find Option
-            # =====================
+            # =====================================
+            # Find option
+            # =====================================
+            print(f"🧠 FINAL NIFTY SIGNAL: {signal}")
+
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
             if not symbol or price is None:
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Lock Protection
-            # =====================
+            # =====================================
+            # Global lock
+            # =====================================
             with lock:
                 busy = global_trade_active
                 if not busy:
@@ -2020,23 +2032,33 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Place Order
-            # =====================
+            # =====================================
+            # Place order
+            # =====================================
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
             if not filled_price:
                 with lock:
                     global_trade_active = False
+
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Start Trade Manager
-            # =====================
+            # =====================================
+            # Manage trade thread
+            # =====================================
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "NIFTY", signal, 0, "TREND"),
+                args=(
+                    symbol,
+                    filled_price,
+                    lot,
+                    exchange,
+                    "NIFTY",
+                    signal,
+                    0,
+                    "TREND"
+                ),
                 daemon=True
             ).start()
 
@@ -2054,9 +2076,9 @@ def nifty_loop():
         time.sleep(10)
 
 
-# =========================
-# 🔥 CRUDE LOOP (FINAL POLISHED)
-# =========================
+# =====================================================
+# 🔥 CRUDE LOOP (FIXED: 15m confirmation + no old filter)
+# =====================================================
 def crude_loop():
     global last_running_signal, current_symbol, current_qty, current_exchange
     global last_executed_signal_crude, global_trade_active
@@ -2067,19 +2089,20 @@ def crude_loop():
         try:
             now_dt = datetime.now(IST)
 
-            # Start after NIFTY close (your logic)
+            # Start after NIFTY close
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
                 print("⏳ CRUDE waiting for start time...")
                 time.sleep(5)
                 continue
 
-            # ✅ Cache refresh every 10 sec
+            # =====================================
+            # Refresh cache
+            # =====================================
             if time.time() - last_fetch_crude > 10 or cached_crude_5m is None:
                 cached_crude_5m = get_cached_data(CRUDE_TOKEN, "5minute", 150)
                 cached_crude_15m = get_cached_data(CRUDE_TOKEN, "15minute", 150)
                 last_fetch_crude = time.time()
 
-            # ✅ None safety
             if cached_crude_5m is None or cached_crude_15m is None:
                 time.sleep(10)
                 continue
@@ -2095,7 +2118,9 @@ def crude_loop():
                 time.sleep(10)
                 continue
 
+            # =====================================
             # Indicators + HalfTrend
+            # =====================================
             df = prepare_indicators(df)
             ht_df = halftrend_tv(df_ht, amplitude=2, channel_deviation=2)
 
@@ -2103,35 +2128,37 @@ def crude_loop():
                 time.sleep(10)
                 continue
 
+            # Last CLOSED candle only
             last = ht_df.iloc[-2]
 
             if DEBUG:
                 verify_halftrend(ht_df, name="CRUDE", bars=5)
 
-            # =====================
-            # Signal Detection
-            # =====================
+            # =====================================
+            # Fresh Arrow Signal
+            # =====================================
+            signal = None
+
             if last["buy"]:
                 signal = "CALL"
             elif last["sell"]:
                 signal = "PUT"
-            else:
-                signal = None
 
-            # =====================
-            # Trend Fallback
-            # =====================
+            # =====================================
+            # Trend fallback (FIXED = 15m only)
+            # =====================================
             if signal is None:
                 trend_signal = "CALL" if last["trend"] == 0 else "PUT"
 
-                prev_close = df.iloc[-2]["close"]
-                curr_close = df.iloc[-1]["close"]
+                prev_close = df_ht.iloc[-3]["close"]
+                curr_close = df_ht.iloc[-2]["close"]
 
-                if (trend_signal == "CALL" and curr_close > prev_close) or \
-                   (trend_signal == "PUT" and curr_close < prev_close):
+                if (trend_signal == "CALL" and curr_close >= prev_close) or \
+                   (trend_signal == "PUT" and curr_close <= prev_close):
                     signal = trend_signal
                 else:
                     status = "WEAK_CRUDE"
+
                     if last_status != status or time.time() - last_weak_log_time > 30:
                         print("⚠️ Weak momentum — skipping (CRUDE)")
                         last_status = status
@@ -2140,20 +2167,25 @@ def crude_loop():
                     time.sleep(10)
                     continue
 
-            # Prevent duplicate same-side trade
+            # =====================================
+            # Avoid duplicate same-side trade
+            # =====================================
             if signal == last_executed_signal_crude:
                 time.sleep(10)
                 continue
 
+            # =====================================
             # Trend confirmation
+            # =====================================
             current_trend = "CALL" if last["trend"] == 0 else "PUT"
+
             if signal != current_trend:
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Flip Exit
-            # =====================
+            # =====================================
+            # Flip exit
+            # =====================================
             if global_trade_active and last_running_signal and signal != last_running_signal:
                 print(f"🔁 CRUDE Flip: {last_running_signal} → {signal}")
 
@@ -2168,23 +2200,20 @@ def crude_loop():
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Find Option
-            # =====================
+            # =====================================
+            # Find option
+            # =====================================
+            print(f"🧠 FINAL CRUDE SIGNAL: {signal}")
+
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
             if not symbol or price is None:
                 time.sleep(10)
                 continue
 
-            # Price filter
-            if not (30 <= price <= 100):
-                time.sleep(10)
-                continue
-
-            # =====================
-            # Lock Protection
-            # =====================
+            # =====================================
+            # Global lock
+            # =====================================
             with lock:
                 busy = global_trade_active
                 if not busy:
@@ -2194,23 +2223,33 @@ def crude_loop():
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Place Order
-            # =====================
+            # =====================================
+            # Place order
+            # =====================================
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
 
             if not filled_price:
                 with lock:
                     global_trade_active = False
+
                 time.sleep(10)
                 continue
 
-            # =====================
-            # Start Trade Manager
-            # =====================
+            # =====================================
+            # Manage trade thread
+            # =====================================
             threading.Thread(
                 target=run_trade_wrapper,
-                args=(symbol, filled_price, lot, exchange, "CRUDE", signal, 0, "TREND"),
+                args=(
+                    symbol,
+                    filled_price,
+                    lot,
+                    exchange,
+                    "CRUDE",
+                    signal,
+                    0,
+                    "TREND"
+                ),
                 daemon=True
             ).start()
 
@@ -2226,9 +2265,10 @@ def crude_loop():
             print("❌ CRUDE LOOP ERROR:", e)
 
         time.sleep(10)
-       
         
-        
+
+
+#==================        
 def get_strike_mode(token):
 
     try:

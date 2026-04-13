@@ -3142,10 +3142,14 @@ def get_cached_data(token, interval, duration):
             interval
         )
         print("✅ Historical data received")
+        print(f"📦 Rows received: {len(data)}")
+        print("🧱 Creating DataFrame...")
         df = pd.DataFrame(data)
+        print("✅ DataFrame created")
+        print(f"📊 DF Shape: {df.shape}")
 
         data_cache[key] = (now_ts, df)
-
+        print("📤 Returning dataframe to loop")
         return df
 
     except Exception as e:

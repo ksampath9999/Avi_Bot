@@ -160,7 +160,7 @@ history_loaded_crude = False
 history_loaded_nifty = False
 last_weak_log_time = 0
 last_status = None
-DEBUG = True
+DEBUG = False
 
 def is_nifty_trading_time():
     now = datetime.datetime.now(IST)

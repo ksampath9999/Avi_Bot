@@ -3117,53 +3117,41 @@ def choose_best_strategy(df, token):
 
     return signal, market_type        
         
-def get_cached_data(token, interval, duration):
-    
-    global data_cache
+from datetime import datetime, timedelta
+import pandas as pd
 
-    key = f"{token}_{interval}"
-
-    now_ts = time.time()
-
-    if key in data_cache:
-        ts, df = data_cache[key]
-        if now_ts - ts < CACHE_TTL:
-            return df
-
+def get_cached_data(token, interval="15minute", count=200):
     try:
         print("📥 get_cached_data() called")
-        now = datetime.datetime.now()
-        from_time = now - datetime.timedelta(days=2)
+
+        # ✅ DEFINE DATES FIRST
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=10)
+
         print("🌐 Requesting historical data from Kite...")
-        data = kite.historical_data(
-            token,
-            from_time,
-            now,
-            interval
-        )
         print(f"🧪 Token: {token}")
         print(f"🧪 Interval: {interval}")
         print(f"🧪 From: {from_date}")
         print(f"🧪 To: {to_date}")
+
+        data = kite.historical_data(
+            token,
+            from_date,
+            to_date,
+            interval
+        )
+
         print("✅ Historical data received")
         print(f"📦 Rows received: {len(data)}")
-        print("🧱 Creating DataFrame...")
-        df = pd.DataFrame(data)
-        print("✅ DataFrame created")
-        print(f"📊 DF Shape: {df.shape}")
-        
-        if not data:
-            print("⚠️ No candle data returned")
-            return pd.DataFrame(columns=["date","open","high","low","close","volume"])
 
-        data_cache[key] = (now_ts, df)
-        print("📤 Returning dataframe to loop")
-        
-        return df
+        df = pd.DataFrame(data)
+        print(f"📊 DF Shape: {df.shape}")
+
+        return df.tail(count)
 
     except Exception as e:
         print("❌ Data fetch error:", e)
-        return None
+        return pd.DataFrame()
 
 
 

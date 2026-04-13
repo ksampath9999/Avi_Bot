@@ -1915,7 +1915,7 @@ def nifty_loop():
 
     while True:
         print("🔥 NIFTY LOOP STARTED")
-        now_dt = datetime.datetime.now(IST)
+        now_dt = datetime.now(IST)
 
         if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
             print("🛑 NIFTY time over — stopping")
@@ -2070,7 +2070,7 @@ def crude_loop():
 
     while True:
         print("🔥 CRUDE LOOP STARTED")
-        now_dt = datetime.datetime.now(IST)
+        now_dt = datetime.now(IST)
 
         if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
             time.sleep(5)

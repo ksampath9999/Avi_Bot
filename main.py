@@ -1990,13 +1990,16 @@ def nifty_loop():
             # =====================================
             if signal is None:
                 trend_signal = "CALL" if last["trend"] == 0 else "PUT"
+                    
+                c1 = df.iloc[-4]["close"]
+                c2 = df.iloc[-3]["close"]
+                c3 = df.iloc[-2]["close"]
 
-                prev_close = df.iloc[-3]["close"]
-                curr_close = df.iloc[-2]["close"]
+                if trend_signal == "CALL" and (c3 >= c2 or c2 >= c1):
+                    signal = "CALL"
 
-                if (trend_signal == "CALL" and curr_close >= prev_close) or \
-                   (trend_signal == "PUT" and curr_close <= prev_close):
-                    signal = trend_signal
+                elif trend_signal == "PUT" and (c3 <= c2 or c2 <= c1):
+                    signal = "PUT"
                 else:
                     status = "WEAK_NIFTY"
 
@@ -2182,12 +2185,15 @@ def crude_loop():
             if signal is None:
                 trend_signal = "CALL" if last["trend"] == 0 else "PUT"
 
-                prev_close = df_ht.iloc[-3]["close"]
-                curr_close = df_ht.iloc[-2]["close"]
+                c1 = df_ht.iloc[-4]["close"]
+                c2 = df_ht.iloc[-3]["close"]
+                c3 = df_ht.iloc[-2]["close"]
 
-                if (trend_signal == "CALL" and curr_close >= prev_close) or \
-                   (trend_signal == "PUT" and curr_close <= prev_close):
-                    signal = trend_signal
+                if trend_signal == "CALL" and (c3 >= c2 or c2 >= c1):
+                    signal = "CALL"
+
+                elif trend_signal == "PUT" and (c3 <= c2 or c2 <= c1):
+                    signal = "PUT"
                 else:
                     status = "WEAK_CRUDE"
 

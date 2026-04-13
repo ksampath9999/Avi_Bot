@@ -1122,7 +1122,7 @@ def find_option(signal, instrument):
             strike_shift = 12
             max_price = 70
         elif balance < 10000:
-            strike_shift = 14
+            strike_shift = 10
             max_price = 120
         elif balance < 20000:
             strike_shift = 8
@@ -1229,14 +1229,26 @@ def find_option(signal, instrument):
     # BEST PICK
     # =====================================
     if candidates:
-        best = sorted(
-            candidates,
-            key=lambda x: (
-                x["diff"],                 # nearest target strike
-                -x["score"],              # best quality
-                abs(x["price"] - max_price)
-            )
-        )[0]
+        if balance <= 10000:
+            # low balance = cheapest first
+            best = sorted(
+                candidates,
+                key=lambda x: (
+                    x["price"],
+                    x["diff"],
+                    -x["score"]
+                )
+            )[0]
+        else:
+            # normal mode
+            best = sorted(
+                candidates,
+                key=lambda x: (
+                    x["diff"],
+                    -x["score"],
+                    abs(x["price"] - max_price)
+                )
+            )[0]
 
         print(f"🏆 Selected: {best['symbol']} | Strike: {best['strike']} | Price: {best['price']}")
 
@@ -1276,10 +1288,22 @@ def find_option(signal, instrument):
             })
 
     if fallback:
-        best = sorted(
-            fallback,
-            key=lambda x: (x["diff"], abs(x["price"] - max_price))
-        )[0]
+        if balance <= 10000:
+            best = sorted(
+                fallback,
+                key=lambda x: (
+                    x["price"],
+                    x["diff"]
+                )
+            )[0]
+        else:
+            best = sorted(
+                fallback,
+                key=lambda x: (
+                    x["diff"],
+                    abs(x["price"] - max_price)
+                )
+            )[0]
 
         print(f"✅ Fallback: {best['symbol']} | Strike: {best['strike']} | Price: {best['price']}")
 

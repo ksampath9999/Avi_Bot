@@ -1938,6 +1938,18 @@ def nifty_loop():
         # ⚠️ USE CLOSED CANDLE ONLY
         last = ht_df.iloc[-2]
         
+
+        # 🔥 EXACT VERIFICATION (ADD HERE)
+        prev = ht_df.iloc[-3]
+        last = ht_df.iloc[-2]
+        live = ht_df.iloc[-1]
+
+        print("PREV :", prev["trend"], prev["buy"], prev["sell"], prev["close"])
+        print("LAST :", last["trend"], last["buy"], last["sell"], last["close"])
+        print("LIVE :", live["trend"], live["buy"], live["sell"], live["close"])
+
+        print("3️⃣ Reading signal")
+        
         if DEBUG and datetime.now().second < 2:
             verify_halftrend(ht_df, name="NIFTY", bars=5)
 

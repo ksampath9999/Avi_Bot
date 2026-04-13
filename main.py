@@ -1058,7 +1058,6 @@ def get_crude_fut_symbol():
 # -----------------------------
 # OPTION SELECTOR
 # -----------------------------
-
 def find_option(signal, instrument):
     print("🔍 Entered find_option")
 
@@ -1097,16 +1096,18 @@ def find_option(signal, instrument):
         lot_size = 100
 
     # =====================================
-    # DATA
+    # MARKET DATA
     # =====================================
     df = get_cached_data(token, "5minute", 150)
 
     if df is None or df.empty:
+        print("❌ No market data")
         return None, None, None, None
 
     ltp = safe_ltp(token_symbol)
 
     if ltp is None or ltp <= 0:
+        print("❌ Invalid spot/fut LTP")
         return None, None, None, None
 
     atm = round(ltp / step) * step
@@ -1118,16 +1119,16 @@ def find_option(signal, instrument):
 
     if instrument == "CRUDE":
         if balance < 5000:
-            strike_shift = 2
+            strike_shift = 8
             max_price = 70
         elif balance < 10000:
-            strike_shift = 1
-            max_price = 100
+            strike_shift = 6
+            max_price = 120
         elif balance < 20000:
-            strike_shift = 0
-            max_price = 200
+            strike_shift = 4
+            max_price = 220
         else:
-            strike_shift = -1
+            strike_shift = 1
             max_price = 350
     else:
         if balance < 5000:
@@ -1144,20 +1145,20 @@ def find_option(signal, instrument):
             max_price = 300
 
     # =====================================
-    # OPTION TYPE
+    # OPTION TYPE + CORRECT STRIKE DIRECTION
     # =====================================
     if signal == "CALL":
         opt_type = "CE"
+        target_strike = atm + (strike_shift * step)
     else:
         opt_type = "PE"
-
-    target_strike = atm + (strike_shift * step)
+        target_strike = atm - (strike_shift * step)
 
     print(f"🎯 Searching option type: {opt_type}")
-    print(f"💰 Balance: {balance} | Target Strike: {target_strike} | Max Premium: {max_price}")
+    print(f"💰 Balance: {balance} | ATM: {atm} | Target Strike: {target_strike} | Max Premium: {max_price}")
 
     # =====================================
-    # LOAD INSTRUMENTS
+    # LOAD OPTION CHAIN
     # =====================================
     instruments = get_instruments_cached(exchange)
     today = datetime.now().date()
@@ -1180,7 +1181,7 @@ def find_option(signal, instrument):
     # =====================================
     candidates = []
 
-    for i in opts[:20]:
+    for i in opts[:20]:   # reduce API load
         if i["expiry"] != expiry:
             continue
 
@@ -1195,14 +1196,14 @@ def find_option(signal, instrument):
         if p is None or p <= 0:
             continue
 
+        # premium filter
         if p < 20 or p > max_price:
             continue
 
         diff = abs(strike - target_strike)
-
         trade_value = p * lot_size
 
-        # Only NIFTY strict affordability
+        # only strict affordability for NIFTY
         if instrument == "NIFTY" and trade_value > balance * 0.95:
             continue
 
@@ -1217,6 +1218,7 @@ def find_option(signal, instrument):
         candidates.append({
             "symbol": i["tradingsymbol"],
             "price": p,
+            "strike": strike,
             "diff": diff,
             "score": score
         })
@@ -1229,10 +1231,14 @@ def find_option(signal, instrument):
     if candidates:
         best = sorted(
             candidates,
-            key=lambda x: (x["diff"], -x["score"], abs(x["price"] - max_price))
+            key=lambda x: (
+                x["diff"],                 # nearest target strike
+                -x["score"],              # best quality
+                abs(x["price"] - max_price)
+            )
         )[0]
 
-        print(f"🏆 Selected: {best['symbol']} @ {best['price']}")
+        print(f"🏆 Selected: {best['symbol']} | Strike: {best['strike']} | Price: {best['price']}")
 
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
@@ -1240,7 +1246,7 @@ def find_option(signal, instrument):
         return best["symbol"], best["price"], lot, exchange
 
     # =====================================
-    # FALLBACK
+    # FALLBACK SEARCH
     # =====================================
     print("⚠️ No ideal candidate — fallback")
 
@@ -1265,13 +1271,17 @@ def find_option(signal, instrument):
             fallback.append({
                 "symbol": i["tradingsymbol"],
                 "price": p,
-                "diff": abs(strike - atm)
+                "strike": strike,
+                "diff": abs(strike - target_strike)
             })
 
     if fallback:
-        best = sorted(fallback, key=lambda x: x["diff"])[0]
+        best = sorted(
+            fallback,
+            key=lambda x: (x["diff"], abs(x["price"] - max_price))
+        )[0]
 
-        print(f"✅ Fallback: {best['symbol']} @ {best['price']}")
+        print(f"✅ Fallback: {best['symbol']} | Strike: {best['strike']} | Price: {best['price']}")
 
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
@@ -1280,7 +1290,6 @@ def find_option(signal, instrument):
 
     print("❌ No valid option found")
     return None, None, None, None    
-    
 
 
 

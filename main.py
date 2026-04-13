@@ -1119,26 +1119,26 @@ def find_option(signal, instrument):
     if instrument == "CRUDE":
         if balance < 5000:
             strike_shift = 2
-            max_price = 120
+            max_price = 70
         elif balance < 10000:
             strike_shift = 1
-            max_price = 220
+            max_price = 100
         elif balance < 20000:
             strike_shift = 0
-            max_price = 300
+            max_price = 200
         else:
             strike_shift = -1
-            max_price = 450
+            max_price = 350
     else:
         if balance < 5000:
             strike_shift = 2
             max_price = 60
         elif balance < 10000:
             strike_shift = 1
-            max_price = 120
+            max_price = 100
         elif balance < 20000:
             strike_shift = 0
-            max_price = 200
+            max_price = 150
         else:
             strike_shift = -1
             max_price = 300

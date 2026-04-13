@@ -3218,10 +3218,7 @@ def get_cached_data(token, interval="15minute", count=200):
         from_date = to_date - timedelta(days=10)
 
         print("🌐 Requesting historical data from Kite...")
-        print(f"🧪 Token: {token}")
-        print(f"🧪 Interval: {interval}")
-        print(f"🧪 From: {from_date}")
-        print(f"🧪 To: {to_date}")
+       
 
         data = kite.historical_data(
             token,
@@ -3230,7 +3227,6 @@ def get_cached_data(token, interval="15minute", count=200):
             interval
         )
 
-        print("✅ Historical data received")
         print(f"📦 Rows received: {len(data)}")
 
         df = pd.DataFrame(data)

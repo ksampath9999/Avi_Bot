@@ -3420,7 +3420,7 @@ if __name__ == "__main__":
         CRUDE_SYMBOL = None
 
         while True:
-            now = datetime.now())
+            now = datetime.now()
 
             if now.hour == 9 and now.minute < 5:
                 print("🔄 Refreshing tokens...")

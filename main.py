@@ -1935,7 +1935,7 @@ def nifty_loop():
 
     while True:
         try:
-            now_dt = datetime.now()
+            now_dt = datetime.now(IST)
 
             # Stop after market close
             if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
@@ -2098,7 +2098,7 @@ def crude_loop():
 
     while True:
         try:
-            now_dt = datetime.now()
+            now_dt = datetime.now(IST)
 
             # Start after NIFTY close (your logic)
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):

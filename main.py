@@ -160,6 +160,7 @@ history_loaded_crude = False
 history_loaded_nifty = False
 last_weak_log_time = 0
 last_status = None
+DEBUG = True
 
 def is_nifty_trading_time():
     now = datetime.datetime.now(IST)
@@ -209,162 +210,225 @@ def prepare_indicators(df):
     df["ema20"] = df["close"].ewm(span=20).mean()
 
     return df
-
-# =========================
-# 🔥 FIXED HALF TREND (PRO)
-# =========================
 import pandas as pd
 import numpy as np
 
-# =========================
-# ATR (same as TradingView)
-# =========================
+# ======================================
+# TRUE TradingView ATR (Wilder RMA)
+# ta.atr(period)
+# ======================================
 def ATR(df, period=100):
-    high = df['high']
-    low = df['low']
-    close = df['close']
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
 
     tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
 
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+
+    # Wilder's RMA = TradingView ATR
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    return atr
 
 
-# =========================
-# FULL HALF TREND (TV MATCH)
-# =========================
+# ======================================
+# TRUE TradingView HalfTrend
+# Pine v6 exact logic
+# ======================================
 def halftrend_tv(df, amplitude=2, channel_deviation=2):
 
-    df = df.copy()
+    df = df.copy().reset_index(drop=True)
 
-    df['atr'] = ATR(df, 100)
-    df['atr2'] = df['atr'] / 2
-    df['dev'] = channel_deviation * df['atr2']
+    n = len(df)
+    if n < 5:
+        return df
 
-    trend = [0]
-    nextTrend = [0]
+    # --- ATR section ---
+    df["atr"] = ATR(df, 100)
+    df["atr2"] = df["atr"] / 2
+    df["dev"] = channel_deviation * df["atr2"]
 
-    maxLowPrice = [df['low'].iloc[0]]
-    minHighPrice = [df['high'].iloc[0]]
+    # --- storage arrays ---
+    trend = [0] * n
+    nextTrend = [0] * n
 
-    up = [0]
-    down = [0]
+    maxLowPrice = [np.nan] * n
+    minHighPrice = [np.nan] * n
 
-    atrHigh = [np.nan]
-    atrLow = [np.nan]
+    up = [np.nan] * n
+    down = [np.nan] * n
 
-    arrowUp = [np.nan]
-    arrowDown = [np.nan]
+    atrHigh = [np.nan] * n
+    atrLow = [np.nan] * n
 
-    for i in range(1, len(df)):
+    arrowUp = [np.nan] * n
+    arrowDown = [np.nan] * n
 
-        high = df['high'].iloc[i]
-        low = df['low'].iloc[i]
-        close = df['close'].iloc[i]
+    # ======================================
+    # EXACT Pine initialization
+    # ======================================
+    maxLowPrice[0] = df["low"].iloc[0]
+    minHighPrice[0] = df["high"].iloc[0]
 
-        highPrice = df['high'].iloc[max(0, i-amplitude):i+1].max()
-        lowPrice = df['low'].iloc[max(0, i-amplitude):i+1].min()
+    up[0] = df["low"].iloc[0]
+    down[0] = df["high"].iloc[0]
 
-        highma = df['high'].iloc[max(0, i-amplitude):i+1].mean()
-        lowma = df['low'].iloc[max(0, i-amplitude):i+1].mean()
+    for i in range(1, n):
 
-        prev_trend = trend[-1]
-        prev_nextTrend = nextTrend[-1]
+        prev_trend = trend[i - 1]
+        prev_nextTrend = nextTrend[i - 1]
 
-        prev_maxLow = maxLowPrice[-1]
-        prev_minHigh = minHighPrice[-1]
+        trend[i] = prev_trend
+        nextTrend[i] = prev_nextTrend
 
-        curr_trend = prev_trend
-        curr_nextTrend = prev_nextTrend
+        maxLowPrice[i] = maxLowPrice[i - 1]
+        minHighPrice[i] = minHighPrice[i - 1]
 
-        curr_maxLow = prev_maxLow
-        curr_minHigh = prev_minHigh
+        up[i] = up[i - 1]
+        down[i] = down[i - 1]
 
-        curr_up = up[-1]
-        curr_down = down[-1]
+        # ======================================
+        # TradingView highestbars / lowestbars equivalent
+        # lookback = amplitude + 1 candles
+        # ======================================
+        start = max(0, i - amplitude)
+        hh_window = df["high"].iloc[start:i + 1]
+        ll_window = df["low"].iloc[start:i + 1]
 
-        curr_arrowUp = np.nan
-        curr_arrowDown = np.nan
+        # last occurrence behavior closer to Pine
+        high_idx = hh_window[::-1].idxmax()
+        low_idx = ll_window[::-1].idxmin()
 
-        # =========================
-        # TREND LOGIC (same as TV)
-        # =========================
+        highPrice = df["high"].loc[high_idx]
+        lowPrice = df["low"].loc[low_idx]
+
+        highma = df["high"].iloc[start:i + 1].mean()
+        lowma = df["low"].iloc[start:i + 1].mean()
+
+        close_now = df["close"].iloc[i]
+        prev_low = df["low"].iloc[i - 1]
+        prev_high = df["high"].iloc[i - 1]
+
+        # ======================================
+        # EXACT TREND SWITCH LOGIC
+        # ======================================
         if prev_nextTrend == 1:
-            curr_maxLow = max(lowPrice, prev_maxLow)
 
-            if highma < curr_maxLow and close < df['low'].iloc[i-1]:
-                curr_trend = 1
-                curr_nextTrend = 0
-                curr_minHigh = highPrice
+            maxLowPrice[i] = max(lowPrice, maxLowPrice[i - 1])
 
-        else:
-            curr_minHigh = min(highPrice, prev_minHigh)
-
-            if lowma > curr_minHigh and close > df['high'].iloc[i-1]:
-                curr_trend = 0
-                curr_nextTrend = 1
-                curr_maxLow = lowPrice
-
-        # =========================
-        # UP / DOWN + ARROWS
-        # =========================
-        if curr_trend == 0:
-
-            if prev_trend == 1:
-                curr_up = down[-1]
-                curr_arrowUp = curr_up - df['atr2'].iloc[i]
-            else:
-                curr_up = max(curr_maxLow, up[-1])
-
-            curr_atrHigh = curr_up + df['dev'].iloc[i]
-            curr_atrLow = curr_up - df['dev'].iloc[i]
+            if highma < maxLowPrice[i] and close_now < prev_low:
+                trend[i] = 1
+                nextTrend[i] = 0
+                minHighPrice[i] = highPrice
 
         else:
 
-            if prev_trend == 0:
-                curr_down = up[-1]
-                curr_arrowDown = curr_down + df['atr2'].iloc[i]
+            minHighPrice[i] = min(highPrice, minHighPrice[i - 1])
+
+            if lowma > minHighPrice[i] and close_now > prev_high:
+                trend[i] = 0
+                nextTrend[i] = 1
+                maxLowPrice[i] = lowPrice
+
+        # ======================================
+        # EXACT UP / DOWN LOGIC
+        # ======================================
+        if trend[i] == 0:
+
+            if trend[i - 1] != 0:
+                up[i] = down[i - 1]
+                arrowUp[i] = up[i] - df["atr2"].iloc[i]
             else:
-                curr_down = min(curr_minHigh, down[-1])
+                up[i] = max(maxLowPrice[i], up[i - 1])
 
-            curr_atrHigh = curr_down + df['dev'].iloc[i]
-            curr_atrLow = curr_down - df['dev'].iloc[i]
+            atrHigh[i] = up[i] + df["dev"].iloc[i]
+            atrLow[i] = up[i] - df["dev"].iloc[i]
 
-        # =========================
-        # STORE
-        # =========================
-        trend.append(curr_trend)
-        nextTrend.append(curr_nextTrend)
+        else:
 
-        maxLowPrice.append(curr_maxLow)
-        minHighPrice.append(curr_minHigh)
+            if trend[i - 1] != 1:
+                down[i] = up[i - 1]
+                arrowDown[i] = down[i] + df["atr2"].iloc[i]
+            else:
+                down[i] = min(minHighPrice[i], down[i - 1])
 
-        up.append(curr_up)
-        down.append(curr_down)
+            atrHigh[i] = down[i] + df["dev"].iloc[i]
+            atrLow[i] = down[i] - df["dev"].iloc[i]
 
-        atrHigh.append(curr_atrHigh)
-        atrLow.append(curr_atrLow)
+    # ======================================
+    # Final output
+    # ======================================
+    df["trend"] = trend
+    df["ht"] = np.where(df["trend"] == 0, up, down)
 
-        arrowUp.append(curr_arrowUp)
-        arrowDown.append(curr_arrowDown)
+    df["atrHigh"] = atrHigh
+    df["atrLow"] = atrLow
 
-    # =========================
-    # FINAL OUTPUT
-    # =========================
-    df['trend'] = trend
-    df['ht'] = np.where(df['trend'] == 0, up, down)
-    df['atrHigh'] = atrHigh
-    df['atrLow'] = atrLow
-    df['arrowUp'] = arrowUp
-    df['arrowDown'] = arrowDown
+    df["arrowUp"] = arrowUp
+    df["arrowDown"] = arrowDown
 
-    # 🔥 TRUE TV SIGNALS
-    df['buy'] = (~pd.isna(df['arrowUp'])) & (df['trend'] == 0) & (df['trend'].shift(1) == 1)
-    df['sell'] = (~pd.isna(df['arrowDown'])) & (df['trend'] == 1) & (df['trend'].shift(1) == 0)
+    df["buy"] = (~pd.isna(df["arrowUp"])) & (df["trend"] == 0) & (pd.Series(df["trend"]).shift(1) == 1)
+    df["sell"] = (~pd.isna(df["arrowDown"])) & (df["trend"] == 1) & (pd.Series(df["trend"]).shift(1) == 0)
 
     return df
+    
+#======
+def verify_halftrend(ht_df, name="VERIFY", bars=5):
+    try:
+        if ht_df is None or len(ht_df) < bars + 1:
+            print(f"⚠️ {name}: Not enough data for verification")
+            return
+
+        print("\n" + "=" * 70)
+        print(f"🔍 HALF TREND VERIFICATION MODE ({name})")
+        print("=" * 70)
+
+        check_df = ht_df.tail(bars).copy()
+
+        for i in range(len(check_df)):
+            row = check_df.iloc[i]
+
+            ts = row.name if row.name is not None else i
+
+            trend = "CALL" if row["trend"] == 0 else "PUT"
+
+            signal = "NONE"
+            if row["buy"]:
+                signal = "BUY"
+            elif row["sell"]:
+                signal = "SELL"
+
+            print(
+                f"🕒 {ts} | "
+                f"Trend: {trend:4} | "
+                f"Signal: {signal:4} | "
+                f"Close: {row['close']:.2f} | "
+                f"HT: {row['ht']:.2f}"
+            )
+
+        last = ht_df.iloc[-2]
+
+        final_signal = None
+        if last["buy"]:
+            final_signal = "CALL"
+        elif last["sell"]:
+            final_signal = "PUT"
+
+        print("-" * 70)
+        print(
+            f"🎯 CLOSED CANDLE DECISION → "
+            f"{final_signal if final_signal else 'NO NEW SIGNAL'}"
+        )
+        print("=" * 70 + "\n")
+
+    except Exception as e:
+        print("❌ Verification error:", e)
+        
+#===
+
+
     
 def detect_market_type(df):
 
@@ -1871,6 +1935,9 @@ def nifty_loop():
 
         # ⚠️ USE CLOSED CANDLE ONLY
         last = ht_df.iloc[-2]
+        
+        if DEBUG and datetime.datetime.now().second < 2:
+            verify_halftrend(ht_df, name="NIFTY", bars=5)
 
         if last['buy']:
             signal = "CALL"
@@ -1959,16 +2026,18 @@ def nifty_loop():
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
             
+            if not filled_price:
+                with lock:
+                    global_trade_active = False
+                continue
+            
             threading.Thread(
                 target=run_trade_wrapper,
                 args=(symbol, filled_price, lot, exchange, "NIFTY", signal, 0, "TREND"),
                 daemon=True
             ).start()
 
-            if not filled_price:
-                with lock:
-                    global_trade_active = False
-                continue
+            
 
             print(f"🎯 TRADE → {signal}")
 
@@ -2018,6 +2087,9 @@ def crude_loop():
 
         # ⚠️ USE CLOSED CANDLE ONLY
         last = ht_df.iloc[-2]
+        
+        if DEBUG and datetime.datetime.now().second < 2:
+            verify_halftrend(ht_df, name="CRUDE", bars=5)
 
         if last['buy']:
             signal = "CALL"
@@ -2109,16 +2181,18 @@ def crude_loop():
 
             filled_price = place_order(symbol, lot, exchange, "CRUDE")
             
+            if not filled_price:
+                with lock:
+                    global_trade_active = False
+                continue
+            
             threading.Thread(
                 target=run_trade_wrapper,
                 args=(symbol, filled_price, lot, exchange, "CRUDE", signal, 0, "TREND"),
                 daemon=True
             ).start()
 
-            if not filled_price:
-                with lock:
-                    global_trade_active = False
-                continue
+            
 
             print(f"🎯 TRADE → {signal}")
 

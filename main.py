@@ -2102,6 +2102,7 @@ def crude_loop():
 
             # Start after NIFTY close (your logic)
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
+                print("⏳ CRUDE waiting for start time...")
                 time.sleep(5)
                 continue
 

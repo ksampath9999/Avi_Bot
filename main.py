@@ -2024,11 +2024,30 @@ def nifty_loop():
             # Fallback = price vs HT line
             # =====================================
             if signal is None:
-                live_price = df.iloc[-1]["close"]
+                live_price = df_ht.iloc[-1]["close"]
+                prev_close = df_ht.iloc[-2]["close"]
                 ht_value = last["ht"]
 
-                signal = "CALL" if live_price > ht_value else "PUT"
+                print("CRUDE:", live_price, prev_close, ht_value, signal)
+                # Strong bullish only if above HT + rising
+                if live_price > ht_value and live_price >= prev_close:
+                    signal = "CALL"
 
+                # Strong bearish only if below HT + falling
+                elif live_price < ht_value and live_price <= prev_close:
+                    signal = "PUT"
+
+                else:
+                    status = "WEAK_CRUDE"
+                    if last_status != status or time.time() - last_weak_log_time > 30:
+                        print("⚠️ Weak momentum — skipping (CRUDE)")
+                        last_status = status
+                        last_weak_log_time = time.time()
+
+                    time.sleep(10)
+                    continue
+
+            
             # =====================================
             # Prevent duplicate same side
             # =====================================

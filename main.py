@@ -230,13 +230,14 @@ def ATR(df, period=100):
     close = df["close"]
 
     tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
 
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    # Wilder's RMA = TradingView ATR
+    # Wilder's RMA = TradingView style
     atr = tr.ewm(alpha=1/period, adjust=False).mean()
+
     return atr
 
 
@@ -1118,27 +1119,27 @@ def find_option(signal, instrument):
     balance = get_balance(instrument) or 10000
 
     if instrument == "CRUDE":
-        if balance < 5000:
+        if balance <= 5000:
             strike_shift = 12
             max_price = 50
-        elif balance < 10000:
+        elif balance <= 10000:
             strike_shift = 11
             max_price = 80
-        elif balance < 20000:
+        elif balance <= 20000:
             strike_shift = 10
             max_price = 100
         else:
             strike_shift = 1
             max_price = 120
     else:
-        if balance < 5000:
-            strike_shift = 2
+        if balance <= 5000:
+            strike_shift = 8
             max_price = 60
-        elif balance < 10000:
-            strike_shift = 1
+        elif balance <= 10000:
+            strike_shift = 6
             max_price = 100
-        elif balance < 20000:
-            strike_shift = 0
+        elif balance <= 20000:
+            strike_shift = 4
             max_price = 150
         else:
             strike_shift = -1
@@ -1958,12 +1959,12 @@ def ai_trade_filter(token, signal, df):
 # =========================
 
 # =====================================================
-# 🔥 NIFTY LOOP (UPDATED FINAL)
+# 🔥 NIFTY LOOP (ARROW ONLY MODE)
 # =====================================================
 def nifty_loop():
     global last_running_signal, current_symbol, current_qty, current_exchange
     global last_executed_signal_nifty, global_trade_active
-    global last_weak_log_time, last_status
+    global last_status, last_weak_log_time
     global last_fetch_nifty, cached_nifty_df
 
     while True:
@@ -1976,11 +1977,13 @@ def nifty_loop():
                 break
 
             # =====================================
-            # Refresh cache (15m)
+            # Refresh Cache
             # =====================================
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
                 cached_nifty_df = get_cached_data(
-                    config.NIFTY_TOKEN, "15minute", 200
+                    config.NIFTY_TOKEN,
+                    "15minute",
+                    200
                 )
                 last_fetch_nifty = time.time()
 
@@ -2004,52 +2007,36 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
-            # Closed candle only
+            # Last CLOSED candle only
             last = ht_df.iloc[-2]
 
             if DEBUG:
                 verify_halftrend(ht_df, name="NIFTY", bars=5)
 
             # =====================================
-            # Arrow signal first
+            # ARROW ONLY SIGNAL
             # =====================================
             signal = None
 
             if last["buy"]:
                 signal = "CALL"
+
             elif last["sell"]:
                 signal = "PUT"
 
+            else:
+                status = "NO_ARROW_NIFTY"
+
+                if last_status != status or time.time() - last_weak_log_time > 30:
+                    print("⏸️ No new HalfTrend arrow — waiting (NIFTY)")
+                    last_status = status
+                    last_weak_log_time = time.time()
+
+                time.sleep(10)
+                continue
+
             # =====================================
-            # Fallback = price vs HT line
-            # =====================================
-            if signal is None:
-                live_price = df.iloc[-1]["close"]
-                prev_close = df.iloc[-2]["close"]
-                ht_value = last["ht"]
-
-                # Bullish confirmation
-                if live_price > ht_value and live_price >= prev_close:
-                    signal = "CALL"
-
-                # Bearish confirmation
-                elif live_price < ht_value and live_price <= prev_close:
-                    signal = "PUT"
-
-                else:
-                    status = "WEAK_NIFTY"
-
-                    if last_status != status or time.time() - last_weak_log_time > 30:
-                        print("⚠️ Weak momentum — skipping (NIFTY)")
-                        last_status = status
-                        last_weak_log_time = time.time()
-
-                    time.sleep(10)
-                    continue
-
-            
-            # =====================================
-            # Prevent duplicate same side
+            # Prevent duplicate same-side trade
             # =====================================
             if signal == last_executed_signal_nifty:
                 time.sleep(10)
@@ -2103,6 +2090,7 @@ def nifty_loop():
             if not filled_price:
                 with lock:
                     global_trade_active = False
+
                 time.sleep(10)
                 continue
 
@@ -2139,12 +2127,12 @@ def nifty_loop():
 
 
 # =====================================================
-# 🔥 CRUDE LOOP (UPDATED FINAL)
+# 🔥 CRUDE LOOP (ARROW ONLY MODE)
 # =====================================================
 def crude_loop():
     global last_running_signal, current_symbol, current_qty, current_exchange
     global last_executed_signal_crude, global_trade_active
-    global last_weak_log_time, last_status
+    global last_status, last_weak_log_time
     global last_fetch_crude, cached_crude_5m, cached_crude_15m
 
     while True:
@@ -2158,14 +2146,14 @@ def crude_loop():
                 continue
 
             # =====================================
-            # Refresh cache
+            # Refresh Cache
             # =====================================
-            if time.time() - last_fetch_crude > 10 or cached_crude_5m is None:
+            if time.time() - last_fetch_crude > 10 or cached_crude_15m is None:
                 cached_crude_5m = get_cached_data(CRUDE_TOKEN, "5minute", 150)
                 cached_crude_15m = get_cached_data(CRUDE_TOKEN, "15minute", 150)
                 last_fetch_crude = time.time()
 
-            if cached_crude_5m is None or cached_crude_15m is None:
+            if cached_crude_15m is None:
                 time.sleep(10)
                 continue
 
@@ -2176,65 +2164,49 @@ def crude_loop():
                 time.sleep(10)
                 continue
 
-            if len(df) < 50 or len(df_ht) < 50:
+            if len(df_ht) < 50:
                 time.sleep(10)
                 continue
 
             # =====================================
             # Indicators + HalfTrend
             # =====================================
-            df = prepare_indicators(df)
             ht_df = halftrend_tv(df_ht, amplitude=2, channel_deviation=2)
 
             if len(ht_df) < 10:
                 time.sleep(10)
                 continue
 
-            # Closed candle
+            # Last CLOSED candle only
             last = ht_df.iloc[-2]
 
             if DEBUG:
                 verify_halftrend(ht_df, name="CRUDE", bars=5)
 
             # =====================================
-            # Arrow signal first
+            # ARROW ONLY SIGNAL
             # =====================================
             signal = None
 
             if last["buy"]:
                 signal = "CALL"
+
             elif last["sell"]:
                 signal = "PUT"
 
-            # =====================================
-            # Fallback = price vs HT line
-            # =====================================
-            if signal is None:
-                live_price = df_ht.iloc[-1]["close"]
-                prev_close = df_ht.iloc[-2]["close"]
-                ht_value = last["ht"]
+            else:
+                status = "NO_ARROW_CRUDE"
 
-                print("CRUDE:", live_price, prev_close, ht_value, signal)
-                # Strong bullish only if above HT + rising
-                if live_price > ht_value and live_price >= prev_close:
-                    signal = "CALL"
+                if last_status != status or time.time() - last_weak_log_time > 30:
+                    print("⏸️ No new HalfTrend arrow — waiting (CRUDE)")
+                    last_status = status
+                    last_weak_log_time = time.time()
 
-                # Strong bearish only if below HT + falling
-                elif live_price < ht_value and live_price <= prev_close:
-                    signal = "PUT"
-
-                else:
-                    status = "WEAK_CRUDE"
-                    if last_status != status or time.time() - last_weak_log_time > 30:
-                        print("⚠️ Weak momentum — skipping (CRUDE)")
-                        last_status = status
-                        last_weak_log_time = time.time()
-
-                    time.sleep(10)
-                    continue
+                time.sleep(10)
+                continue
 
             # =====================================
-            # Prevent duplicate same side
+            # Prevent duplicate same-side trade
             # =====================================
             if signal == last_executed_signal_crude:
                 time.sleep(10)
@@ -2258,15 +2230,6 @@ def crude_loop():
                 continue
 
             print(f"🧠 FINAL CRUDE SIGNAL: {signal}")
-            print("========== CRUDE DECISION DEBUG ==========")
-            print("buy :", last["buy"])
-            print("sell:", last["sell"])
-            print("trend:", last["trend"])
-            print("ht:", last["ht"])
-            print("prev_close:", df_ht.iloc[-2]["close"])
-            print("live_close:", df_ht.iloc[-1]["close"])
-            print("final_signal:", signal)
-            print("=========================================")
 
             # =====================================
             # Find Option
@@ -2297,6 +2260,7 @@ def crude_loop():
             if not filled_price:
                 with lock:
                     global_trade_active = False
+
                 time.sleep(10)
                 continue
 

@@ -1934,6 +1934,14 @@ def nifty_loop():
         # 🔥 FULL TV HALF TREND
         print("3️⃣ Reading signal")
         ht_df = halftrend_tv(df_ht)
+        
+        if len(ht_df) < 10:
+            continue
+        
+        # 🔥 LOOK BACK MORE CANDLES (ADD HERE)
+        for i in range(-10, 0):
+            row = ht_df.iloc[i]
+            print(i, row["trend"], row["buy"], row["sell"], row["close"])
 
         # ⚠️ USE CLOSED CANDLE ONLY
         last = ht_df.iloc[-2]

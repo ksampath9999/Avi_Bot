@@ -3118,7 +3118,7 @@ def choose_best_strategy(df, token):
     return signal, market_type        
         
 def get_cached_data(token, interval, duration):
-
+    
     global data_cache
 
     key = f"{token}_{interval}"
@@ -3131,16 +3131,17 @@ def get_cached_data(token, interval, duration):
             return df
 
     try:
+        print("📥 get_cached_data() called")
         now = datetime.datetime.now()
         from_time = now - datetime.timedelta(days=2)
-
+        print("🌐 Requesting historical data from Kite...")
         data = kite.historical_data(
             token,
             from_time,
             now,
             interval
         )
-
+        print("✅ Historical data received")
         df = pd.DataFrame(data)
 
         data_cache[key] = (now_ts, df)

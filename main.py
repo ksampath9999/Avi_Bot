@@ -1059,20 +1059,28 @@ def get_crude_fut_symbol():
 # OPTION SELECTOR
 # -----------------------------
 
-
 def find_option(signal, instrument):
     print("🔍 Entered find_option")
+
+    # =====================================
+    # Normalize signal
+    # =====================================
+    signal = str(signal).strip().upper()
+
+    if signal not in ["CALL", "PUT"]:
+        print("❌ Invalid signal:", signal)
+        return None, None, None, None
+
+    print("🧠 find_option received:", signal)
 
     symbol = None
     price = None
     lot = None
     exchange = None
 
-    global CRUDE_SYMBOL
-
-    # =============================
+    # =====================================
     # CONFIG
-    # =============================
+    # =====================================
     if instrument == "NIFTY":
         exchange = "NFO"
         name = "NIFTY"
@@ -1088,50 +1096,69 @@ def find_option(signal, instrument):
         token_symbol = get_crude_fut_symbol()
         lot_size = 100
 
-    # =============================
+    # =====================================
     # DATA
-    # =============================
+    # =====================================
     df = get_cached_data(token, "5minute", 150)
+
     if df is None or df.empty:
         return None, None, None, None
 
     ltp = safe_ltp(token_symbol)
+
     if ltp is None or ltp <= 0:
         return None, None, None, None
 
     atm = round(ltp / step) * step
 
-    # =============================
-    # 💰 BALANCE BASED SETTINGS
-    # =============================
+    # =====================================
+    # BALANCE BASED SETTINGS
+    # =====================================
     balance = get_balance(instrument) or 10000
 
-    if balance < 5000:
-        strike_shift = 2
-        max_price = 60
-    elif balance < 10000:
-        strike_shift = 1
-        max_price = 120
-    elif balance < 20000:
-        strike_shift = 0
-        max_price = 200
+    if instrument == "CRUDE":
+        if balance < 5000:
+            strike_shift = 2
+            max_price = 120
+        elif balance < 10000:
+            strike_shift = 1
+            max_price = 220
+        elif balance < 20000:
+            strike_shift = 0
+            max_price = 300
+        else:
+            strike_shift = -1
+            max_price = 450
     else:
-        strike_shift = -1
-        max_price = 300
+        if balance < 5000:
+            strike_shift = 2
+            max_price = 60
+        elif balance < 10000:
+            strike_shift = 1
+            max_price = 120
+        elif balance < 20000:
+            strike_shift = 0
+            max_price = 200
+        else:
+            strike_shift = -1
+            max_price = 300
 
-    # Strike direction
+    # =====================================
+    # OPTION TYPE
+    # =====================================
     if signal == "CALL":
-        target_strike = atm + (strike_shift * step)
         opt_type = "CE"
     else:
-        target_strike = atm + (strike_shift * step)
         opt_type = "PE"
 
+    target_strike = atm + (strike_shift * step)
+
+    print(f"🎯 Searching option type: {opt_type}")
     print(f"💰 Balance: {balance} | Target Strike: {target_strike} | Max Premium: {max_price}")
 
-    # =============================
+    # =====================================
     # LOAD INSTRUMENTS
-    # =============================
+    # =====================================
     instruments = get_instruments_cached(exchange)
     today = datetime.now().date()
 
@@ -1143,16 +1170,17 @@ def find_option(signal, instrument):
     ]
 
     if not opts:
+        print("❌ No option contracts found")
         return None, None, None, None
 
     expiry = sorted(set(i["expiry"] for i in opts))[0]
 
-    # =============================
-    # PRIMARY SELECTION
-    # =============================
+    # =====================================
+    # PRIMARY SEARCH
+    # =====================================
     candidates = []
 
-    for i in opts[:20]:   # reduced API load
+    for i in opts[:20]:
         if i["expiry"] != expiry:
             continue
 
@@ -1161,38 +1189,43 @@ def find_option(signal, instrument):
         except:
             continue
 
-        diff = abs(strike - target_strike)
-
         sym = f"{exchange}:{i['tradingsymbol']}"
         p = safe_ltp(sym)
 
         if p is None or p <= 0:
             continue
 
-        # Dynamic premium filter
         if p < 20 or p > max_price:
             continue
 
+        diff = abs(strike - target_strike)
+
         trade_value = p * lot_size
 
-        # Affordability
-        if trade_value > balance * 0.95:
+        # Only NIFTY strict affordability
+        if instrument == "NIFTY" and trade_value > balance * 0.95:
             continue
 
-        score = score_option(i["tradingsymbol"], exchange, token, signal, df)
+        score = score_option(
+            i["tradingsymbol"],
+            exchange,
+            token,
+            signal,
+            df
+        )
 
         candidates.append({
             "symbol": i["tradingsymbol"],
             "price": p,
-            "score": score,
-            "diff": diff
+            "diff": diff,
+            "score": score
         })
 
-    # =============================
-    # BEST PICK
-    # =============================
     print(f"📊 Candidates found: {len(candidates)}")
 
+    # =====================================
+    # BEST PICK
+    # =====================================
     if candidates:
         best = sorted(
             candidates,
@@ -1206,9 +1239,9 @@ def find_option(signal, instrument):
 
         return best["symbol"], best["price"], lot, exchange
 
-    # =============================
-    # RELAXED FALLBACK
-    # =============================
+    # =====================================
+    # FALLBACK
+    # =====================================
     print("⚠️ No ideal candidate — fallback")
 
     fallback = []
@@ -1228,7 +1261,7 @@ def find_option(signal, instrument):
         if p is None or p <= 0:
             continue
 
-        if 20 <= p <= max_price * 1.2:
+        if 20 <= p <= max_price * 1.8:
             fallback.append({
                 "symbol": i["tradingsymbol"],
                 "price": p,
@@ -1246,8 +1279,7 @@ def find_option(signal, instrument):
         return best["symbol"], best["price"], lot, exchange
 
     print("❌ No valid option found")
-    return None, None, None, None
-    
+    return None, None, None, None    
     
 
 

@@ -11,6 +11,7 @@ import csv
 import os
 import json
 from datetime import datetime, timedelta
+from datetime import timedelta, date
 
 if not os.path.exists("trade_log.csv"):
     with open("trade_log.csv", "w") as f:
@@ -2584,7 +2585,8 @@ def reset_daily_pnl():
     global report_sent_today, max_drawdown
     global portfolio_pnl, peak_portfolio   # ✅ CORRECT VARIABLES
 
-    today = datetime.date.today()
+    now = datetime.datetime.now()
+    today = date.today()
 
     if last_reset_date != today:
         print("🔄 Resetting daily stats")

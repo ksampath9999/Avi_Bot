@@ -2127,7 +2127,7 @@ def crude_loop():
     while True:
         try:
             now_dt = datetime.now(IST)
-
+            print("Crude Start")
             # Crude trades after Nifty hours
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
                 time.sleep(30)

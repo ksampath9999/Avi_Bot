@@ -169,6 +169,14 @@ cached_nifty_df = None
 cached_crude_5m = None
 cached_crude_15m = None
 
+# HalfTrend indicator cache — recomputed only when underlying data refreshes
+cached_nifty_ht = None
+cached_crude_ht = None
+
+# Per-instrument trade locks (replaces single global_trade_active for cross-instrument safety)
+nifty_trade_active = False
+crude_trade_active = False
+
 def is_nifty_trading_time():
     now = datetime.now(IST)
 
@@ -224,19 +232,25 @@ import numpy as np
 # TRUE TradingView ATR (Wilder RMA)
 # ta.atr(period)
 # ======================================
+import numpy as np
+
 def ATR(df, period=100):
     high = df["high"]
     low = df["low"]
     close = df["close"]
+    prev_close = close.shift()
 
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
-
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    # Wilder's RMA = TradingView style
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    # Vectorized calculation
+    tr = np.maximum(
+        high - low, 
+        np.maximum(
+            (high - prev_close).abs(), 
+            (low - prev_close).abs()
+        )
+    )
+    
+    # Using your existing (correct) RMA logic
+    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
     return atr
 
@@ -245,143 +259,148 @@ def ATR(df, period=100):
 # TRUE TradingView HalfTrend
 # Pine v6 exact logic
 # ======================================
+import pandas as pd
+import numpy as np
+
 def halftrend_tv(df, amplitude=2, channel_deviation=2):
+    """
+    Exact Python port of the TradingView HalfTrend indicator (Pine Script v6)
+    by Alex Orekhov (everget). GPL-3.0 licensed.
 
-    df = df.copy().reset_index(drop=True)
-
+    Outputs per bar:
+        trend     : 0 = bullish, 1 = bearish
+        ht        : HalfTrend line value (up when trend=0, down when trend=1)
+        atr2      : half of ATR(100) — used for arrow offset
+        atrHigh   : ht + channel_deviation * atr2  (upper channel band)
+        atrLow    : ht - channel_deviation * atr2  (lower channel band)
+        arrowUp   : non-NaN only on the bar a BUY arrow fires (= up - atr2)
+        arrowDown : non-NaN only on the bar a SELL arrow fires (= down + atr2)
+        buy       : True on the exact bar the buy arrow fires  → enter CALL
+        sell      : True on the exact bar the sell arrow fires → enter PUT
+    """
+    df = df.copy()
     n = len(df)
-    if n < 5:
-        return df
 
-    # --- ATR section ---
-    df["atr"] = ATR(df, 100)
-    df["atr2"] = df["atr"] / 2
-    df["dev"] = channel_deviation * df["atr2"]
+    # ── 1. ATR(100) Wilder RMA — matches ta.atr(100) exactly ──────────────
+    atr_series = ATR(df, 100)
+    atr2_arr   = (atr_series / 2).to_numpy()
+    dev_arr    = channel_deviation * atr2_arr
 
-    # --- storage arrays ---
-    trend = [0] * n
-    nextTrend = [0] * n
+    # ── 2. Rolling stats matching Pine's highestbars / lowestbars / sma ───
+    # ta.highestbars(amplitude) → index offset of highest bar in last `amplitude` bars
+    # high[math.abs(ta.highestbars(amplitude))] → the high VALUE at that bar
+    # This equals rolling(amplitude).max() — numerically identical.
+    # Pine's sma(high, amplitude) = rolling mean of high over amplitude bars.
+    high_arr = df['high'].to_numpy(dtype=float)
+    low_arr  = df['low'].to_numpy(dtype=float)
+    close_arr = df['close'].to_numpy(dtype=float)
 
-    maxLowPrice = [np.nan] * n
-    minHighPrice = [np.nan] * n
+    hp_arr  = df['high'].rolling(window=amplitude).max().to_numpy(dtype=float)   # highPrice
+    lp_arr  = df['low'].rolling(window=amplitude).min().to_numpy(dtype=float)    # lowPrice
+    hma_arr = df['high'].rolling(window=amplitude).mean().to_numpy(dtype=float)  # highma
+    lma_arr = df['low'].rolling(window=amplitude).mean().to_numpy(dtype=float)   # lowma
 
-    up = [np.nan] * n
-    down = [np.nan] * n
+    # ── 3. State arrays (all persistent — Pine `var`) ─────────────────────
+    trend        = np.zeros(n, dtype=float)
+    nextTrend    = np.zeros(n, dtype=float)
+    maxLowPrice  = np.zeros(n, dtype=float)
+    minHighPrice = np.zeros(n, dtype=float)
+    up           = np.zeros(n, dtype=float)
+    down         = np.zeros(n, dtype=float)
 
-    atrHigh = [np.nan] * n
-    atrLow = [np.nan] * n
+    # Pine var initialisation:
+    #   maxLowPrice = nz(low[1], low)  → low[0] on bar 0
+    #   minHighPrice = nz(high[1], high) → high[0] on bar 0
+    maxLowPrice[0]  = low_arr[0]
+    minHighPrice[0] = high_arr[0]
 
-    arrowUp = [np.nan] * n
-    arrowDown = [np.nan] * n
-
-    # ======================================
-    # EXACT Pine initialization
-    # ======================================
-    maxLowPrice[0] = df["low"].iloc[0]
-    minHighPrice[0] = df["high"].iloc[0]
-
-    up[0] = df["low"].iloc[0]
-    down[0] = df["high"].iloc[0]
+    # Output arrays for arrow values (NaN = no arrow on that bar)
+    arrowUp_arr   = np.full(n, np.nan)
+    arrowDown_arr = np.full(n, np.nan)
 
     for i in range(1, n):
+        # ── carry forward persistent vars ────────────────────────────────
+        trend[i]        = trend[i-1]
+        nextTrend[i]    = nextTrend[i-1]
+        maxLowPrice[i]  = maxLowPrice[i-1]
+        minHighPrice[i] = minHighPrice[i-1]
+        up[i]           = up[i-1]
+        down[i]         = down[i-1]
 
-        prev_trend = trend[i - 1]
-        prev_nextTrend = nextTrend[i - 1]
+        # Skip until rolling windows are fully populated
+        if i < amplitude:
+            continue
 
-        trend[i] = prev_trend
-        nextTrend[i] = prev_nextTrend
+        close_i     = close_arr[i]
+        low_prev    = low_arr[i-1]    # nz(low[1], low)
+        high_prev   = high_arr[i-1]   # nz(high[1], high)
+        hp          = hp_arr[i]        # highPrice
+        lp          = lp_arr[i]        # lowPrice
+        hma         = hma_arr[i]       # highma
+        lma         = lma_arr[i]       # lowma
+        atr2_i      = atr2_arr[i]
 
-        maxLowPrice[i] = maxLowPrice[i - 1]
-        minHighPrice[i] = minHighPrice[i - 1]
-
-        up[i] = up[i - 1]
-        down[i] = down[i - 1]
-
-        # ======================================
-        # TradingView highestbars / lowestbars equivalent
-        # lookback = amplitude + 1 candles
-        # ======================================
-        start = max(0, i - amplitude)
-        hh_window = df["high"].iloc[start:i + 1]
-        ll_window = df["low"].iloc[start:i + 1]
-
-        # last occurrence behavior closer to Pine
-        high_idx = hh_window[::-1].idxmax()
-        low_idx = ll_window[::-1].idxmin()
-
-        highPrice = df["high"].loc[high_idx]
-        lowPrice = df["low"].loc[low_idx]
-
-        highma = df["high"].iloc[start:i + 1].mean()
-        lowma = df["low"].iloc[start:i + 1].mean()
-
-        close_now = df["close"].iloc[i]
-        prev_low = df["low"].iloc[i - 1]
-        prev_high = df["high"].iloc[i - 1]
-
-        # ======================================
-        # EXACT TREND SWITCH LOGIC
-        # ======================================
-        if prev_nextTrend == 1:
-
-            maxLowPrice[i] = max(lowPrice, maxLowPrice[i - 1])
-
-            if highma < maxLowPrice[i] and close_now < prev_low:
-                trend[i] = 1
-                nextTrend[i] = 0
-                minHighPrice[i] = highPrice
-
+        # ── Trend logic (exact Pine if/else) ─────────────────────────────
+        if nextTrend[i] == 1:
+            maxLowPrice[i] = max(lp, maxLowPrice[i])
+            if hma < maxLowPrice[i] and close_i < low_prev:
+                trend[i]        = 1
+                nextTrend[i]    = 0
+                minHighPrice[i] = hp
         else:
+            minHighPrice[i] = min(hp, minHighPrice[i])
+            if lma > minHighPrice[i] and close_i > high_prev:
+                trend[i]       = 0
+                nextTrend[i]   = 1
+                maxLowPrice[i] = lp
 
-            minHighPrice[i] = min(highPrice, minHighPrice[i - 1])
+        # ── up / down line + arrow placement ─────────────────────────────
+        # Pine: trend[1] means previous bar trend → trend[i-1] in Python
+        prev_trend  = trend[i-1]
+        prev_up     = up[i-1]
+        prev_down   = down[i-1]
 
-            if lowma > minHighPrice[i] and close_now > prev_high:
-                trend[i] = 0
-                nextTrend[i] = 1
-                maxLowPrice[i] = lowPrice
-
-        # ======================================
-        # EXACT UP / DOWN LOGIC
-        # ======================================
         if trend[i] == 0:
-
-            if trend[i - 1] != 0:
-                up[i] = down[i - 1]
-                arrowUp[i] = up[i] - df["atr2"].iloc[i]
+            if prev_trend != 0:
+                # Trend just switched to bullish
+                # Pine: up := na(down[1]) ? down : down[1]
+                # In Python: if prev bar's down was 0 (never set), fall back to current down
+                up[i]            = prev_down if prev_down != 0 else down[i]
+                arrowUp_arr[i]   = up[i] - atr2_i   # Pine: arrowUp := up - atr2
             else:
-                up[i] = max(maxLowPrice[i], up[i - 1])
-
-            atrHigh[i] = up[i] + df["dev"].iloc[i]
-            atrLow[i] = up[i] - df["dev"].iloc[i]
-
+                # Pine: up := na(up[1]) ? maxLowPrice : math.max(maxLowPrice, up[1])
+                up[i] = max(maxLowPrice[i], prev_up) if prev_up != 0 else maxLowPrice[i]
         else:
-
-            if trend[i - 1] != 1:
-                down[i] = up[i - 1]
-                arrowDown[i] = down[i] + df["atr2"].iloc[i]
+            if prev_trend != 1:
+                # Trend just switched to bearish
+                # Pine: down := na(up[1]) ? up : up[1]
+                down[i]          = prev_up if prev_up != 0 else up[i]
+                arrowDown_arr[i] = down[i] + atr2_i  # Pine: arrowDown := down + atr2
             else:
-                down[i] = min(minHighPrice[i], down[i - 1])
+                # Pine: down := na(down[1]) ? minHighPrice : math.min(minHighPrice, down[1])
+                down[i] = min(minHighPrice[i], prev_down) if prev_down != 0 else minHighPrice[i]
 
-            atrHigh[i] = down[i] + df["dev"].iloc[i]
-            atrLow[i] = down[i] - df["dev"].iloc[i]
+    # ── 4. Output columns ─────────────────────────────────────────────────
+    ht_arr    = np.where(trend == 0, up, down)
+    atrHigh   = ht_arr + dev_arr
+    atrLow    = ht_arr - dev_arr
 
-    # ======================================
-    # Final output
-    # ======================================
-    df["trend"] = trend
-    df["ht"] = np.where(df["trend"] == 0, up, down)
+    df["trend"]      = trend
+    df["ht"]         = ht_arr
+    df["atr2"]       = atr2_arr
+    df["atrHigh"]    = atrHigh      # upper channel band (sell ribbon edge)
+    df["atrLow"]     = atrLow       # lower channel band (buy ribbon edge)
+    df["arrowUp"]    = arrowUp_arr   # NaN except on buy-signal bar
+    df["arrowDown"]  = arrowDown_arr # NaN except on sell-signal bar
 
-    df["atrHigh"] = atrHigh
-    df["atrLow"] = atrLow
-
-    df["arrowUp"] = arrowUp
-    df["arrowDown"] = arrowDown
-
-    df["buy"] = (~pd.isna(df["arrowUp"])) & (df["trend"] == 0) & (pd.Series(df["trend"]).shift(1) == 1)
-    df["sell"] = (~pd.isna(df["arrowDown"])) & (df["trend"] == 1) & (pd.Series(df["trend"]).shift(1) == 0)
+    # ── 5. Signal flags — exact Pine definition ───────────────────────────
+    # Pine: buySignal  = not na(arrowUp)   and trend == 0 and trend[1] == 1
+    # Pine: sellSignal = not na(arrowDown) and trend == 1 and trend[1] == 0
+    trend_series = df["trend"]
+    df["buy"]  = (~np.isnan(arrowUp_arr))   & (trend_series == 0) & (trend_series.shift(1) == 1)
+    df["sell"] = (~np.isnan(arrowDown_arr)) & (trend_series == 1) & (trend_series.shift(1) == 0)
 
     return df
-    
 #======
 def verify_halftrend(ht_df, name="VERIFY", bars=5):
     try:
@@ -389,47 +408,48 @@ def verify_halftrend(ht_df, name="VERIFY", bars=5):
             print(f"⚠️ {name}: Not enough data for verification")
             return
 
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 90)
         print(f"🔍 HALF TREND VERIFICATION MODE ({name})")
-        print("=" * 70)
+        print("=" * 90)
 
         check_df = ht_df.tail(bars).copy()
 
         for i in range(len(check_df)):
             row = check_df.iloc[i]
-
-            ts = row.name if row.name is not None else i
-
-            trend = "CALL" if row["trend"] == 0 else "PUT"
+            ts    = row.name if row.name is not None else i
+            trend = "CALL(0)" if row["trend"] == 0 else "PUT(1) "
 
             signal = "NONE"
             if row["buy"]:
-                signal = "BUY"
+                signal = "BUY ▲"
             elif row["sell"]:
-                signal = "SELL"
+                signal = "SELL ▼"
+
+            arrow_val = ""
+            if row["buy"]:
+                arrow_val = f"arrowUp={row['arrowUp']:.2f}  atrLow={row['atrLow']:.2f}"
+            elif row["sell"]:
+                arrow_val = f"arrowDn={row['arrowDown']:.2f}  atrHigh={row['atrHigh']:.2f}"
 
             print(
                 f"🕒 {ts} | "
-                f"Trend: {trend:4} | "
-                f"Signal: {signal:4} | "
-                f"Close: {row['close']:.2f} | "
-                f"HT: {row['ht']:.2f}"
+                f"Trend:{trend} | "
+                f"Signal:{signal:6} | "
+                f"Close:{row['close']:.2f} | "
+                f"HT:{row['ht']:.2f} | "
+                f"{arrow_val}"
             )
 
         last = ht_df.iloc[-2]
-
         final_signal = None
         if last["buy"]:
-            final_signal = "CALL"
+            final_signal = f"CALL  (arrowUp={last['arrowUp']:.2f}, enter near atrLow={last['atrLow']:.2f})"
         elif last["sell"]:
-            final_signal = "PUT"
+            final_signal = f"PUT   (arrowDn={last['arrowDown']:.2f}, enter near atrHigh={last['atrHigh']:.2f})"
 
-        print("-" * 70)
-        print(
-            f"🎯 CLOSED CANDLE DECISION → "
-            f"{final_signal if final_signal else 'NO NEW SIGNAL'}"
-        )
-        print("=" * 70 + "\n")
+        print("-" * 90)
+        print(f"🎯 CLOSED CANDLE DECISION → {final_signal if final_signal else 'NO NEW SIGNAL'}")
+        print("=" * 90 + "\n")
 
     except Exception as e:
         print("❌ Verification error:", e)
@@ -438,43 +458,10 @@ def verify_halftrend(ht_df, name="VERIFY", bars=5):
 
 
     
-def detect_market_type(df):
+# NOTE: detect_market_type() is defined further below (single authoritative version).
+# The duplicate that was here has been removed to prevent silent override.
 
-    if df is None or len(df) < 20:
-        return "NORMAL"
 
-    df = prepare_indicators(df)
-
-    last = df.iloc[-1]
-
-    # -----------------------------
-    # 📊 VOLATILITY
-    # -----------------------------
-    range_ = df["high"].max() - df["low"].min()
-    price = last["close"]
-
-    volatility = range_ / price
-
-    # -----------------------------
-    # 📈 TREND STRENGTH
-    # -----------------------------
-    trend_move = abs(df.iloc[-1]["close"] - df.iloc[0]["close"]) / price
-
-    # -----------------------------
-    # 🎯 LOGIC
-    # -----------------------------
-    if trend_move > 0.008:
-        return "TREND"
-
-    elif volatility < 0.003:
-        return "SIDEWAYS"
-
-    elif volatility > 0.01:
-        return "VOLATILE"
-
-    return "NORMAL"
-    
-    
 
 def evaluate_strategies():
 
@@ -709,9 +696,8 @@ def can_trade():
     if last_loss_time and time.time() - last_loss_time < config.COOLDOWN_AFTER_LOSS:
         return False
 
-    # 🚫 Losing streak control
+    # 🚫 Losing streak control — do NOT sleep here; let the loop handle the pause
     if loss_streak >= 3:
-        time.sleep(120)
         return False
 
     return True
@@ -1087,7 +1073,7 @@ def find_option(signal, instrument):
         step = 50
         token = config.NIFTY_TOKEN
         token_symbol = "NSE:NIFTY 50"
-        lot_size = 65
+        lot_size = 65         
     else:
         exchange = "MCX"
         name = "CRUDEOIL"
@@ -1132,18 +1118,26 @@ def find_option(signal, instrument):
             strike_shift = 1
             max_price = 120
     else:
-        if balance <= 5000:
-            strike_shift = 8
-            max_price = 60
-        elif balance <= 10000:
-            strike_shift = 6
-            max_price = 100
+        # NIFTY — lot size 65, 5% risk model
+        # max_price = max affordable premium so 1 lot value <= 40% of balance
+        # 1 lot value = premium * 65
+        # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 133
+        # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 266
+        if balance <= 10000:
+            strike_shift = 8      # deep OTM — very cheap premium
+            max_price = 50        # max ₹50 premium → ₹3,750 per lot (fits ₹10k)
         elif balance <= 20000:
-            strike_shift = 4
-            max_price = 150
+            strike_shift = 6      # OTM
+            max_price = 100       # max ₹100 premium → ₹7,500 per lot
+        elif balance <= 35000:
+            strike_shift = 4      # slight OTM
+            max_price = 160       # max ₹160 premium → ₹12,000 per lot
+        elif balance <= 50000:
+            strike_shift = 2      # near ATM
+            max_price = 230       # max ₹230 premium → ₹17,250 per lot
         else:
-            strike_shift = -1
-            max_price = 300
+            strike_shift = 1      # ATM / 1 strike OTM
+            max_price = 350       # max ₹350 premium → ₹26,250 per lot
 
     # =====================================
     # OPTION TYPE + CORRECT STRIKE DIRECTION
@@ -1204,8 +1198,7 @@ def find_option(signal, instrument):
         diff = abs(strike - target_strike)
         trade_value = p * lot_size
 
-        # only strict affordability for NIFTY
-        if instrument == "NIFTY" and trade_value > balance * 0.95:
+        if instrument == "NIFTY" and trade_value > balance * 0.80:
             continue
 
         score = score_option(
@@ -1362,7 +1355,25 @@ def place_order(symbol, qty, exchange, instrument):
 
         quantity = get_quantity(qty, exchange)
 
-        print(f"➡️ Placing LIMIT order @ {price}")
+        # ✅ LIVE BALANCE SUFFICIENCY CHECK — block order if balance too low
+        try:
+            live_balance = get_balance(instrument)
+            total_cost   = price * quantity          # total ₹ this order will deploy
+            min_required = total_cost * 1.10         # 10% buffer for margin/charges
+
+            print(f"💰 Balance check → Available: ₹{live_balance:,.0f}  |  Order cost: ₹{total_cost:,.0f}  |  Required (with buffer): ₹{min_required:,.0f}")
+
+            if live_balance < min_required:
+                msg = (f"🚫 Insufficient balance for {symbol}\n"
+                       f"Need ₹{min_required:,.0f}, have ₹{live_balance:,.0f}")
+                print(msg)
+                send_message(msg)
+                return None
+
+        except Exception as e:
+            print(f"⚠️ Balance check failed: {e} — proceeding with order")
+
+        print(f"➡️ Placing LIMIT order @ {price}  qty={quantity}")
 
         # 🚀 PLACE ORDER
         order_id = kite.place_order(
@@ -1376,7 +1387,12 @@ def place_order(symbol, qty, exchange, instrument):
             product="MIS" if exchange == "NFO" else "NRML"
         )
 
-        send_message(f"📥 Order placed: {symbol} @ {price}")
+        send_message(
+            f"📥 Order placed: {symbol}\n"
+            f"   Price: ₹{price:.1f}  |  Qty: {quantity}  |  Lots: {qty}\n"
+            f"   Total deployed: ₹{price * quantity:,.0f}\n"
+            f"   Max risk (20% SL): ₹{price * 0.20 * quantity:,.0f}"
+        )
 
         filled_price = None
 
@@ -1432,14 +1448,10 @@ def place_order(symbol, qty, exchange, instrument):
         slippage = abs(filled_price - expected_price)
 
         if slippage > expected_price * 0.012:  # tighter control
-            print(f"❌ High slippage: {slippage}")
-            send_message(f"❌ Trade rejected (slippage)\n{symbol}")
-
-            try:
-                kite.cancel_order(variety="regular", order_id=order_id)
-            except:
-                pass
-
+            print(f"❌ High slippage: {slippage} — exiting filled position immediately")
+            send_message(f"❌ Trade slippage exit\n{symbol} slippage={slippage:.2f}")
+            # The order is already FILLED — cancel won't work. Exit the position instead.
+            exit_position(symbol, quantity, exchange)
             return None
 
         print(f"✅ Filled @ {filled_price}")
@@ -1590,8 +1602,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     50
                 )
 
-                atr = df_trail["high"].rolling(14).max() - df_trail["low"].rolling(14).min()
-                atr_value = atr.iloc[-1] if atr is not None else entry * 0.02
+                # FIX: use the ATR() function (Wilder RMA), not a high-low range
+                atr_series = ATR(df_trail, period=14)
+                atr_value = atr_series.iloc[-1] if not atr_series.isna().iloc[-1] else entry * 0.02
 
             except:
                 atr_value = entry * 0.02
@@ -1617,7 +1630,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 else:
                     sl = min(sl, peak + (atr_value * 0.8))
 
-            # 🔥 HALF TREND EXIT (NEW)
+            # 🔥 HALF TREND EXIT — Pine-accurate: exit when opposite arrow fires on closed candle
             try:
                 df_ht_exit = get_cached_data(
                     CRUDE_TOKEN if instrument == "CRUDE" else config.NIFTY_TOKEN,
@@ -1627,20 +1640,24 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
                 ht_df_exit = halftrend_tv(df_ht_exit)
 
+                # Use closed candle (-2) — same anti-repaint rule as entry
                 last_exit = ht_df_exit.iloc[-2]
 
+                # Pine: buySignal = not na(arrowUp) and trend==0 and trend[1]==1
+                # Pine: sellSignal = not na(arrowDown) and trend==1 and trend[1]==0
                 exit_signal = None
-                if last_exit['buy']:
+                if last_exit["buy"]:
                     exit_signal = "CALL"
-                elif last_exit['sell']:
+                elif last_exit["sell"]:
                     exit_signal = "PUT"
 
                 if exit_signal and exit_signal != signal:
+                    print(f"🔄 HalfTrend Exit Triggered — new arrow: {exit_signal}, was in: {signal}")
+                    print(f"   HT={last_exit['ht']:.2f}  atrHigh={last_exit['atrHigh']:.2f}  atrLow={last_exit['atrLow']:.2f}")
                     if not exit_done:
                         exit_position(symbol, remaining_qty, exchange)
                         exit_done = True
 
-                    print("🔄 HalfTrend Exit Triggered")
                     pnl = current_pnl
                     break
 
@@ -1701,12 +1718,13 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             update_streak(pnl)
             update_exit_time(instrument)
             
-            
 
             if instrument == "NIFTY":
                 nifty_active = False
+                nifty_trade_active = False
             else:
                 crude_active = False
+                crude_trade_active = False
                 
             
             global_trade_active = False
@@ -1835,20 +1853,23 @@ def tune_strategy():
 def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probability, market_type):
 
     global nifty_active, crude_active
+    global nifty_trade_active, crude_trade_active
 
     try:
         manage_trade(symbol, price, lot, exchange, instrument, signal, probability, market_type)
 
     finally:
         with lock:
-            global global_trade_active   # 🔥 ADD THIS
+            global global_trade_active
 
             if instrument == "NIFTY":
                 nifty_active = False
+                nifty_trade_active = False
             else:
                 crude_active = False
+                crude_trade_active = False
 
-            global_trade_active = False   # 🔥 ADD THIS
+            global_trade_active = False
 
             
             
@@ -1958,14 +1979,12 @@ def ai_trade_filter(token, signal, df):
 # 🔥 NIFTY LOOP (UPDATED)
 # =========================
 
-# =====================================================
-# 🔥 NIFTY LOOP (ARROW ONLY MODE)
-# =====================================================
 def nifty_loop():
     global last_running_signal, current_symbol, current_qty, current_exchange
     global last_executed_signal_nifty, global_trade_active
     global last_status, last_weak_log_time
-    global last_fetch_nifty, cached_nifty_df
+    global last_fetch_nifty, cached_nifty_df, cached_nifty_ht
+    global nifty_trade_active
 
     while True:
         try:
@@ -1976,323 +1995,240 @@ def nifty_loop():
                 print("🛑 NIFTY time over — stopping")
                 break
 
-            # =====================================
-            # Refresh Cache
-            # =====================================
+            # Reset daily stats at start of new trading day
+            reset_daily_pnl()
+
+            # Loss streak cooldown — sleep OUTSIDE lock
+            if loss_streak >= 3:
+                print("⚠️ Loss streak >= 3 — pausing NIFTY 2 min")
+                time.sleep(120)
+                continue
+
+            # Refresh data cache every 30 seconds
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
-                cached_nifty_df = get_cached_data(
-                    config.NIFTY_TOKEN,
-                    "15minute",
-                    200
-                )
+                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 200)
+                # Recompute HalfTrend only when data refreshes — not every loop tick
+                if cached_nifty_df is not None and len(cached_nifty_df) >= 120:
+                    cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=2, channel_deviation=2)
                 last_fetch_nifty = time.time()
 
-            if cached_nifty_df is None:
+            if cached_nifty_df is None or len(cached_nifty_df) < 120 or cached_nifty_ht is None:
                 time.sleep(10)
                 continue
 
-            df = cached_nifty_df.copy()
+            ht_df = cached_nifty_ht
 
-            if df.empty or len(df) < 120:
-                time.sleep(10)
-                continue
+            # EXTREMELY IMPORTANT: We look at index -2 (the last CLOSED candle)
+            # This prevents entering trades on arrows that disappear (repainting)
+            last_closed_candle = ht_df.iloc[-2]
 
-            # =====================================
-            # Indicators + HalfTrend
-            # =====================================
-            df = prepare_indicators(df)
-            ht_df = halftrend_tv(df, amplitude=2, channel_deviation=2)
-
-            if len(ht_df) < 10:
-                time.sleep(10)
-                continue
-
-            # Last CLOSED candle only
-            last = ht_df.iloc[-2]
-
-            if DEBUG:
-                verify_halftrend(ht_df, name="NIFTY", bars=5)
-
-            # =====================================
-            # ARROW ONLY SIGNAL
-            # =====================================
+            # --- Signal Detection: matches Pine's buySignal / sellSignal exactly ---
+            # Pine: buySignal  = not na(arrowUp)   and trend==0 and trend[1]==1
+            # Pine: sellSignal = not na(arrowDown)  and trend==1 and trend[1]==0
+            # Arrow placement: arrowUp at atrLow, arrowDown at atrHigh
             signal = None
+            arrow_level = None
 
-            if last["buy"]:
+            if last_closed_candle["buy"]:    # Green arrow — arrowUp fired
                 signal = "CALL"
-
-            elif last["sell"]:
+                arrow_level = last_closed_candle["atrLow"]   # Pine plots arrow at atrLow
+                print(f"🟢 NIFTY BUY arrow @ atrLow={arrow_level:.2f}  HT={last_closed_candle['ht']:.2f}")
+            elif last_closed_candle["sell"]: # Red arrow — arrowDown fired
                 signal = "PUT"
+                arrow_level = last_closed_candle["atrHigh"]  # Pine plots arrow at atrHigh
+                print(f"🔴 NIFTY SELL arrow @ atrHigh={arrow_level:.2f}  HT={last_closed_candle['ht']:.2f}")
 
-            else:
+            # Log if no arrow is present
+            if signal is None:
                 status = "NO_ARROW_NIFTY"
-
-                if last_status != status or time.time() - last_weak_log_time > 30:
-                    print("⏸️ No new HalfTrend arrow — waiting (NIFTY)")
+                if last_status != status or time.time() - last_weak_log_time > 60:
+                    print("⏸️ Waiting for NIFTY HalfTrend Arrow...")
                     last_status = status
                     last_weak_log_time = time.time()
-
                 time.sleep(10)
                 continue
 
-            # =====================================
-            # Prevent duplicate same-side trade
-            # =====================================
+            # --- Rule 1: Prevent duplicate entry on the same arrow ---
             if signal == last_executed_signal_nifty:
                 time.sleep(10)
                 continue
 
-            # =====================================
-            # Flip Exit
-            # =====================================
-            if global_trade_active and last_running_signal and signal != last_running_signal:
-                print(f"🔁 NIFTY Flip: {last_running_signal} → {signal}")
+            # --- Rule 2: Flip/Exit Logic ---
+            # If we are in a trade and the opposite arrow appears, exit immediately
+            with lock:
+                is_active = global_trade_active
 
+            if is_active and last_running_signal and signal != last_running_signal:
+                print(f"🔁 NIFTY Flip Signal: {last_running_signal} → {signal}. Exiting current position.")
                 exit_position(current_symbol, current_qty, current_exchange)
-
                 with lock:
                     global_trade_active = False
-
+                    nifty_trade_active = False
                 last_running_signal = None
-                last_executed_signal_nifty = None
+                # Small sleep to let Zerodha process the exit before we enter the flip
+                time.sleep(2)
 
-                time.sleep(10)
-                continue
+            # --- Rule 3: Entry Logic — use per-instrument lock ---
+            with lock:
+                if nifty_trade_active:  # Only block NIFTY, not CRUDE
+                    time.sleep(10)
+                    continue
+                nifty_trade_active = True
+                global_trade_active = True  # also set global for flip detection
 
-            print(f"🧠 FINAL NIFTY SIGNAL: {signal}")
-
-            # =====================================
-            # Find Option
-            # =====================================
+            print(f"🧠 HalfTrend Arrow Detected: {signal}")
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
             if not symbol or price is None:
+                with lock:
+                    nifty_trade_active = False
+                    global_trade_active = False
                 time.sleep(10)
                 continue
 
-            # =====================================
-            # Lock Protection
-            # =====================================
-            with lock:
-                busy = global_trade_active
-                if not busy:
-                    global_trade_active = True
-
-            if busy:
-                time.sleep(10)
-                continue
-
-            # =====================================
-            # Place Order
-            # =====================================
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
-            if not filled_price:
+            if filled_price:
+                last_running_signal = signal
+                last_executed_signal_nifty = signal
+                current_symbol = symbol
+                current_qty = lot
+                current_exchange = exchange
+
+                threading.Thread(
+                    target=run_trade_wrapper,
+                    args=(symbol, filled_price, lot, exchange, "NIFTY", signal, 0, "TREND"),
+                    daemon=True
+                ).start()
+                print(f"🎯 NIFTY Trade Executed: {symbol} @ {filled_price}")
+            else:
                 with lock:
+                    nifty_trade_active = False
                     global_trade_active = False
-
-                time.sleep(10)
-                continue
-
-            # =====================================
-            # Start Trade Manager
-            # =====================================
-            threading.Thread(
-                target=run_trade_wrapper,
-                args=(
-                    symbol,
-                    filled_price,
-                    lot,
-                    exchange,
-                    "NIFTY",
-                    signal,
-                    0,
-                    "TREND"
-                ),
-                daemon=True
-            ).start()
-
-            print(f"🎯 NIFTY TRADE → {signal}")
-
-            last_running_signal = signal
-            last_executed_signal_nifty = signal
-            current_symbol = symbol
-            current_qty = lot
-            current_exchange = exchange
 
         except Exception as e:
             print("❌ NIFTY LOOP ERROR:", e)
-
+        
         time.sleep(10)
 
 
 # =====================================================
 # 🔥 CRUDE LOOP (ARROW ONLY MODE)
 # =====================================================
+
 def crude_loop():
     global last_running_signal, current_symbol, current_qty, current_exchange
     global last_executed_signal_crude, global_trade_active
     global last_status, last_weak_log_time
-    global last_fetch_crude, cached_crude_5m, cached_crude_15m
+    global last_fetch_crude, cached_crude_15m, cached_crude_ht
+    global crude_trade_active
 
     while True:
         try:
             now_dt = datetime.now(IST)
 
-            # Start after NIFTY close
+            # Crude trades after Nifty hours
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
-                print("⏳ CRUDE waiting for start time...")
-                time.sleep(5)
+                time.sleep(30)
                 continue
 
-            # =====================================
-            # Refresh Cache
-            # =====================================
-            if time.time() - last_fetch_crude > 10 or cached_crude_15m is None:
-                cached_crude_5m = get_cached_data(CRUDE_TOKEN, "5minute", 150)
+            # Reset daily stats at start of new day
+            reset_daily_pnl()
+
+            # Loss streak cooldown — sleep OUTSIDE lock
+            if loss_streak >= 3:
+                print("⚠️ Loss streak >= 3 — pausing CRUDE 2 min")
+                time.sleep(120)
+                continue
+
+            # Refresh data cache every 20 seconds
+            if time.time() - last_fetch_crude > 20 or cached_crude_15m is None:
                 cached_crude_15m = get_cached_data(CRUDE_TOKEN, "15minute", 150)
+                # Recompute HalfTrend only when data refreshes
+                if cached_crude_15m is not None and len(cached_crude_15m) >= 50:
+                    cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=2, channel_deviation=2)
                 last_fetch_crude = time.time()
 
-            if cached_crude_15m is None:
+            if cached_crude_15m is None or len(cached_crude_15m) < 50 or cached_crude_ht is None:
                 time.sleep(10)
                 continue
 
-            df = cached_crude_5m.copy()
-            df_ht = cached_crude_15m.copy()
+            ht_df = cached_crude_ht
 
-            if df.empty or df_ht.empty:
-                time.sleep(10)
-                continue
+            # Signal on last CLOSED candle — Pine-accurate buySignal / sellSignal
+            last_closed = ht_df.iloc[-2]
 
-            if len(df_ht) < 50:
-                time.sleep(10)
-                continue
-
-            # =====================================
-            # Indicators + HalfTrend
-            # =====================================
-            ht_df = halftrend_tv(df_ht, amplitude=2, channel_deviation=2)
-
-            if len(ht_df) < 10:
-                time.sleep(10)
-                continue
-
-            # Last CLOSED candle only
-            last = ht_df.iloc[-2]
-
-            if DEBUG:
-                verify_halftrend(ht_df, name="CRUDE", bars=5)
-
-            # =====================================
-            # ARROW ONLY SIGNAL
-            # =====================================
             signal = None
+            arrow_level = None
 
-            if last["buy"]:
+            if last_closed["buy"]:    # Green arrow
                 signal = "CALL"
-
-            elif last["sell"]:
+                arrow_level = last_closed["atrLow"]
+                print(f"🟢 CRUDE BUY arrow @ atrLow={arrow_level:.2f}  HT={last_closed['ht']:.2f}")
+            elif last_closed["sell"]: # Red arrow
                 signal = "PUT"
+                arrow_level = last_closed["atrHigh"]
+                print(f"🔴 CRUDE SELL arrow @ atrHigh={arrow_level:.2f}  HT={last_closed['ht']:.2f}")
 
-            else:
-                status = "NO_ARROW_CRUDE"
-
-                if last_status != status or time.time() - last_weak_log_time > 30:
-                    print("⏸️ No new HalfTrend arrow — waiting (CRUDE)")
-                    last_status = status
-                    last_weak_log_time = time.time()
-
+            if signal is None:
                 time.sleep(10)
                 continue
 
-            # =====================================
-            # Prevent duplicate same-side trade
-            # =====================================
+            # Skip if signal is same as last executed
             if signal == last_executed_signal_crude:
                 time.sleep(10)
                 continue
 
-            # =====================================
-            # Flip Exit
-            # =====================================
-            if global_trade_active and last_running_signal and signal != last_running_signal:
+            # Flip/Exit Logic
+            with lock:
+                is_active = global_trade_active
+
+            if is_active and last_running_signal and signal != last_running_signal:
                 print(f"🔁 CRUDE Flip: {last_running_signal} → {signal}")
-
                 exit_position(current_symbol, current_qty, current_exchange)
-
                 with lock:
                     global_trade_active = False
-
+                    crude_trade_active = False
                 last_running_signal = None
-                last_executed_signal_crude = None
+                time.sleep(2)
 
-                time.sleep(10)
-                continue
+            # Entry Logic — use per-instrument lock
+            with lock:
+                if crude_trade_active:  # Only block CRUDE, not NIFTY
+                    time.sleep(10)
+                    continue
+                crude_trade_active = True
+                global_trade_active = True  # also set global for flip detection
 
-            print(f"🧠 FINAL CRUDE SIGNAL: {signal}")
-
-            # =====================================
-            # Find Option
-            # =====================================
+            print(f"🧠 CRUDE Arrow Detected: {signal}")
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
 
-            if not symbol or price is None:
-                time.sleep(10)
-                continue
+            if symbol:
+                filled_price = place_order(symbol, lot, exchange, "CRUDE")
+                if filled_price:
+                    last_running_signal = signal
+                    last_executed_signal_crude = signal
+                    current_symbol = symbol
+                    current_qty = lot
+                    current_exchange = exchange
 
-            # =====================================
-            # Lock Protection
-            # =====================================
-            with lock:
-                busy = global_trade_active
-                if not busy:
-                    global_trade_active = True
-
-            if busy:
-                time.sleep(10)
-                continue
-
-            # =====================================
-            # Place Order
-            # =====================================
-            filled_price = place_order(symbol, lot, exchange, "CRUDE")
-
-            if not filled_price:
+                    threading.Thread(
+                        target=run_trade_wrapper,
+                        args=(symbol, filled_price, lot, exchange, "CRUDE", signal, 0, "TREND"),
+                        daemon=True
+                    ).start()
+                else:
+                    with lock:
+                        crude_trade_active = False
+                        global_trade_active = False
+            else:
                 with lock:
+                    crude_trade_active = False
                     global_trade_active = False
-
-                time.sleep(10)
-                continue
-
-            # =====================================
-            # Start Trade Manager
-            # =====================================
-            threading.Thread(
-                target=run_trade_wrapper,
-                args=(
-                    symbol,
-                    filled_price,
-                    lot,
-                    exchange,
-                    "CRUDE",
-                    signal,
-                    0,
-                    "TREND"
-                ),
-                daemon=True
-            ).start()
-
-            print(f"🎯 CRUDE TRADE → {signal}")
-
-            last_running_signal = signal
-            last_executed_signal_crude = signal
-            current_symbol = symbol
-            current_qty = lot
-            current_exchange = exchange
 
         except Exception as e:
             print("❌ CRUDE LOOP ERROR:", e)
-
+        
         time.sleep(10)
 
 #==================        
@@ -2395,92 +2331,141 @@ def confirm_entry(token, signal, df=None):
         return False
     
 def get_quantity(lots, exchange):
-    if exchange == "NFO":   # NIFTY
+    if exchange == "NFO":    
         return lots * 65
-    elif exchange == "MCX": # CRUDE
-        return lots
+    elif exchange == "MCX":  # CRUDE OIL
+        return lots * 100
     return lots
     
 def get_balance(instrument):
-    margin = kite.margins()
+    """
+    Returns the live available cash balance from Kite for the given instrument.
+    NIFTY → equity segment
+    CRUDE → commodity segment
+    """
+    try:
+        margin = kite.margins()
+        if instrument == "NIFTY":
+            seg = margin.get("equity", {}).get("available", {})
+        else:
+            seg = margin.get("commodity", {}).get("available", {})
 
-    if instrument == "NIFTY":
-        return margin["equity"]["available"].get("live_balance", 0)
-    else:
-        return margin["commodity"]["available"].get("live_balance", 0)
+        # Kite returns live_balance when intraday, cash otherwise
+        balance = seg.get("live_balance") or seg.get("cash") or 0
+        balance = float(balance)
+
+        if balance <= 0:
+            print(f"⚠️ get_balance: zero or negative balance for {instrument}")
+
+        return balance
+
+    except Exception as e:
+        print(f"❌ get_balance error for {instrument}: {e}")
+        return 0
         
         
 def calculate_lots(price, exchange, instrument, strong_trend=False):
-    #comment if want to auto lot selection
-    return 1 
+    """
+    Balance-aware lot sizing for Nifty (NFO) and Crude (MCX).
 
+    Logic:
+      1. Fetch live available balance from Kite.
+      2. Risk amount = balance * RISK_PCT (5% by default).
+      3. SL is assumed at 20% of option premium (i.e. exit if premium drops 20%).
+      4. risk_per_lot = SL_points * lot_size
+      5. lots = floor(risk_amount / risk_per_lot)
+      6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
+      7. Streak and drawdown adjustments applied last.
+
+    Nifty lot size = 65.
+    Crude lot size = 100 bbls.
+    """
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio
 
-    balance = get_balance(instrument) or 10000
-    risk_amount = balance * config.RISK_PER_TRADE * adaptive_config["risk_multiplier"]
+    # ── Risk parameters ──────────────────────────────────────────────────
+    RISK_PCT         = 0.05    # 5% of balance risked per trade
+    SL_PCT           = 0.20    # assume SL at 20% drop in option premium
+    MAX_CAPITAL_PCT  = 0.80    # never deploy more than 80% of balance in one trade
+    MAX_LOTS_NIFTY   = 5       # hard ceiling — adjust to your comfort
+    MAX_LOTS_CRUDE   = 3
 
-    # -----------------------------
-    # LOT SIZE BASE
-    # -----------------------------
-    if instrument == "CRUDE":
-        lot_size = 100
+    # ── Lot sizes ─────────────────────────────────────────────────────────
+    if instrument == "NIFTY":
+        lot_size = 65       
+        max_lots = MAX_LOTS_NIFTY
     else:
-        lot_size = 65 if exchange == "NFO" else 100
+        lot_size = 100         # Crude Oil MCX lot size
+        max_lots = MAX_LOTS_CRUDE
 
-    sl_points = price * 0.10
-    risk_per_lot = sl_points * lot_size
-
-    if risk_per_lot == 0:
+    # ── 1. Live balance ───────────────────────────────────────────────────
+    try:
+        balance = get_balance(instrument)
+        if not balance or balance <= 0:
+            print("⚠️ Balance fetch failed — defaulting to 1 lot")
+            return 1
+    except Exception as e:
+        print(f"⚠️ Balance error: {e} — defaulting to 1 lot")
         return 1
 
-    lots = int(risk_amount / risk_per_lot)
+    print(f"💰 Live balance ({instrument}): ₹{balance:,.0f}")
 
-    # -----------------------------
-    # 🔥 AUTO SCALE ENGINE
-    # -----------------------------
+    # ── 2. Risk amount ────────────────────────────────────────────────────
+    risk_amount = balance * RISK_PCT * adaptive_config["risk_multiplier"]
+    print(f"🎯 Risk amount (5%): ₹{risk_amount:,.0f}")
 
-    # 🟢 Minimum safety
-    lots = max(1, lots)
+    # ── 3. Risk per lot ───────────────────────────────────────────────────
+    sl_points      = price * SL_PCT          # points lost if SL hit
+    risk_per_lot   = sl_points * lot_size    # ₹ loss per lot if SL hit
+    trade_value_1  = price * lot_size        # ₹ deployed per lot
 
-    # 🚀 Win streak scaling
-    if win_streak >= 2:
-        print("🚀 Scaling up (win streak)")
-        lots = int(lots * 1.4)
+    if risk_per_lot <= 0 or trade_value_1 <= 0:
+        print("⚠️ Invalid price for lot calculation — defaulting to 1 lot")
+        return 1
 
-    # 🛑 Loss streak protection
-    if loss_streak >= 2:
-        print("⚠️ Scaling down (loss streak)")
+    print(f"📊 Option premium: ₹{price:.1f}  |  SL pts: ₹{sl_points:.1f}  |  Risk/lot: ₹{risk_per_lot:.0f}  |  Deploy/lot: ₹{trade_value_1:.0f}")
+
+    # ── 4. Lots from risk model ───────────────────────────────────────────
+    lots_by_risk = int(risk_amount / risk_per_lot)
+
+    # ── 5. Lots from capital cap (never deploy > 40% of balance) ─────────
+    max_deployable   = balance * MAX_CAPITAL_PCT
+    lots_by_capital  = int(max_deployable / trade_value_1)
+
+    lots = min(lots_by_risk, lots_by_capital)
+    print(f"📐 Lots by risk={lots_by_risk}  |  Lots by capital cap={lots_by_capital}  |  Chosen={lots}")
+
+    # ── 6. Streak adjustments ─────────────────────────────────────────────
+    if win_streak >= 3:
+        lots = int(lots * 1.3)
+        print(f"🚀 Win streak {win_streak} → scale up to {lots} lots")
+    elif win_streak >= 2:
+        lots = int(lots * 1.15)
+        print(f"📈 Win streak {win_streak} → slight scale up to {lots} lots")
+
+    if loss_streak >= 3:
+        lots = 1
+        print(f"🛑 Loss streak {loss_streak} → forced to 1 lot")
+    elif loss_streak >= 2:
         lots = max(1, int(lots * 0.6))
+        print(f"⚠️ Loss streak {loss_streak} → scale down to {lots} lots")
 
-    # 🛑 Drawdown protection
+    # ── 7. Drawdown protection ────────────────────────────────────────────
     drawdown = peak_portfolio - portfolio_pnl
     if drawdown > abs(config.MAX_DRAWDOWN) * 0.5:
-        print("🚫 Drawdown protection active")
         lots = 1
+        print(f"🚫 Drawdown ₹{drawdown:.0f} > 50% of max — forced to 1 lot")
 
-    # -----------------------------
-    # 📈 TREND BOOST (CONTROLLED)
-    # -----------------------------
-    if strong_trend and win_streak >= 1:
-        print("📈 Trend boost")
+    # ── 8. Trend boost (only when already profitable today) ──────────────
+    if strong_trend and win_streak >= 2 and daily_pnl > 0:
         lots = int(lots * 1.2)
+        print(f"📈 Strong trend + winning day → boost to {lots} lots")
 
-    # -----------------------------
-    # 💰 CAPITAL SCALING
-    # -----------------------------
-    if balance > 20000:
-        lots = int(lots * 1.2)
-
-    if balance > 50000:
-        lots = int(lots * 1.4)
-
-    # -----------------------------
-    # FINAL SAFETY
-    # -----------------------------
+    # ── 9. Hard floor and ceiling ─────────────────────────────────────────
     lots = max(1, lots)
-    lots = min(lots, config.MAX_LOTS)
+    lots = min(lots, max_lots)
 
+    print(f"✅ Final lots: {lots}  |  Total deployed: ₹{lots * trade_value_1:,.0f}  |  Max risk: ₹{lots * risk_per_lot:,.0f}")
     return lots
 
 def is_strong_trend_day(token, df=None):
@@ -2621,6 +2606,9 @@ def reset_daily_pnl():
         loss_streak = 0
         report_sent_today = False
         max_drawdown = 0
+
+        # Clear stale option chain cache from prior trading day
+        instrument_cache.clear()
 
         last_reset_date = today
         
@@ -3170,16 +3158,16 @@ def choose_best_strategy(df, token):
         signal = elite_signal(df)
 
     # -----------------------------
-    # SIDEWAYS
+    # SIDEWAYS — mean reversion: fade the breakout
     # -----------------------------
     elif market_type == "SIDEWAYS":
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
         if last["close"] < prev["low"]:
-            signal = "CALL"
+            signal = "PUT"   # price broke below support — bearish
         elif last["close"] > prev["high"]:
-            signal = "PUT"
+            signal = "CALL"  # price broke above resistance — bullish
         else:
             signal = "HOLD"
 
@@ -3240,11 +3228,12 @@ def backtest_full(token, instrument, days=5):
 
     print(f"📊 Running backtest for {instrument}")
 
+    from datetime import timedelta
     now = datetime.now()
 
     df = pd.DataFrame(kite.historical_data(
         token,
-        now - datetime.timedelta(days=days),
+        now - timedelta(days=days),
         now,
         "5minute"
     ))
@@ -3324,7 +3313,8 @@ def send_daily_report():
             return
 
         df["time"] = pd.to_datetime(df["time"])
-        today = datetime.date.today()
+        from datetime import date
+        today = date.today()
 
         today_df = df[df["time"].dt.date == today]
 
@@ -3495,6 +3485,7 @@ if __name__ == "__main__":
     def refresh_tokens():
         data_cache.clear()
         ltp_cache.clear()
+        instrument_cache.clear()  # Clear stale option chains from prior day
         global CRUDE_TOKEN, NIFTY_FUT_TOKEN
         global CRUDE_SYMBOL
         CRUDE_SYMBOL = None

@@ -1118,26 +1118,20 @@ def find_option(signal, instrument):
             strike_shift = 1
             max_price = 120
     else:
-        # NIFTY — lot size 65, 5% risk model
-        # max_price = max affordable premium so 1 lot value <= 40% of balance
-        # 1 lot value = premium * 65
-        # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 133
-        # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 266
-        if balance <= 10000:
-            strike_shift = 12      # deep OTM — very cheap premium
-            max_price = 100       # max ₹50 premium → ₹3,750 per lot (fits ₹10k)
+        # NIFTY dynamic affordability logic
+        safe_capital = balance * 0.75
+        max_price = round(safe_capital / lot_size, 1)
+
+        if balance <= 12000:
+            strike_shift = 10
         elif balance <= 20000:
-            strike_shift = 10     # OTM
-            max_price = 150       # max ₹100 premium → ₹7,500 per lot
+            strike_shift = 7
         elif balance <= 35000:
-            strike_shift = 5     # slight OTM
-            max_price = 180      # max ₹160 premium → ₹12,000 per lot
+            strike_shift = 4
         elif balance <= 50000:
-            strike_shift = 2      # near ATM
-            max_price = 200      # max ₹230 premium → ₹17,250 per lot
+            strike_shift = 2
         else:
-            strike_shift = 1      # ATM / 1 strike OTM
-            max_price = 230       # max ₹350 premium → ₹26,250 per lot
+            strike_shift = 1
 
     # =====================================
     # OPTION TYPE + CORRECT STRIKE DIRECTION
@@ -1225,30 +1219,32 @@ def find_option(signal, instrument):
     # =====================================
     if candidates:
         if balance <= 10000:
-            # low balance = cheapest first
             best = sorted(
                 candidates,
-                key=lambda x: (
-                    x["price"],
-                    x["diff"],
-                    -x["score"]
-                )
+                key=lambda x: (x["price"], x["diff"], -x["score"])
             )[0]
         else:
-            # normal mode
             best = sorted(
                 candidates,
-                key=lambda x: (
-                    x["diff"],
-                    -x["score"],
-                    abs(x["price"] - max_price)
-                )
+                key=lambda x: (x["diff"], -x["score"], abs(x["price"] - max_price))
             )[0]
 
         print(f"🏆 Selected: {best['symbol']} | Strike: {best['strike']} | Price: {best['price']}")
 
+        # 🔥 FINAL AFFORDABILITY CHECK
+        final_cost = best["price"] * lot_size
+        allowed = balance * 0.80
+
+        if final_cost > allowed:
+            print(f"🚫 Rejected: ₹{final_cost:.0f} > allowed ₹{allowed:.0f}")
+            return None, None, None, None
+
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
+
+        if lot <= 0:
+            print("🚫 Lot size invalid")
+            return None, None, None, None
 
         return best["symbol"], best["price"], lot, exchange
 
@@ -1286,24 +1282,30 @@ def find_option(signal, instrument):
         if balance <= 10000:
             best = sorted(
                 fallback,
-                key=lambda x: (
-                    x["price"],
-                    x["diff"]
-                )
+                key=lambda x: (x["price"], x["diff"])
             )[0]
         else:
             best = sorted(
                 fallback,
-                key=lambda x: (
-                    x["diff"],
-                    abs(x["price"] - max_price)
-                )
+                key=lambda x: (x["diff"], abs(x["price"] - max_price))
             )[0]
 
         print(f"✅ Fallback: {best['symbol']} | Strike: {best['strike']} | Price: {best['price']}")
 
+        # 🔥 FINAL AFFORDABILITY CHECK
+        final_cost = best["price"] * lot_size
+        allowed = balance * 0.80
+
+        if final_cost > allowed:
+            print(f"🚫 Fallback rejected: ₹{final_cost:.0f} > allowed ₹{allowed:.0f}")
+            return None, None, None, None
+
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
+
+        if lot <= 0:
+            print("🚫 Lot size invalid")
+            return None, None, None, None
 
         return best["symbol"], best["price"], lot, exchange
 

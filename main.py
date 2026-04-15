@@ -12,7 +12,6 @@ import os
 import json
 from datetime import datetime, timedelta
 
-
 if not os.path.exists("trade_log.csv"):
     with open("trade_log.csv", "w") as f:
         f.write("time,symbol,entry,exit,pnl\n")
@@ -1074,7 +1073,7 @@ def find_option(signal, instrument):
         step = 50
         token = config.NIFTY_TOKEN
         token_symbol = "NSE:NIFTY 50"
-        lot_size = 65         
+        lot_size = 65
     else:
         exchange = "MCX"
         name = "CRUDEOIL"
@@ -1125,10 +1124,10 @@ def find_option(signal, instrument):
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 133
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 266
         if balance <= 10000:
-            strike_shift = 8      # deep OTM — very cheap premium
-            max_price = 50        # max ₹50 premium → ₹3,750 per lot (fits ₹10k)
+            strike_shift = 6      # deep OTM — very cheap premium
+            max_price = 80        # max ₹50 premium → ₹3,750 per lot (fits ₹10k)
         elif balance <= 20000:
-            strike_shift = 6      # OTM
+            strike_shift = 5      # OTM
             max_price = 100       # max ₹100 premium → ₹7,500 per lot
         elif balance <= 35000:
             strike_shift = 4      # slight OTM
@@ -1199,7 +1198,8 @@ def find_option(signal, instrument):
         diff = abs(strike - target_strike)
         trade_value = p * lot_size
 
-        if instrument == "NIFTY" and trade_value > balance * 0.80:
+        # Hard affordability: 1 lot must not exceed 80% of available balance
+        if trade_value > balance * 0.80:
             continue
 
         score = score_option(
@@ -1974,6 +1974,70 @@ def ai_trade_filter(token, signal, df):
  
  
 # -----------------------------
+# LAST ACTIVE SIGNAL RESOLVER
+# -----------------------------
+def get_last_active_signal(ht_df):
+    """
+    Solves the MIS carry-over problem.
+
+    MIS positions are auto-squared at 3:20 PM every day.
+    Next morning the HalfTrend trend may still be active (bullish/bearish)
+    but NO new arrow fires — because the trend didn't change overnight.
+    The bot would sit idle all day even though the signal is clear.
+
+    This function:
+      1. First checks the last closed candle for a fresh arrow (normal path).
+      2. If no fresh arrow, scans backward through closed candles to find
+         the most recent arrow that still matches the CURRENT trend direction.
+      3. Returns that signal so the bot can re-enter at market open.
+
+    Safety rules:
+      - Only looks back MAX_LOOKBACK_BARS candles (default 10 = ~2.5 hours on 15-min).
+      - Signal must AGREE with current trend (trend==0 → CALL, trend==1 → PUT).
+      - If the last arrow found disagrees with current trend (reversal happened
+        but no re-entry arrow yet), returns None — do not trade.
+      - Returns a tuple: (signal, arrow_bar_index, is_fresh)
+          signal         : "CALL" | "PUT" | None
+          arrow_bar_index: integer index in ht_df of the arrow bar
+          is_fresh       : True if arrow is on iloc[-2] (same-day),
+                           False if it is a carried-over signal from prior bars
+    """
+    MAX_LOOKBACK_BARS = 10   # how far back to scan (~2.5 hrs on 15-min chart)
+
+    n = len(ht_df)
+    if n < 4:
+        return None, None, False
+
+    # Current trend direction from the last closed candle
+    current_trend = int(ht_df.iloc[-2]["trend"])   # 0=bullish, 1=bearish
+    expected_signal = "CALL" if current_trend == 0 else "PUT"
+
+    # Scan from most-recent closed candle backward
+    for offset in range(2, min(n, MAX_LOOKBACK_BARS + 2)):
+        bar = ht_df.iloc[-offset]
+        bar_trend = int(bar["trend"])
+
+        # Stop as soon as we hit a bar where trend was opposite —
+        # means there was a full reversal cycle with no re-entry yet.
+        if bar_trend != current_trend:
+            break
+
+        is_buy_arrow  = bar["buy"]
+        is_sell_arrow = bar["sell"]
+
+        if is_buy_arrow and expected_signal == "CALL":
+            is_fresh = (offset == 2)
+            return "CALL", n - offset, is_fresh
+
+        if is_sell_arrow and expected_signal == "PUT":
+            is_fresh = (offset == 2)
+            return "PUT", n - offset, is_fresh
+
+    # No matching arrow found within lookback window
+    return None, None, False
+
+
+# -----------------------------
 # THREADS
 # -----------------------------
 # =========================
@@ -1995,7 +2059,7 @@ def nifty_loop():
             if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
                 print("🛑 NIFTY time over — stopping")
                 break
-            print("Nifty Start")
+
             # Reset daily stats at start of new trading day
             reset_daily_pnl()
 
@@ -2019,40 +2083,59 @@ def nifty_loop():
 
             ht_df = cached_nifty_ht
 
-            # EXTREMELY IMPORTANT: We look at index -2 (the last CLOSED candle)
-            # This prevents entering trades on arrows that disappear (repainting)
-            last_closed_candle = ht_df.iloc[-2]
+            # ── Signal Detection ──────────────────────────────────────────────
+            # Step 1: check for a fresh arrow on the last CLOSED candle (iloc[-2])
+            # Step 2: if no fresh arrow, scan back for the last active arrow that
+            #         still matches the current trend — handles MIS carry-over days
+            #         where the trend continues but no new arrow fires at open.
 
-            # --- Signal Detection: matches Pine's buySignal / sellSignal exactly ---
-            # Pine: buySignal  = not na(arrowUp)   and trend==0 and trend[1]==1
-            # Pine: sellSignal = not na(arrowDown)  and trend==1 and trend[1]==0
-            # Arrow placement: arrowUp at atrLow, arrowDown at atrHigh
-            signal = None
+            signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
+
+            # Determine the arrow level for logging
             arrow_level = None
+            if signal is not None and arrow_idx is not None:
+                arrow_bar = ht_df.iloc[arrow_idx]
+                arrow_level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
 
-            if last_closed_candle["buy"]:    # Green arrow — arrowUp fired
-                signal = "CALL"
-                arrow_level = last_closed_candle["atrLow"]   # Pine plots arrow at atrLow
-                print(f"🟢 NIFTY BUY arrow @ atrLow={arrow_level:.2f}  HT={last_closed_candle['ht']:.2f}")
-            elif last_closed_candle["sell"]: # Red arrow — arrowDown fired
-                signal = "PUT"
-                arrow_level = last_closed_candle["atrHigh"]  # Pine plots arrow at atrHigh
-                print(f"🔴 NIFTY SELL arrow @ atrHigh={arrow_level:.2f}  HT={last_closed_candle['ht']:.2f}")
+                if is_fresh:
+                    tag = "🟢 FRESH arrow" if signal == "CALL" else "🔴 FRESH arrow"
+                    print(f"{tag} NIFTY {signal} @ {'atrLow' if signal=='CALL' else 'atrHigh'}={arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
+                else:
+                    # Carried-over signal — log how many bars ago the arrow fired
+                    bars_ago = len(ht_df) - arrow_idx - 2
+                    mins_ago = bars_ago * 15
+                    tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
+                    print(f"{tag} NIFTY {signal} — last arrow was {bars_ago} bars ({mins_ago} min) ago @ level={arrow_level:.2f}")
 
-            # Log if no arrow is present
+            # No signal — current trend has no valid arrow in lookback window
             if signal is None:
                 status = "NO_ARROW_NIFTY"
                 if last_status != status or time.time() - last_weak_log_time > 60:
-                    print("⏸️ Waiting for NIFTY HalfTrend Arrow...")
+                    current_trend = int(ht_df.iloc[-2]["trend"])
+                    trend_name = "BULLISH" if current_trend == 0 else "BEARISH"
+                    print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 10 bars — waiting")
                     last_status = status
                     last_weak_log_time = time.time()
                 time.sleep(10)
                 continue
 
-            # --- Rule 1: Prevent duplicate entry on the same arrow ---
-            if signal == last_executed_signal_nifty:
+            # ── Duplicate prevention ──────────────────────────────────────────
+            # For fresh arrows: block if same signal as last executed (same arrow)
+            # For carry-over: always allow once per day (daily_entry_done flag below)
+            if is_fresh and signal == last_executed_signal_nifty:
                 time.sleep(10)
                 continue
+
+            # Carry-over signal: only enter ONCE per trading day to avoid
+            # re-entering repeatedly on the same old arrow every loop tick.
+            # We track this with a date-stamped flag.
+            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+            carryover_key = f"NIFTY_{signal}_{today_str}"
+            if not is_fresh:
+                if getattr(nifty_loop, "_carryover_done", None) == carryover_key:
+                    # Already entered on this carry-over signal today — skip
+                    time.sleep(10)
+                    continue
 
             # --- Rule 2: Flip/Exit Logic ---
             # If we are in a trade and the opposite arrow appears, exit immediately
@@ -2096,6 +2179,17 @@ def nifty_loop():
                 current_qty = lot
                 current_exchange = exchange
 
+                # Mark carry-over signal as used for today
+                if not is_fresh:
+                    nifty_loop._carryover_done = carryover_key
+                    send_message(
+                        f"♻️ NIFTY carry-over entry\n"
+                        f"Signal: {signal} (trend continuing from prior day)\n"
+                        f"{symbol} @ ₹{filled_price}"
+                    )
+                else:
+                    send_message(f"🆕 NIFTY fresh signal entry: {signal}\n{symbol} @ ₹{filled_price}")
+
                 threading.Thread(
                     target=run_trade_wrapper,
                     args=(symbol, filled_price, lot, exchange, "NIFTY", signal, 0, "TREND"),
@@ -2127,12 +2221,12 @@ def crude_loop():
     while True:
         try:
             now_dt = datetime.now(IST)
-            
+
             # Crude trades after Nifty hours
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
                 time.sleep(30)
                 continue
-            print("Crude Start")
+
             # Reset daily stats at start of new day
             reset_daily_pnl()
 
@@ -2156,29 +2250,33 @@ def crude_loop():
 
             ht_df = cached_crude_ht
 
-            # Signal on last CLOSED candle — Pine-accurate buySignal / sellSignal
-            last_closed = ht_df.iloc[-2]
+            # ── Signal Detection (same carry-over logic as Nifty) ─────────────
+            signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
 
-            signal = None
             arrow_level = None
-
-            if last_closed["buy"]:    # Green arrow
-                signal = "CALL"
-                arrow_level = last_closed["atrLow"]
-                print(f"🟢 CRUDE BUY arrow @ atrLow={arrow_level:.2f}  HT={last_closed['ht']:.2f}")
-            elif last_closed["sell"]: # Red arrow
-                signal = "PUT"
-                arrow_level = last_closed["atrHigh"]
-                print(f"🔴 CRUDE SELL arrow @ atrHigh={arrow_level:.2f}  HT={last_closed['ht']:.2f}")
+            if signal is not None and arrow_idx is not None:
+                arrow_bar = ht_df.iloc[arrow_idx]
+                arrow_level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
+                if is_fresh:
+                    print(f"{'🟢' if signal=='CALL' else '🔴'} FRESH CRUDE {signal} @ {arrow_level:.2f}")
+                else:
+                    bars_ago = len(ht_df) - arrow_idx - 2
+                    print(f"{'🟢' if signal=='CALL' else '🔴'} CARRY-OVER CRUDE {signal} — {bars_ago} bars ago @ {arrow_level:.2f}")
 
             if signal is None:
                 time.sleep(10)
                 continue
 
-            # Skip if signal is same as last executed
-            if signal == last_executed_signal_crude:
+            if is_fresh and signal == last_executed_signal_crude:
                 time.sleep(10)
                 continue
+
+            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+            carryover_key = f"CRUDE_{signal}_{today_str}"
+            if not is_fresh:
+                if getattr(crude_loop, "_carryover_done", None) == carryover_key:
+                    time.sleep(10)
+                    continue
 
             # Flip/Exit Logic
             with lock:
@@ -2212,6 +2310,14 @@ def crude_loop():
                     current_symbol = symbol
                     current_qty = lot
                     current_exchange = exchange
+
+                    if not is_fresh:
+                        crude_loop._carryover_done = carryover_key
+                        send_message(
+                            f"♻️ CRUDE carry-over entry\n"
+                            f"Signal: {signal} (trend continuing)\n"
+                            f"{symbol} @ ₹{filled_price}"
+                        )
 
                     threading.Thread(
                         target=run_trade_wrapper,
@@ -2332,7 +2438,7 @@ def confirm_entry(token, signal, df=None):
         return False
     
 def get_quantity(lots, exchange):
-    if exchange == "NFO":    
+    if exchange == "NFO":    # NIFTY — SEBI revised lot size Nov 2024
         return lots * 65
     elif exchange == "MCX":  # CRUDE OIL
         return lots * 100
@@ -2378,7 +2484,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
       6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
       7. Streak and drawdown adjustments applied last.
 
-    Nifty lot size = 65.
+    Nifty lot size = 65 
     Crude lot size = 100 bbls.
     """
     global win_streak, loss_streak
@@ -2393,7 +2499,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
 
     # ── Lot sizes ─────────────────────────────────────────────────────────
     if instrument == "NIFTY":
-        lot_size = 65       
+        lot_size = 65         
         max_lots = MAX_LOTS_NIFTY
     else:
         lot_size = 100         # Crude Oil MCX lot size
@@ -2585,8 +2691,7 @@ def reset_daily_pnl():
     global report_sent_today, max_drawdown
     global portfolio_pnl, peak_portfolio   # ✅ CORRECT VARIABLES
 
-    from datetime import date
-    today = date.today()
+    today = datetime.date.today()
 
     if last_reset_date != today:
         print("🔄 Resetting daily stats")

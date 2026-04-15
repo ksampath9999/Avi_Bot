@@ -2002,7 +2002,7 @@ def get_last_active_signal(ht_df):
           is_fresh       : True if arrow is on iloc[-2] (same-day),
                            False if it is a carried-over signal from prior bars
     """
-    MAX_LOOKBACK_BARS = 10   # how far back to scan (~2.5 hrs on 15-min chart)
+    MAX_LOOKBACK_BARS = 20   # how far back to scan (~2.5 hrs on 15-min chart)
 
     n = len(ht_df)
     if n < 4:

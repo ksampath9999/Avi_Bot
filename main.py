@@ -1108,13 +1108,13 @@ def find_option(signal, instrument):
 
     if instrument == "CRUDE":
         if balance <= 5000:
-            strike_shift = 7
+            strike_shift = 5
             max_price = 50
         elif balance <= 11000:
-            strike_shift = 5
+            strike_shift = 3
             max_price = 80
         elif balance <= 20000:
-            strike_shift = 4
+            strike_shift = 2
             max_price = 100
         else:
             strike_shift = 1
@@ -3300,7 +3300,6 @@ import pandas as pd
 
 def get_cached_data(token, interval="15minute", count=200):
     try:
-        print("📥 get_cached_data() called")
 
         # ✅ DEFINE DATES FIRST
         to_date = datetime.now()
@@ -3316,10 +3315,8 @@ def get_cached_data(token, interval="15minute", count=200):
             interval
         )
 
-        print(f"📦 Rows received: {len(data)}")
 
         df = pd.DataFrame(data)
-        print(f"📊 DF Shape: {df.shape}")
 
         return df.tail(count)
 

@@ -1995,7 +1995,7 @@ def nifty_loop():
             if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
                 print("🛑 NIFTY time over — stopping")
                 break
-
+            print("Nifty Start")
             # Reset daily stats at start of new trading day
             reset_daily_pnl()
 
@@ -2127,12 +2127,12 @@ def crude_loop():
     while True:
         try:
             now_dt = datetime.now(IST)
-            print("Crude Start")
+            
             # Crude trades after Nifty hours
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
                 time.sleep(30)
                 continue
-
+            print("Crude Start")
             # Reset daily stats at start of new day
             reset_daily_pnl()
 

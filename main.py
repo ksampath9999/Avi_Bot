@@ -1170,7 +1170,7 @@ def find_option(signal, instrument):
     # =====================================
     candidates = []
 
-    for i in opts[:80]:   # reduce API load
+    for i in opts[:150]:   # reduce API load
         if i["expiry"] != expiry:
             continue
 
@@ -1255,7 +1255,7 @@ def find_option(signal, instrument):
 
     fallback = []
 
-    for i in opts[:80]:
+    for i in opts[:150]:
         if i["expiry"] != expiry:
             continue
 

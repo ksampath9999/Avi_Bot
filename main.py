@@ -2454,10 +2454,8 @@ def get_balance(instrument):
     """
     try:
         margin = kite.margins()
-        if instrument == "NIFTY":
-            seg = margin.get("equity", {}).get("available", {})
-        else:
-            seg = margin.get("commodity", {}).get("available", {})
+        
+        seg = margin.get("equity", {}).get("available", {})
 
         # Kite returns live_balance when intraday, cash otherwise
         balance = seg.get("live_balance") or seg.get("cash") or 0

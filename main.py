@@ -1123,11 +1123,11 @@ def find_option(signal, instrument):
         max_price = round(safe_capital / lot_size, 1)
 
         if balance <= 12000:
-            strike_shift = 10
-        elif balance <= 20000:
             strike_shift = 7
+        elif balance <= 20000:
+            strike_shift = 5
         elif balance <= 35000:
-            strike_shift = 4
+            strike_shift = 3
         elif balance <= 50000:
             strike_shift = 2
         else:

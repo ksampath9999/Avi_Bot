@@ -1124,16 +1124,16 @@ def find_option(signal, instrument):
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 133
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 266
         if balance <= 10000:
-            strike_shift = 8      # deep OTM — very cheap premium
-            max_price = 80        # max ₹50 premium → ₹3,750 per lot (fits ₹10k)
+            strike_shift = 6      # deep OTM — very cheap premium
+            max_price = 70        # max ₹50 premium → ₹3,750 per lot (fits ₹10k)
         elif balance <= 20000:
-            strike_shift = 6      # OTM
-            max_price = 90       # max ₹100 premium → ₹7,500 per lot
+            strike_shift = 3     # OTM
+            max_price = 100       # max ₹100 premium → ₹7,500 per lot
         elif balance <= 35000:
-            strike_shift = 4      # slight OTM
+            strike_shift = 2     # slight OTM
             max_price = 120      # max ₹160 premium → ₹12,000 per lot
         elif balance <= 50000:
-            strike_shift = 2      # near ATM
+            strike_shift = 1      # near ATM
             max_price = 150      # max ₹230 premium → ₹17,250 per lot
         else:
             strike_shift = 1      # ATM / 1 strike OTM
@@ -1176,7 +1176,7 @@ def find_option(signal, instrument):
     # =====================================
     candidates = []
 
-    for i in opts[:20]:   # reduce API load
+    for i in opts[:80]:   # reduce API load
         if i["expiry"] != expiry:
             continue
 
@@ -1259,7 +1259,7 @@ def find_option(signal, instrument):
 
     fallback = []
 
-    for i in opts[:20]:
+    for i in opts[:80]:
         if i["expiry"] != expiry:
             continue
 

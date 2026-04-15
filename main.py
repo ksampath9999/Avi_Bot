@@ -1785,7 +1785,7 @@ def exit_position(symbol, qty, exchange):
         # ===============================
         # 🚪 EXIT ORDER (MARKET)
         # ===============================
-       print(f"🚪 EXITING: {symbol}, qty: {qty}")
+        print(f"🚪 EXITING: {symbol}, qty: {qty}")
 
         order_id = kite.place_order(
             variety=kite.VARIETY_REGULAR,
@@ -2221,6 +2221,35 @@ def crude_loop():
     while True:
         try:
             now_dt = datetime.now(IST)
+            # ===============================
+            # 🔴 FORCE EXIT CRUDE AT 09:50 PM
+            # ===============================
+            if now_dt.hour == 21 and now_dt.minute >= 50:
+                print("⏰ 10:00 PM — closing all CRUDE positions")
+
+                try:
+                    positions = kite.positions()["net"]
+
+                    for p in positions:
+                        if p["exchange"] == "MCX" and p["quantity"] != 0:
+                            symbol = p["tradingsymbol"]
+                            qty = abs(p["quantity"])
+
+                            print(f"🚪 Force exiting: {symbol}, qty: {qty}")
+                            exit_position(symbol, qty, "MCX")
+
+                    time.sleep(60)   # avoid repeated loop exits
+
+                except Exception as e:
+                    print("❌ Force exit error:", e)
+
+                continue
+                
+            # ⏸️ No new trades after 9:45 PM
+            if now_dt.hour == 21 and now_dt.minute >= 45:
+                print("⏸️ No new CRUDE entries after 9:45 PM")
+                time.sleep(30)
+                continue
 
             # Crude trades after Nifty hours
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):

@@ -2438,10 +2438,10 @@ def confirm_entry(token, signal, df=None):
         return False
     
 def get_quantity(lots, exchange):
-    if exchange == "NFO":    # NIFTY — SEBI revised lot size Nov 2024
+    if exchange == "NFO":    # NIFTY 
         return lots * 65
     elif exchange == "MCX":  # CRUDE OIL
-        return lots * 100
+        return lots * 1
     return lots
     
 def get_balance(instrument):

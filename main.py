@@ -1785,7 +1785,7 @@ def exit_position(symbol, qty, exchange):
         # ===============================
         # 🚪 EXIT ORDER (MARKET)
         # ===============================
-        print(f"🚪 EXITING: {symbol}, qty: {qty}")
+       print(f"🚪 EXITING: {symbol}, qty: {qty}")
 
         order_id = kite.place_order(
             variety=kite.VARIETY_REGULAR,

@@ -1103,25 +1103,23 @@ def find_option(signal, instrument):
     # BALANCE BASED SETTINGS
     # =====================================
     balance = get_balance(instrument) or 10000
+    safe_capital = balance * 0.75
+    max_price = round(safe_capital / lot_size, 1)
 
     if instrument == "CRUDE":
         if balance <= 5000:
-            strike_shift = 12
+            strike_shift = 7
             max_price = 50
-        elif balance <= 10000:
-            strike_shift = 11
+        elif balance <= 11000:
+            strike_shift = 5
             max_price = 80
         elif balance <= 20000:
-            strike_shift = 10
+            strike_shift = 4
             max_price = 100
         else:
             strike_shift = 1
             max_price = 120
     else:
-        # NIFTY dynamic affordability logic
-        safe_capital = balance * 0.75
-        max_price = round(safe_capital / lot_size, 1)
-
         if balance <= 12000:
             strike_shift = 3
         elif balance <= 20000:

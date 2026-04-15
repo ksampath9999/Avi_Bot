@@ -2245,7 +2245,7 @@ def crude_loop():
                     cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=2, channel_deviation=2)
                 last_fetch_crude = time.time()
 
-            if cached_crude_15m is None or len(cached_crude_15m) < 50 or cached_crude_ht is None:
+           if cached_crude_15m is None or len(cached_crude_15m) < 50 or cached_crude_ht is None:
                 time.sleep(10)
                 continue
 

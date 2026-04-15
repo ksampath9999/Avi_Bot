@@ -2691,7 +2691,8 @@ def reset_daily_pnl():
     global report_sent_today, max_drawdown
     global portfolio_pnl, peak_portfolio   # ✅ CORRECT VARIABLES
 
-    today = datetime.date.today()
+    from datetime import date
+    today = date.today()
 
     if last_reset_date != today:
         print("🔄 Resetting daily stats")

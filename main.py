@@ -118,17 +118,30 @@ def zerodha_auto_login():
         print("   ✅ 2FA passed")
 
         # ── Step 3: Get request_token via Kite Connect redirect ─────────────
+        # Use allow_redirects=False so we read the Location header directly
+        # without trying to connect to the redirect URL (which may be localhost).
         print("   Getting request_token from Kite Connect redirect...")
         login_url = f"https://kite.zerodha.com/connect/login?api_key={config.API_KEY}&v=3"
-        resp3 = session.get(login_url, allow_redirects=True, timeout=15)
+        resp3 = session.get(login_url, allow_redirects=False, timeout=15)
 
-        final_url = resp3.url
-        match = re.search(r"request_token=([^&]+)", final_url)
+        # The request_token is in the Location header of the redirect response
+        redirect_url = resp3.headers.get("Location", "")
+        print(f"   Redirect URL: {redirect_url[:80]}...")
+
+        match = re.search(r"request_token=([^&]+)", redirect_url)
         if not match:
-            match = re.search(r"request_token=([^&\"]+)", resp3.text)
+            # Fallback: follow redirects but catch the final URL
+            try:
+                resp3b = session.get(login_url, allow_redirects=True, timeout=15)
+                match = re.search(r"request_token=([^&]+)", resp3b.url)
+                if not match:
+                    match = re.search(r"request_token=([^&\"]+)", resp3b.text)
+            except Exception:
+                pass
         if not match:
             raise Exception(
-                f"request_token not found. Final URL: {final_url}\n"
+                f"request_token not found in redirect.\n"
+                f"Location header: {redirect_url}\n"
                 "Check that your Kite app redirect URL is set correctly."
             )
         request_token = match.group(1)

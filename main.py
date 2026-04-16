@@ -118,17 +118,19 @@ def zerodha_auto_login():
         print("   ✅ 2FA passed")
 
         # ── Step 3: Get request_token via Kite Connect redirect ─────────────
-        print("   Getting request_token from Kite Connect redirect...")
+        import sys
+        print("   Getting request_token from Kite Connect redirect...", flush=True)
         login_url = f"https://kite.zerodha.com/connect/login?api_key={config.API_KEY}&v=3"
 
         request_token = None
 
         # ── 3a: Hop 1 — /connect/login → /connect/finish ────────────────────
         resp_login = session.get(login_url, allow_redirects=False, timeout=15)
-        print(f"   [login] status={resp_login.status_code} location={resp_login.headers.get('Location','')[:120]}")
-
-        # Check if request_token already in this redirect
         loc1 = resp_login.headers.get("Location", "")
+        print(f"   [hop1] status={resp_login.status_code} | loc={loc1[:150]}", flush=True)
+        print(f"   [hop1] body={resp_login.text[:200]}", flush=True)
+        sys.stdout.flush()
+
         m = re.search(r"request_token=([^&]+)", loc1)
         if m:
             request_token = m.group(1)
@@ -138,42 +140,40 @@ def zerodha_auto_login():
             finish_url = loc1 if loc1.startswith("http") else "https://kite.zerodha.com" + loc1
             resp_finish = session.get(finish_url, allow_redirects=False, timeout=15)
             loc2 = resp_finish.headers.get("Location", "")
-            print(f"   [finish] status={resp_finish.status_code} location={loc2[:120]}")
-            print(f"   [finish] body_snippet={resp_finish.text[:300]}")
+            print(f"   [hop2] status={resp_finish.status_code} | loc={loc2[:150]}", flush=True)
+            print(f"   [hop2] body={resp_finish.text[:400]}", flush=True)
+            sys.stdout.flush()
 
             m = re.search(r"request_token=([^&\"']+)", loc2)
             if m:
                 request_token = m.group(1)
 
-            # /connect/finish may embed token in page body / JS
             if not request_token:
                 m = re.search(r"request_token[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9]+)", resp_finish.text)
                 if m:
                     request_token = m.group(1)
 
-            # ── 3c: Hop 3 — follow app redirect (ignore connection errors) ───
+            # ── 3c: Hop 3 — follow app redirect URL ─────────────────────────
             if not request_token and loc2:
                 try:
                     app_url = loc2 if loc2.startswith("http") else "https://kite.zerodha.com" + loc2
                     resp_app = session.get(app_url, allow_redirects=False, timeout=10)
                     loc3 = resp_app.headers.get("Location", "")
-                    print(f"   [app] status={resp_app.status_code} location={loc3[:120]}")
-                    print(f"   [app] body_snippet={resp_app.text[:300]}")
+                    print(f"   [hop3] status={resp_app.status_code} | loc={loc3[:150]}", flush=True)
+                    print(f"   [hop3] body={resp_app.text[:400]}", flush=True)
+                    sys.stdout.flush()
                     m = re.search(r"request_token=([^&\"']+)", loc3 + resp_app.text)
                     if m:
                         request_token = m.group(1)
                 except Exception as e:
-                    print(f"   [app] connection error (expected if localhost): {e}")
-                    m = re.search(r"request_token=([^&\"']+)", str(e))
-                    if m:
-                        request_token = m.group(1)
+                    print(f"   [hop3] error: {e}", flush=True)
+                    sys.stdout.flush()
 
         if not request_token:
             raise Exception(
-                "request_token not found. Check the debug output above to see what "
-                "Zerodha returned at each step."
+                "request_token not found. Check hop1/hop2/hop3 debug lines above."
             )
-        print(f"   request_token: {request_token[:10]}...")
+        print(f"   request_token: {request_token[:10]}...", flush=True)
 
         # ── Step 4: Generate access_token ───────────────────────────────────
         session_data = kite.generate_session(request_token, api_secret=api_secret)

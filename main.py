@@ -1123,6 +1123,8 @@ def find_option(signal, instrument):
         # Capital cap: 1 lot must not exceed 40% of balance
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
+        if balance <= 5000:
+            strike_shift = 7
         if balance <= 10000:
             strike_shift = 5      # deep OTM — cheap premium
             max_price = 50        # ₹50 × 65 = ₹3,250 per lot

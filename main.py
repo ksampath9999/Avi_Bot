@@ -24,7 +24,8 @@ if not os.path.exists("trade_log.csv"):
 bot_started = False
 lock = threading.Lock()
 IST = pytz.timezone("Asia/Kolkata")
-kite = KiteConnect(api_key=config.API_KEY)
+_KITE_API_KEY = os.environ.get("KITE_API_KEY") or config.API_KEY
+kite = KiteConnect(api_key=_KITE_API_KEY)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔑 AUTO LOGIN — Zerodha TOTP + Kite Connect token refresh
@@ -190,8 +191,11 @@ def zerodha_auto_login():
                           getattr(config, "API_SECRET", None) or
                           getattr(config, "SECRET", None))
         print(f"   api_secret: {'SET len='+str(len(api_secret)) if api_secret else 'NONE — check KITE_API_SECRET in Railway'}", flush=True)
+        print(f"   kite.api_key: {kite.api_key}", flush=True)
         if not api_secret:
             raise Exception("KITE_API_SECRET is not set or empty in Railway env vars.")
+        # Ensure kite object has the correct api_key from env var
+        kite.api_key = _api_key
         session_data = kite.generate_session(request_token, api_secret=api_secret)
         access_token = session_data["access_token"]
         kite.set_access_token(access_token)

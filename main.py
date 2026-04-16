@@ -118,31 +118,39 @@ def zerodha_auto_login():
         print("   ✅ 2FA passed")
 
         # ── Step 3: Get request_token via Kite Connect redirect ─────────────
-        # Use allow_redirects=False so we read the Location header directly
-        # without trying to connect to the redirect URL (which may be localhost).
+        # Zerodha redirect flow (2 hops):
+        #   Hop 1: /connect/login  → /connect/finish?sess_id=...
+        #   Hop 2: /connect/finish → <your redirect URL>?request_token=...
+        # We follow hop-by-hop with allow_redirects=False to avoid connecting
+        # to localhost (or any custom redirect URL) on the final hop.
         print("   Getting request_token from Kite Connect redirect...")
         login_url = f"https://kite.zerodha.com/connect/login?api_key={config.API_KEY}&v=3"
-        resp3 = session.get(login_url, allow_redirects=False, timeout=15)
 
-        # The request_token is in the Location header of the redirect response
-        redirect_url = resp3.headers.get("Location", "")
-        print(f"   Redirect URL: {redirect_url[:80]}...")
+        match = None
+        current_url = login_url
+        for hop in range(1, 6):   # follow up to 5 hops
+            resp_hop = session.get(current_url, allow_redirects=False, timeout=15)
+            location = resp_hop.headers.get("Location", "")
+            print(f"   Hop {hop}: {resp_hop.status_code} → {location[:100]}")
 
-        match = re.search(r"request_token=([^&]+)", redirect_url)
-        if not match:
-            # Fallback: follow redirects but catch the final URL
-            try:
-                resp3b = session.get(login_url, allow_redirects=True, timeout=15)
-                match = re.search(r"request_token=([^&]+)", resp3b.url)
-                if not match:
-                    match = re.search(r"request_token=([^&\"]+)", resp3b.text)
-            except Exception:
-                pass
+            # Check this location for request_token
+            match = re.search(r"request_token=([^&]+)", location)
+            if match:
+                break
+
+            # If no more redirects, stop
+            if not location or resp_hop.status_code not in (301, 302, 303, 307, 308):
+                break
+
+            # Build absolute URL if relative
+            if location.startswith("/"):
+                location = "https://kite.zerodha.com" + location
+            current_url = location
+
         if not match:
             raise Exception(
-                f"request_token not found in redirect.\n"
-                f"Location header: {redirect_url}\n"
-                "Check that your Kite app redirect URL is set correctly."
+                f"request_token not found after following redirects.\n"
+                "Check that your Kite app redirect URL is correctly set in the Kite developer console."
             )
         request_token = match.group(1)
         print(f"   request_token: {request_token[:10]}...")

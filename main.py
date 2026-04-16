@@ -1148,8 +1148,8 @@ def find_option(signal, instrument):
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
         if balance <= 5000:
             strike_shift = 7
-            max_price = 50 
-        if balance <= 10000:
+            max_price = 50
+        elif balance <= 10000:
             strike_shift = 5      # deep OTM — cheap premium
             max_price = 80        # ₹50 × 65 = ₹3,250 per lot
         elif balance <= 20000:
@@ -1200,11 +1200,16 @@ def find_option(signal, instrument):
     # =====================================
     # PRIMARY SEARCH
     # =====================================
+    # FIX: sort by strike proximity to target_strike BEFORE slicing to [:20]
+    # so the best candidates are always evaluated even in large option chains.
+    opts_sorted = sorted(
+        [i for i in opts if i["expiry"] == expiry],
+        key=lambda x: abs(int(x.get("strike", 0)) - target_strike)
+    )
+
     candidates = []
 
-    for i in opts[:20]:   # reduce API load
-        if i["expiry"] != expiry:
-            continue
+    for i in opts_sorted[:20]:   # reduce API load — now sorted by proximity
 
         try:
             strike = int(i["strike"])
@@ -1285,9 +1290,8 @@ def find_option(signal, instrument):
 
     fallback = []
 
-    for i in opts[:20]:
-        if i["expiry"] != expiry:
-            continue
+    # FIX: same proximity-sort fix as primary search
+    for i in opts_sorted[:20]:
 
         try:
             strike = int(i["strike"])
@@ -1831,8 +1835,6 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     nifty_daily_wins += 1
                 else:
                     nifty_daily_losses += 1
-                nifty_active = False
-                nifty_trade_active = False
             else:
                 crude_daily_pnl += pnl
                 crude_trade_count += 1
@@ -1840,15 +1842,25 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     crude_daily_wins += 1
                 else:
                     crude_daily_losses += 1
-                crude_active = False
-                crude_trade_active = False
 
             update_streak(pnl)
             update_exit_time(instrument)
 
-            global_trade_active = False
-
-            # 🔥 CRITICAL FIX (MISSING)
+            # 🔥 FLIP RACE CONDITION FIX:
+            # Do NOT unconditionally clear nifty_trade_active / crude_trade_active
+            # here.  If a HalfTrend flip happened while this trade was running,
+            # nifty_loop already registered a NEW trade in nifty_position with a
+            # different symbol and set nifty_trade_active=True for that new trade.
+            # Clearing it here would wipe the new trade's flag and allow a third
+            # order to be placed immediately.
+            #
+            # run_trade_wrapper.finally already does this with a symbol guard —
+            # clearing flags only when pos_dict["symbol"] still matches THIS trade.
+            # So we deliberately leave nifty_active / crude_active / trade_active
+            # flag management to run_trade_wrapper.finally exclusively.
+            #
+            # We DO still need to clear the legacy trade_in_progress flags (they
+            # are not used in the flip path so it is safe to clear them here).
             global trade_in_progress_nifty, trade_in_progress_crude
 
             if instrument == "NIFTY":
@@ -1996,43 +2008,144 @@ def restore_position_state_from_kite():
 
 #exit sell orders
 def exit_position(symbol, qty, exchange):
+    """
+    Exit (sell) an open option position.
 
+    Kite API BLOCKS market orders for NFO/MCX via API:
+      "Market orders without market protection are not allowed via API."
+
+    Fix: use LIMIT order at a small discount below LTP.
+    We retry up to 4 times, each time lowering the price slightly so it
+    fills quickly even if the spread is wide or the market is moving fast.
+
+    Slippage ladder (sell price as % of LTP):
+      Attempt 1: LTP × 0.995  (-0.5%)
+      Attempt 2: LTP × 0.990  (-1.0%)
+      Attempt 3: LTP × 0.982  (-1.8%)
+      Attempt 4: LTP × 0.970  (-3.0%)   ← last resort aggressive fill
+    """
     try:
         # ===============================
         # 🔍 VERIFY POSITION BEFORE EXIT
         # ===============================
         positions = kite.positions()["net"]
-        print(f"📊 Positions: {positions}")
         found = False
+        actual_qty = qty
         for p in positions:
             if p["tradingsymbol"] == symbol and p["quantity"] > 0:
                 found = True
+                actual_qty = p["quantity"]   # use actual open qty, not stale in-memory qty
                 break
 
         if not found:
-            print(f"⚠️ No open position found for {symbol}")
+            print(f"⚠️ No open position found for {symbol} — already exited?")
+            return False
+
+        # Use actual qty from Kite (avoids partial-exit mismatch)
+        exit_qty = min(qty, actual_qty)
+        print(f"🚪 EXITING: {symbol}, qty: {exit_qty}, exchange: {exchange}")
+
+        # ===============================
+        # 💰 GET LTP FOR LIMIT PRICE
+        # ===============================
+        full_symbol = f"{exchange}:{symbol}"
+        ltp = safe_ltp(full_symbol)
+        if ltp is None or ltp <= 0:
+            # Fallback: try quote API
+            try:
+                q = kite.quote([full_symbol])
+                ltp = q[full_symbol]["last_price"]
+            except Exception:
+                ltp = None
+
+        if ltp is None or ltp <= 0:
+            print(f"❌ Cannot get LTP for {symbol} — aborting exit")
+            send_message(f"❌ Exit FAILED — no LTP for {symbol}")
             return False
 
         # ===============================
-        # 🚪 EXIT ORDER (MARKET)
+        # 🚪 EXIT WITH LIMIT ORDER + RETRY
         # ===============================
-        print(f"🚪 EXITING: {symbol}, qty: {qty}")
+        slippage_pcts = [0.995, 0.990, 0.982, 0.970]   # increasingly aggressive
 
-        order_id = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=exchange,
-            tradingsymbol=symbol,
-            transaction_type=kite.TRANSACTION_TYPE_SELL,
-            quantity=qty,
-            order_type=kite.ORDER_TYPE_MARKET,   # 🔥 IMPORTANT
-            product = kite.PRODUCT_MIS if exchange == "NFO" else kite.PRODUCT_NRML
+        for attempt, slip in enumerate(slippage_pcts, 1):
+            exit_price = round(ltp * slip, 1)
+            if exit_price <= 0:
+                exit_price = 0.5   # minimum valid option price on Kite
+
+            print(f"🚪 Exit attempt {attempt}/4 — LIMIT @ ₹{exit_price:.1f}  (LTP={ltp:.1f}, slip={slip})")
+
+            try:
+                order_id = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange=exchange,
+                    tradingsymbol=symbol,
+                    transaction_type=kite.TRANSACTION_TYPE_SELL,
+                    quantity=exit_qty,
+                    order_type=kite.ORDER_TYPE_LIMIT,
+                    price=exit_price,
+                    product=kite.PRODUCT_MIS if exchange == "NFO" else kite.PRODUCT_NRML
+                )
+                print(f"   Order placed: {order_id}")
+            except Exception as oe:
+                print(f"   ⚠️ Order placement failed: {oe}")
+                time.sleep(1)
+                continue
+
+            # Wait up to 3 seconds for fill confirmation
+            filled = False
+            for _ in range(3):
+                time.sleep(1)
+                try:
+                    orders = kite.orders()
+                    for o in orders:
+                        if o["order_id"] == order_id:
+                            if o["status"] == "COMPLETE":
+                                filled = True
+                                filled_price = o["average_price"]
+                                break
+                            elif o["status"] in ["CANCELLED", "REJECTED"]:
+                                print(f"   ❌ Order {o['status']}")
+                                break
+                except Exception:
+                    pass
+                if filled:
+                    break
+
+            if filled:
+                # Invalidate Kite position cache so next loop sees the exit
+                _kite_pos_cache.pop("NIFTY" if exchange == "NFO" else "CRUDE", None)
+                send_message(
+                    f"✅ EXIT FILLED\n"
+                    f"📌 {symbol}\n"
+                    f"💰 Sell price: ₹{filled_price:.1f}  |  Qty: {exit_qty}\n"
+                    f"📊 Slippage: {(1-slip)*100:.1f}% from LTP ₹{ltp:.1f}"
+                )
+                print(f"✅ Exit filled @ ₹{filled_price:.1f}")
+                return True
+
+            # Not filled — cancel and try next slippage level
+            try:
+                kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=order_id)
+                print(f"   ↩️ Cancelled unfilled order — trying next level")
+            except Exception:
+                pass
+
+            time.sleep(0.5)
+
+        # All attempts exhausted
+        print(f"❌ Exit FAILED after 4 attempts — {symbol}")
+        send_message(
+            f"🚨 EXIT FAILED — {symbol}\n"
+            f"4 limit order attempts exhausted.\n"
+            f"Please exit manually immediately!\n"
+            f"Qty: {exit_qty}  |  Last tried price: ₹{round(ltp * slippage_pcts[-1], 1):.1f}"
         )
-
-        print(f"✅ Exit order placed: {order_id}")
-        return True
+        return False
 
     except Exception as e:
         print(f"❌ Exit order failed: {symbol} | Error: {e}")
+        send_message(f"🚨 EXIT ERROR — {symbol}\n{e}\nPlease check and exit manually!")
         return False
             
 
@@ -2646,10 +2759,6 @@ def crude_loop():
                     )
                     crude_loop._sig_alerted = _sig_key_c
 
-            if is_fresh and signal == last_executed_signal_crude:
-                time.sleep(10)
-                continue
-
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
             carryover_key = f"CRUDE_{signal}_{today_str}"
             if not is_fresh:
@@ -2661,6 +2770,8 @@ def crude_loop():
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
             # Layer 1 — Kite ground truth (handles bot restarts / flag drift)
+            # FIX: Layer 1 must run FIRST so that in-memory state is synced
+            # from Kite on restart before any duplicate-prevention logic fires.
             kite_pos = get_open_kite_position("CRUDE")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
@@ -2705,6 +2816,7 @@ def crude_loop():
                         crude_trade_active = False
                         global_trade_active = False
                         last_running_signal = None
+                        last_executed_signal_crude = None   # FIX: reset so flip re-entry isn't blocked by Layer 3
                     time.sleep(3)   # let Kite process exit before re-entry
 
             else:
@@ -2727,6 +2839,9 @@ def crude_loop():
                 continue
 
             # Layer 3 — duplicate prevention for same fresh signal
+            # FIX: moved here (after Layer 1 Kite sync) so that a bot restart
+            # with an open Kite position still syncs in-memory state correctly
+            # before the duplicate-signal check short-circuits the loop.
             if is_fresh and signal == last_executed_signal_crude:
                 time.sleep(10)
                 continue
@@ -2952,7 +3067,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
       6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
       7. Streak and drawdown adjustments applied last.
 
-    Nifty lot size = 65 
+    Nifty lot size = 65 (as of 2024 revision — update if SEBI changes it again).
     Crude lot size = 1 bbls.
     """
     global win_streak, loss_streak
@@ -4082,9 +4197,12 @@ if __name__ == "__main__":
     # -----------------------------
     # 📄 CREATE TRADE LOG FILE (FIX)
     # -----------------------------
+    # Note: top-level check at module load already creates this file with the
+    # correct 8-column header.  This block is kept as a safety net only — and
+    # now uses the same 8-column format so both paths are consistent.
     if not os.path.exists("trade_log.csv"):
         with open("trade_log.csv", "w") as f:
-            f.write("time,symbol,entry,exit,pnl\n")
+            f.write("time,instrument,symbol,signal,entry,exit,pnl,probability\n")
 
     # -----------------------------
     # 🎯 TOKEN INITIALIZATION

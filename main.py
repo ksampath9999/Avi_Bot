@@ -115,12 +115,16 @@ def zerodha_auto_login():
 
         if not data2 or data2.get("status") != "success":
             raise Exception(f"2FA failed after 3 attempts: {data2.get('message') if data2 else 'No response'}")
-        print("   ✅ 2FA passed")
+        print(f"   ✅ 2FA passed | full response: {data2}", flush=True)
+        print(f"   Session cookies after 2FA: {dict(session.cookies)}", flush=True)
+        import sys; sys.stdout.flush()
 
         # ── Step 3: Get request_token via Kite Connect redirect ─────────────
         import sys
         print("   Getting request_token from Kite Connect redirect...", flush=True)
-        login_url = f"https://kite.zerodha.com/connect/login?api_key={config.API_KEY}&v=3"
+        _api_key = os.environ.get("KITE_API_KEY") or config.API_KEY
+        print(f"   Using api_key: {_api_key[:6]}... (len={len(str(_api_key))})", flush=True)
+        login_url = f"https://kite.zerodha.com/connect/login?api_key={_api_key}&v=3"
 
         request_token = None
 

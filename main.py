@@ -1073,7 +1073,7 @@ def find_option(signal, instrument):
         step = 50
         token = config.NIFTY_TOKEN
         token_symbol = "NSE:NIFTY 50"
-        lot_size = 65
+        lot_size = 65          # Current Nifty F&O lot size
     else:
         exchange = "MCX"
         name = "CRUDEOIL"
@@ -1103,14 +1103,12 @@ def find_option(signal, instrument):
     # BALANCE BASED SETTINGS
     # =====================================
     balance = get_balance(instrument) or 10000
-    safe_capital = balance * 0.75
-    max_price = round(safe_capital / lot_size, 1)
 
     if instrument == "CRUDE":
         if balance <= 5000:
             strike_shift = 5
             max_price = 50
-        elif balance <= 11000:
+        elif balance <= 10000:
             strike_shift = 3
             max_price = 80
         elif balance <= 20000:
@@ -1120,16 +1118,26 @@ def find_option(signal, instrument):
             strike_shift = 1
             max_price = 120
     else:
-        if balance <= 12000:
-            strike_shift = 3
+        # NIFTY — lot size 65, 5% risk model
+        # 1 lot value = premium * 65
+        # Capital cap: 1 lot must not exceed 40% of balance
+        # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
+        # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
+        if balance <= 10000:
+            strike_shift = 5      # deep OTM — cheap premium
+            max_price = 50        # ₹50 × 65 = ₹3,250 per lot
         elif balance <= 20000:
-            strike_shift = 2
+            strike_shift = 3      # OTM
+            max_price = 110       # ₹110 × 65 = ₹7,150 per lot
         elif balance <= 35000:
-            strike_shift = 2
+            strike_shift = 2      # slight OTM
+            max_price = 170       # ₹170 × 65 = ₹11,050 per lot
         elif balance <= 50000:
-            strike_shift = 1
+            strike_shift = 1      # near ATM
+            max_price = 250       # ₹250 × 65 = ₹16,250 per lot
         else:
-            strike_shift = 1
+            strike_shift = 1      # ATM / 1 strike OTM
+            max_price = 380       # ₹380 × 65 = ₹24,700 per lot
 
     # =====================================
     # OPTION TYPE + CORRECT STRIKE DIRECTION
@@ -1168,7 +1176,7 @@ def find_option(signal, instrument):
     # =====================================
     candidates = []
 
-    for i in opts[:150]:   # reduce API load
+    for i in opts[:20]:   # reduce API load
         if i["expiry"] != expiry:
             continue
 
@@ -1190,8 +1198,8 @@ def find_option(signal, instrument):
         diff = abs(strike - target_strike)
         trade_value = p * lot_size
 
-        # Hard affordability: 1 lot must not exceed 80% of available balance
-        if trade_value > balance * 0.80:
+        # Hard affordability: 1 lot must not exceed 40% of available balance
+        if trade_value > balance * 0.40:
             continue
 
         score = score_option(
@@ -1217,32 +1225,30 @@ def find_option(signal, instrument):
     # =====================================
     if candidates:
         if balance <= 10000:
+            # low balance = cheapest first
             best = sorted(
                 candidates,
-                key=lambda x: (x["price"], x["diff"], -x["score"])
+                key=lambda x: (
+                    x["price"],
+                    x["diff"],
+                    -x["score"]
+                )
             )[0]
         else:
+            # normal mode
             best = sorted(
                 candidates,
-                key=lambda x: (x["diff"], -x["score"], abs(x["price"] - max_price))
+                key=lambda x: (
+                    x["diff"],
+                    -x["score"],
+                    abs(x["price"] - max_price)
+                )
             )[0]
 
         print(f"🏆 Selected: {best['symbol']} | Strike: {best['strike']} | Price: {best['price']}")
 
-        # 🔥 FINAL AFFORDABILITY CHECK
-        final_cost = best["price"] * lot_size
-        allowed = balance * 0.80
-
-        if final_cost > allowed:
-            print(f"🚫 Rejected: ₹{final_cost:.0f} > allowed ₹{allowed:.0f}")
-            return None, None, None, None
-
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
-
-        if lot <= 0:
-            print("🚫 Lot size invalid")
-            return None, None, None, None
 
         return best["symbol"], best["price"], lot, exchange
 
@@ -1253,7 +1259,7 @@ def find_option(signal, instrument):
 
     fallback = []
 
-    for i in opts[:150]:
+    for i in opts[:20]:
         if i["expiry"] != expiry:
             continue
 
@@ -1280,30 +1286,24 @@ def find_option(signal, instrument):
         if balance <= 10000:
             best = sorted(
                 fallback,
-                key=lambda x: (x["price"], x["diff"])
+                key=lambda x: (
+                    x["price"],
+                    x["diff"]
+                )
             )[0]
         else:
             best = sorted(
                 fallback,
-                key=lambda x: (x["diff"], abs(x["price"] - max_price))
+                key=lambda x: (
+                    x["diff"],
+                    abs(x["price"] - max_price)
+                )
             )[0]
 
         print(f"✅ Fallback: {best['symbol']} | Strike: {best['strike']} | Price: {best['price']}")
 
-        # 🔥 FINAL AFFORDABILITY CHECK
-        final_cost = best["price"] * lot_size
-        allowed = balance * 0.80
-
-        if final_cost > allowed:
-            print(f"🚫 Fallback rejected: ₹{final_cost:.0f} > allowed ₹{allowed:.0f}")
-            return None, None, None, None
-
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
-
-        if lot <= 0:
-            print("🚫 Lot size invalid")
-            return None, None, None, None
 
         return best["symbol"], best["price"], lot, exchange
 
@@ -1855,6 +1855,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
 
     global nifty_active, crude_active
     global nifty_trade_active, crude_trade_active
+    global nifty_position, crude_position
 
     try:
         manage_trade(symbol, price, lot, exchange, instrument, signal, probability, market_type)
@@ -1866,9 +1867,14 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
             if instrument == "NIFTY":
                 nifty_active = False
                 nifty_trade_active = False
+                # Clear position dict so flip logic knows trade is closed
+                nifty_position.update({"symbol": None, "qty": 0, "exchange": None,
+                                       "signal": None, "active": False})
             else:
                 crude_active = False
                 crude_trade_active = False
+                crude_position.update({"symbol": None, "qty": 0, "exchange": None,
+                                       "signal": None, "active": False})
 
             global_trade_active = False
 
@@ -2002,7 +2008,7 @@ def get_last_active_signal(ht_df):
           is_fresh       : True if arrow is on iloc[-2] (same-day),
                            False if it is a carried-over signal from prior bars
     """
-    MAX_LOOKBACK_BARS = 20   # how far back to scan (~2.5 hrs on 15-min chart)
+    MAX_LOOKBACK_BARS = 10   # how far back to scan (~2.5 hrs on 15-min chart)
 
     n = len(ht_df)
     if n < 4:
@@ -2037,6 +2043,11 @@ def get_last_active_signal(ht_df):
     return None, None, False
 
 
+# Per-trade state — written only inside lock, read by both loop and manage_trade thread
+# These replace the shared current_symbol/qty/exchange globals for flip safety
+nifty_position = {"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False}
+crude_position = {"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False}
+
 # -----------------------------
 # THREADS
 # -----------------------------
@@ -2049,7 +2060,7 @@ def nifty_loop():
     global last_executed_signal_nifty, global_trade_active
     global last_status, last_weak_log_time
     global last_fetch_nifty, cached_nifty_df, cached_nifty_ht
-    global nifty_trade_active
+    global nifty_trade_active, nifty_position
 
     while True:
         try:
@@ -2072,7 +2083,6 @@ def nifty_loop():
             # Refresh data cache every 30 seconds
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
                 cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 200)
-                # Recompute HalfTrend only when data refreshes — not every loop tick
                 if cached_nifty_df is not None and len(cached_nifty_df) >= 120:
                     cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=2, channel_deviation=2)
                 last_fetch_nifty = time.time()
@@ -2083,84 +2093,100 @@ def nifty_loop():
 
             ht_df = cached_nifty_ht
 
-            # ── Signal Detection ──────────────────────────────────────────────
-            # Step 1: check for a fresh arrow on the last CLOSED candle (iloc[-2])
-            # Step 2: if no fresh arrow, scan back for the last active arrow that
-            #         still matches the current trend — handles MIS carry-over days
-            #         where the trend continues but no new arrow fires at open.
-
+            # ── Signal Detection (fresh arrow + carry-over) ───────────────────
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
 
-            # Determine the arrow level for logging
             arrow_level = None
             if signal is not None and arrow_idx is not None:
                 arrow_bar = ht_df.iloc[arrow_idx]
                 arrow_level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
-
                 if is_fresh:
-                    tag = "🟢 FRESH arrow" if signal == "CALL" else "🔴 FRESH arrow"
-                    print(f"{tag} NIFTY {signal} @ {'atrLow' if signal=='CALL' else 'atrHigh'}={arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
+                    tag = "🟢 FRESH" if signal == "CALL" else "🔴 FRESH"
+                    print(f"{tag} NIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
                 else:
-                    # Carried-over signal — log how many bars ago the arrow fired
                     bars_ago = len(ht_df) - arrow_idx - 2
-                    mins_ago = bars_ago * 15
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
-                    print(f"{tag} NIFTY {signal} — last arrow was {bars_ago} bars ({mins_ago} min) ago @ level={arrow_level:.2f}")
+                    print(f"{tag} NIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
 
-            # No signal — current trend has no valid arrow in lookback window
             if signal is None:
                 status = "NO_ARROW_NIFTY"
                 if last_status != status or time.time() - last_weak_log_time > 60:
-                    current_trend = int(ht_df.iloc[-2]["trend"])
-                    trend_name = "BULLISH" if current_trend == 0 else "BEARISH"
+                    trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
                     print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 10 bars — waiting")
                     last_status = status
                     last_weak_log_time = time.time()
                 time.sleep(10)
                 continue
 
-            # ── Duplicate prevention ──────────────────────────────────────────
-            # For fresh arrows: block if same signal as last executed (same arrow)
-            # For carry-over: always allow once per day (daily_entry_done flag below)
-            if is_fresh and signal == last_executed_signal_nifty:
-                time.sleep(10)
-                continue
-
-            # Carry-over signal: only enter ONCE per trading day to avoid
-            # re-entering repeatedly on the same old arrow every loop tick.
-            # We track this with a date-stamped flag.
+            # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
             carryover_key = f"NIFTY_{signal}_{today_str}"
             if not is_fresh:
                 if getattr(nifty_loop, "_carryover_done", None) == carryover_key:
-                    # Already entered on this carry-over signal today — skip
                     time.sleep(10)
                     continue
 
-            # --- Rule 2: Flip/Exit Logic ---
-            # If we are in a trade and the opposite arrow appears, exit immediately
+            # ── Read current position state atomically ─────────────────────────
             with lock:
-                is_active = global_trade_active
+                pos_active    = nifty_position["active"]
+                pos_signal    = nifty_position["signal"]
+                pos_symbol    = nifty_position["symbol"]
+                pos_qty       = nifty_position["qty"]
+                pos_exchange  = nifty_position["exchange"]
 
-            if is_active and last_running_signal and signal != last_running_signal:
-                print(f"🔁 NIFTY Flip Signal: {last_running_signal} → {signal}. Exiting current position.")
-                exit_position(current_symbol, current_qty, current_exchange)
+            # ── FLIP DETECTION ─────────────────────────────────────────────────
+            # A flip = we are in an active trade AND the new signal is the opposite.
+            # Action: exit the current position FIRST, then re-enter with new signal.
+            if pos_active and pos_signal and signal != pos_signal:
+                print(f"🔁 NIFTY FLIP: {pos_signal} → {signal}")
+                print(f"   Exiting: {pos_symbol}  qty={pos_qty}")
+
+                # Exit the live position
+                exit_ok = exit_position(pos_symbol, pos_qty, pos_exchange)
+
+                if exit_ok:
+                    send_message(
+                        f"🔁 NIFTY flip exit\n"
+                        f"Closed: {pos_signal} ({pos_symbol})\n"
+                        f"New signal: {signal}"
+                    )
+                else:
+                    print("⚠️ Flip exit order failed — will retry next tick")
+                    time.sleep(5)
+                    continue
+
+                # Clear position state atomically
                 with lock:
-                    global_trade_active = False
+                    nifty_position.update({"symbol": None, "qty": 0, "exchange": None,
+                                           "signal": None, "active": False})
                     nifty_trade_active = False
-                last_running_signal = None
-                # Small sleep to let Zerodha process the exit before we enter the flip
-                time.sleep(2)
+                    global_trade_active = False
+                    last_running_signal = None
 
-            # --- Rule 3: Entry Logic — use per-instrument lock ---
+                # Clear manage_trade's exit_done so it doesn't try to double-exit
+                # Small pause so Kite processes the exit before new order
+                time.sleep(3)
+
+            # ── SAME SIGNAL — already in matching trade, nothing to do ─────────
+            elif pos_active and pos_signal == signal:
+                # Already in a trade in the same direction — no action needed
+                time.sleep(10)
+                continue
+
+            # ── DUPLICATE PREVENTION for fresh arrows ─────────────────────────
+            if is_fresh and signal == last_executed_signal_nifty:
+                time.sleep(10)
+                continue
+
+            # ── ENTRY — acquire lock and place order ──────────────────────────
             with lock:
-                if nifty_trade_active:  # Only block NIFTY, not CRUDE
+                if nifty_trade_active:
                     time.sleep(10)
                     continue
                 nifty_trade_active = True
-                global_trade_active = True  # also set global for flip detection
+                global_trade_active = True
 
-            print(f"🧠 HalfTrend Arrow Detected: {signal}")
+            print(f"🧠 NIFTY entering: {signal}")
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
             if not symbol or price is None:
@@ -2173,29 +2199,37 @@ def nifty_loop():
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
             if filled_price:
-                last_running_signal = signal
-                last_executed_signal_nifty = signal
-                current_symbol = symbol
-                current_qty = lot
-                current_exchange = exchange
+                # Store position state atomically so flip detection works
+                with lock:
+                    nifty_position.update({
+                        "symbol":   symbol,
+                        "qty":      get_quantity(lot, exchange),
+                        "exchange": exchange,
+                        "signal":   signal,
+                        "active":   True
+                    })
+                    last_running_signal        = signal
+                    last_executed_signal_nifty = signal
+                    current_symbol             = symbol
+                    current_qty                = lot
+                    current_exchange           = exchange
 
-                # Mark carry-over signal as used for today
                 if not is_fresh:
                     nifty_loop._carryover_done = carryover_key
                     send_message(
                         f"♻️ NIFTY carry-over entry\n"
-                        f"Signal: {signal} (trend continuing from prior day)\n"
+                        f"Signal: {signal} (trend continuing)\n"
                         f"{symbol} @ ₹{filled_price}"
                     )
                 else:
-                    send_message(f"🆕 NIFTY fresh signal entry: {signal}\n{symbol} @ ₹{filled_price}")
+                    send_message(f"🆕 NIFTY {signal} entry\n{symbol} @ ₹{filled_price}")
 
                 threading.Thread(
                     target=run_trade_wrapper,
                     args=(symbol, filled_price, lot, exchange, "NIFTY", signal, 0, "TREND"),
                     daemon=True
                 ).start()
-                print(f"🎯 NIFTY Trade Executed: {symbol} @ {filled_price}")
+                print(f"🎯 NIFTY Trade: {symbol} @ ₹{filled_price}  lots={lot}")
             else:
                 with lock:
                     nifty_trade_active = False
@@ -2203,7 +2237,7 @@ def nifty_loop():
 
         except Exception as e:
             print("❌ NIFTY LOOP ERROR:", e)
-        
+
         time.sleep(10)
 
 
@@ -2221,7 +2255,6 @@ def crude_loop():
     while True:
         try:
             now_dt = datetime.now(IST)
-
 
             # Crude trades after Nifty hours
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
@@ -2245,7 +2278,7 @@ def crude_loop():
                     cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=2, channel_deviation=2)
                 last_fetch_crude = time.time()
 
-           if cached_crude_15m is None or len(cached_crude_15m) < 50 or cached_crude_ht is None:
+            if cached_crude_15m is None or len(cached_crude_15m) < 50 or cached_crude_ht is None:
                 time.sleep(10)
                 continue
 
@@ -2279,26 +2312,52 @@ def crude_loop():
                     time.sleep(10)
                     continue
 
-            # Flip/Exit Logic
+            # ── Read current position state atomically ─────────────────────────
             with lock:
-                is_active = global_trade_active
+                pos_active   = crude_position["active"]
+                pos_signal   = crude_position["signal"]
+                pos_symbol   = crude_position["symbol"]
+                pos_qty      = crude_position["qty"]
+                pos_exchange = crude_position["exchange"]
 
-            if is_active and last_running_signal and signal != last_running_signal:
-                print(f"🔁 CRUDE Flip: {last_running_signal} → {signal}")
-                exit_position(current_symbol, current_qty, current_exchange)
+            # ── FLIP DETECTION ─────────────────────────────────────────────────
+            if pos_active and pos_signal and signal != pos_signal:
+                print(f"🔁 CRUDE FLIP: {pos_signal} → {signal}")
+                exit_ok = exit_position(pos_symbol, pos_qty, pos_exchange)
+                if exit_ok:
+                    send_message(
+                        f"🔁 CRUDE flip exit\n"
+                        f"Closed: {pos_signal} ({pos_symbol})\n"
+                        f"New signal: {signal}"
+                    )
+                else:
+                    print("⚠️ CRUDE flip exit failed — retrying next tick")
+                    time.sleep(5)
+                    continue
+
                 with lock:
-                    global_trade_active = False
+                    crude_position.update({"symbol": None, "qty": 0, "exchange": None,
+                                           "signal": None, "active": False})
                     crude_trade_active = False
-                last_running_signal = None
-                time.sleep(2)
+                    global_trade_active = False
+                    last_running_signal = None
+                time.sleep(3)
+
+            elif pos_active and pos_signal == signal:
+                time.sleep(10)
+                continue
+
+            if is_fresh and signal == last_executed_signal_crude:
+                time.sleep(10)
+                continue
 
             # Entry Logic — use per-instrument lock
             with lock:
-                if crude_trade_active:  # Only block CRUDE, not NIFTY
+                if crude_trade_active:
                     time.sleep(10)
                     continue
                 crude_trade_active = True
-                global_trade_active = True  # also set global for flip detection
+                global_trade_active = True
 
             print(f"🧠 CRUDE Arrow Detected: {signal}")
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
@@ -2306,11 +2365,19 @@ def crude_loop():
             if symbol:
                 filled_price = place_order(symbol, lot, exchange, "CRUDE")
                 if filled_price:
-                    last_running_signal = signal
-                    last_executed_signal_crude = signal
-                    current_symbol = symbol
-                    current_qty = lot
-                    current_exchange = exchange
+                    with lock:
+                        crude_position.update({
+                            "symbol":   symbol,
+                            "qty":      get_quantity(lot, exchange),
+                            "exchange": exchange,
+                            "signal":   signal,
+                            "active":   True
+                        })
+                        last_running_signal       = signal
+                        last_executed_signal_crude = signal
+                        current_symbol            = symbol
+                        current_qty               = lot
+                        current_exchange          = exchange
 
                     if not is_fresh:
                         crude_loop._carryover_done = carryover_key
@@ -2439,7 +2506,7 @@ def confirm_entry(token, signal, df=None):
         return False
     
 def get_quantity(lots, exchange):
-    if exchange == "NFO":    # NIFTY 
+    if exchange == "NFO":    # NIFTY — current lot size = 65
         return lots * 65
     elif exchange == "MCX":  # CRUDE OIL
         return lots * 1
@@ -2453,8 +2520,10 @@ def get_balance(instrument):
     """
     try:
         margin = kite.margins()
-        
-        seg = margin.get("equity", {}).get("available", {})
+        if instrument == "NIFTY":
+            seg = margin.get("equity", {}).get("available", {})
+        else:
+            seg = margin.get("commodity", {}).get("available", {})
 
         # Kite returns live_balance when intraday, cash otherwise
         balance = seg.get("live_balance") or seg.get("cash") or 0
@@ -2483,7 +2552,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
       6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
       7. Streak and drawdown adjustments applied last.
 
-    Nifty lot size = 65 
+    Nifty lot size = 75 (as of 2024 revision — update if SEBI changes it again).
     Crude lot size = 100 bbls.
     """
     global win_streak, loss_streak
@@ -2492,13 +2561,13 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     # ── Risk parameters ──────────────────────────────────────────────────
     RISK_PCT         = 0.05    # 5% of balance risked per trade
     SL_PCT           = 0.20    # assume SL at 20% drop in option premium
-    MAX_CAPITAL_PCT  = 0.80    # never deploy more than 80% of balance in one trade
+    MAX_CAPITAL_PCT  = 0.40    # never deploy more than 40% of balance in one trade
     MAX_LOTS_NIFTY   = 5       # hard ceiling — adjust to your comfort
     MAX_LOTS_CRUDE   = 3
 
     # ── Lot sizes ─────────────────────────────────────────────────────────
     if instrument == "NIFTY":
-        lot_size = 65         
+        lot_size = 65          # Current Nifty F&O lot size
         max_lots = MAX_LOTS_NIFTY
     else:
         lot_size = 100         # Crude Oil MCX lot size
@@ -3301,6 +3370,7 @@ import pandas as pd
 
 def get_cached_data(token, interval="15minute", count=200):
     try:
+        print("📥 get_cached_data() called")
 
         # ✅ DEFINE DATES FIRST
         to_date = datetime.now()
@@ -3316,8 +3386,10 @@ def get_cached_data(token, interval="15minute", count=200):
             interval
         )
 
+        print(f"📦 Rows received: {len(data)}")
 
         df = pd.DataFrame(data)
+        print(f"📊 DF Shape: {df.shape}")
 
         return df.tail(count)
 

@@ -3085,7 +3085,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
         lot_size = 65          # Current Nifty F&O lot size
         max_lots = MAX_LOTS_NIFTY
     else:
-        lot_size = 1         # Crude Oil MCX lot size
+         lot_size = 1         # Crude Oil MCX lot size
         max_lots = MAX_LOTS_CRUDE
 
     # ── 1. Live balance ───────────────────────────────────────────────────

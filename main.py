@@ -1124,7 +1124,7 @@ def find_option(signal, instrument):
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
         if balance <= 5000:
-            strike_shift = 9
+            strike_shift = 7
             max_price = 50 
         if balance <= 10000:
             strike_shift = 5      # deep OTM — cheap premium
@@ -1363,7 +1363,7 @@ def place_order(symbol, qty, exchange, instrument):
         try:
             live_balance = get_balance(instrument)
             total_cost   = price * quantity          # total ₹ this order will deploy
-            min_required = total_cost * 1.10         # 10% buffer for margin/charges
+            min_required = total_cost * 1.02        # 10% buffer for margin/charges
 
             print(f"💰 Balance check → Available: ₹{live_balance:,.0f}  |  Order cost: ₹{total_cost:,.0f}  |  Required (with buffer): ₹{min_required:,.0f}")
 

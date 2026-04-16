@@ -10,6 +10,8 @@ from telegram_bot import send_message
 import csv
 import os
 import json
+import re
+import pyotp
 from datetime import datetime, timedelta
 
 # ── FIX: CSV header matches log_trade_full() column order exactly ──
@@ -23,7 +25,117 @@ bot_started = False
 lock = threading.Lock()
 IST = pytz.timezone("Asia/Kolkata")
 kite = KiteConnect(api_key=config.API_KEY)
-kite.set_access_token(config.ACCESS_TOKEN)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔑 AUTO LOGIN — Zerodha TOTP + Kite Connect token refresh
+# ─────────────────────────────────────────────────────────────────────────────
+# Reads these env vars (set in Railway → service → Variables):
+#   ZERODHA_USER_ID       e.g. AB1234
+#   ZERODHA_PASSWORD      your Zerodha login password
+#   ZERODHA_TOTP_SECRET   TOTP secret from Zerodha authenticator setup
+#   KITE_API_SECRET       Kite Connect API secret
+# Falls back to config.ACCESS_TOKEN if any env var is missing (backward compat).
+
+def zerodha_auto_login():
+    """
+    Full automated Zerodha login flow:
+      1. POST credentials → get request_id
+      2. Generate TOTP from ZERODHA_TOTP_SECRET → complete 2FA
+      3. Follow Kite Connect login redirect → extract request_token
+      4. kite.generate_session(request_token) → get fresh access_token
+      5. Apply token to global kite object
+    Returns the new access_token string, or None on failure.
+    """
+    user_id     = os.environ.get("ZERODHA_USER_ID")
+    password    = os.environ.get("ZERODHA_PASSWORD")
+    totp_secret = os.environ.get("ZERODHA_TOTP_SECRET")
+    api_secret  = os.environ.get("KITE_API_SECRET") or getattr(config, "API_SECRET", None)
+
+    if not all([user_id, password, totp_secret, api_secret]):
+        print("⚠️  Auto-login env vars not set — falling back to config.ACCESS_TOKEN")
+        kite.set_access_token(config.ACCESS_TOKEN)
+        return None
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent"     : "Mozilla/5.0",
+        "Content-Type"   : "application/x-www-form-urlencoded",
+        "X-Kite-Version" : "3",
+    })
+
+    try:
+        # ── Step 1: POST login credentials ──────────────────────────────────
+        print("🔐 Auto-login: posting credentials...")
+        resp = session.post(
+            "https://kite.zerodha.com/api/login",
+            data={"user_id": user_id, "password": password},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("status") != "success":
+            raise Exception(f"Credential login failed: {data.get('message')}")
+
+        request_id = data["data"]["request_id"]
+        twofa_type = data["data"].get("twofa_type", "totp")
+        print(f"   request_id: {request_id}  |  2FA: {twofa_type}")
+
+        # ── Step 2: TOTP 2FA ────────────────────────────────────────────────
+        totp_value = pyotp.TOTP(totp_secret).now()
+        print(f"   TOTP generated: {totp_value}")
+
+        resp2 = session.post(
+            "https://kite.zerodha.com/api/twofa",
+            data={
+                "user_id"      : user_id,
+                "request_id"   : request_id,
+                "twofa_value"  : totp_value,
+                "twofa_type"   : twofa_type,
+                "skip_session" : "",
+            },
+            timeout=15,
+        )
+        data2 = resp2.json()
+        if data2.get("status") != "success":
+            raise Exception(f"2FA failed: {data2.get('message')}")
+        print("   ✅ 2FA passed")
+
+        # ── Step 3: Get request_token via Kite Connect redirect ─────────────
+        print("   Getting request_token from Kite Connect redirect...")
+        login_url = f"https://kite.zerodha.com/connect/login?api_key={config.API_KEY}&v=3"
+        resp3 = session.get(login_url, allow_redirects=True, timeout=15)
+
+        final_url = resp3.url
+        match = re.search(r"request_token=([^&]+)", final_url)
+        if not match:
+            match = re.search(r"request_token=([^&\"]+)", resp3.text)
+        if not match:
+            raise Exception(
+                f"request_token not found. Final URL: {final_url}\n"
+                "Check that your Kite app redirect URL is set correctly."
+            )
+        request_token = match.group(1)
+        print(f"   request_token: {request_token[:10]}...")
+
+        # ── Step 4: Generate access_token ───────────────────────────────────
+        session_data = kite.generate_session(request_token, api_secret=api_secret)
+        access_token = session_data["access_token"]
+        kite.set_access_token(access_token)
+        print(f"✅ Auto-login successful | token: {access_token[:8]}...{access_token[-4:]}")
+        return access_token
+
+    except Exception as e:
+        print(f"❌ Auto-login failed: {e}")
+        # Fallback: use last known token from config so bot can still attempt to run
+        try:
+            kite.set_access_token(config.ACCESS_TOKEN)
+            print("⚠️  Falling back to config.ACCESS_TOKEN")
+        except Exception:
+            pass
+        return None
+
+
+# ── Initial login at startup ─────────────────────────────────────────────────
+_startup_token = zerodha_auto_login()
 
 # 🌐 PRINT RAILWAY PUBLIC IP
 try:
@@ -3050,7 +3162,7 @@ def get_balance(instrument):
         if instrument == "NIFTY":
             seg = margin.get("equity", {}).get("available", {})
         else:
-            seg = margin.get("commodity", {}).get("available", {})
+            seg = margin.get("equity", {}).get("available", {})
 
         # Kite returns live_balance when intraday, cash otherwise
         balance = seg.get("live_balance") or seg.get("cash") or 0
@@ -3097,7 +3209,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
         lot_size = 65          # Current Nifty F&O lot size
         max_lots = MAX_LOTS_NIFTY
     else:
-        lot_size = 100         # Crude Oil MCX lot size
+        lot_size = 1        # Crude Oil MCX lot size
         max_lots = MAX_LOTS_CRUDE
 
     # ── 1. Live balance ───────────────────────────────────────────────────
@@ -4353,16 +4465,55 @@ if __name__ == "__main__":
         global CRUDE_SYMBOL
         CRUDE_SYMBOL = None
 
+        _access_token_refreshed_today = [False]   # mutable flag for closure
+        _last_refresh_date = [None]
+
         while True:
-            now = datetime.now()
+            now = datetime.now(IST)
+            today = now.date()
 
+            # Reset daily flag at midnight
+            if _last_refresh_date[0] != today:
+                _access_token_refreshed_today[0] = False
+                _last_refresh_date[0] = today
+
+            # ── 8:00 AM — refresh Kite access token (before market opens) ──
+            if now.hour == 8 and now.minute < 5 and not _access_token_refreshed_today[0]:
+                print("🔑 Daily access token refresh starting (8:00 AM)...")
+                new_token = zerodha_auto_login()
+                _access_token_refreshed_today[0] = True
+                ist_str = now.strftime("%d %b %Y %H:%M IST")
+                if new_token:
+                    try:
+                        send_message(
+                            f"✅ KITE TOKEN REFRESHED\n"
+                            f"{'='*28}\n"
+                            f"🕐 Time  : {ist_str}\n"
+                            f"🔑 Token : {new_token[:8]}...{new_token[-4:]}\n"
+                            f"📈 Bot ready for market open at 9:15 AM"
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        send_message(
+                            f"❌ KITE TOKEN REFRESH FAILED\n"
+                            f"{'='*28}\n"
+                            f"🕐 Time  : {ist_str}\n"
+                            f"⚠️ Using previous token — please check manually!"
+                        )
+                    except Exception:
+                        pass
+
+            # ── 9:00–9:05 AM — refresh instrument tokens ────────────────────
             if now.hour == 9 and now.minute < 5:
-                print("🔄 Refreshing tokens...")
-
+                print("🔄 Refreshing instrument tokens...")
                 CRUDE_TOKEN = get_latest_fut_token("CRUDEOIL", "MCX")
                 NIFTY_FUT_TOKEN = get_nifty_fut_token()
-
-                print("✅ Tokens refreshed")
+                data_cache.clear()
+                ltp_cache.clear()
+                instrument_cache.clear()
+                print("✅ Instrument tokens refreshed")
 
             time.sleep(60)
 

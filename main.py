@@ -80,23 +80,41 @@ def zerodha_auto_login():
         print(f"   request_id: {request_id}  |  2FA: {twofa_type}")
 
         # ── Step 2: TOTP 2FA ────────────────────────────────────────────────
-        totp_value = pyotp.TOTP(totp_secret).now()
-        print(f"   TOTP generated: {totp_value}")
+        # If we're in the last 3 seconds of the 30-second window, wait for
+        # the next window to avoid submitting a code that expires in-flight.
+        totp_obj = pyotp.TOTP(totp_secret)
+        seconds_remaining = 30 - (int(time.time()) % 30)
+        if seconds_remaining <= 3:
+            print(f"   ⏳ Near window boundary ({seconds_remaining}s left) — waiting for next window...")
+            time.sleep(seconds_remaining + 1)
 
-        resp2 = session.post(
-            "https://kite.zerodha.com/api/twofa",
-            data={
-                "user_id"      : user_id,
-                "request_id"   : request_id,
-                "twofa_value"  : totp_value,
-                "twofa_type"   : twofa_type,
-                "skip_session" : "",
-            },
-            timeout=15,
-        )
-        data2 = resp2.json()
-        if data2.get("status") != "success":
-            raise Exception(f"2FA failed: {data2.get('message')}")
+        totp_value = totp_obj.now()
+        print(f"   TOTP generated: {totp_value} (window: {30 - (int(time.time()) % 30)}s remaining)")
+
+        data2 = None
+        for attempt in range(1, 4):
+            resp2 = session.post(
+                "https://kite.zerodha.com/api/twofa",
+                data={
+                    "user_id"      : user_id,
+                    "request_id"   : request_id,
+                    "twofa_value"  : totp_obj.now(),   # regenerate on each attempt
+                    "twofa_type"   : twofa_type,
+                    "skip_session" : "",
+                },
+                timeout=15,
+            )
+            data2 = resp2.json()
+            print(f"   2FA attempt {attempt}: {data2.get('status')} | code: {totp_obj.now()}")
+            if data2.get("status") == "success":
+                break
+            # Wait for the next 30-second window and retry with a fresh code
+            wait_secs = 30 - (int(time.time()) % 30) + 1
+            print(f"   ⏳ Waiting {wait_secs}s for next TOTP window (attempt {attempt}/3)...")
+            time.sleep(wait_secs)
+
+        if not data2 or data2.get("status") != "success":
+            raise Exception(f"2FA failed after 3 attempts: {data2.get('message') if data2 else 'No response'}")
         print("   ✅ 2FA passed")
 
         # ── Step 3: Get request_token via Kite Connect redirect ─────────────
@@ -3209,7 +3227,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
         lot_size = 65          # Current Nifty F&O lot size
         max_lots = MAX_LOTS_NIFTY
     else:
-        lot_size = 1        # Crude Oil MCX lot size
+        lot_size = 100         # Crude Oil MCX lot size
         max_lots = MAX_LOTS_CRUDE
 
     # ── 1. Live balance ───────────────────────────────────────────────────

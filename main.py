@@ -1675,18 +1675,20 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             except Exception as e:
                 print("HT exit error:", e)
 
-            # 🚨 HARD SL
-            if profit < -risk:
-                
+            # 🚨 HARD SL (Real ₹ Loss Based)
+            max_loss = risk * remaining_qty
+
+            if current_pnl <= -max_loss:
+
                 last_exit_reason = "SL"
 
-                print("🛑 HARD SL HIT")
-
+                print(f"🛑 HARD SL HIT | Loss: ₹{current_pnl:.0f} / Limit: ₹{max_loss:.0f}")
+                send_message(f"🛑 HARD SL HIT | Loss: ₹{current_pnl:.0f} / Limit: ₹{max_loss:.0f}")
                 if not exit_done:
                     exit_position(symbol, remaining_qty, exchange)
                     exit_done = True
 
-                pnl = profit * remaining_qty
+                pnl = current_pnl
                 break
 
             
@@ -2018,7 +2020,7 @@ def get_last_active_signal(ht_df):
           is_fresh       : True if arrow is on iloc[-2] (same-day),
                            False if it is a carried-over signal from prior bars
     """
-    MAX_LOOKBACK_BARS = 10   # how far back to scan (~2.5 hrs on 15-min chart)
+    MAX_LOOKBACK_BARS = 20   # how far back to scan (~2.5 hrs on 15-min chart)
 
     n = len(ht_df)
     if n < 4:
@@ -2172,6 +2174,7 @@ def nifty_loop():
                     nifty_trade_active = False
                     global_trade_active = False
                     last_running_signal = None
+                    last_executed_signal_nifty = None
 
                 # Clear manage_trade's exit_done so it doesn't try to double-exit
                 # Small pause so Kite processes the exit before new order
@@ -3380,7 +3383,6 @@ import pandas as pd
 
 def get_cached_data(token, interval="15minute", count=200):
     try:
-        print("📥 get_cached_data() called")
 
         # ✅ DEFINE DATES FIRST
         to_date = datetime.now()
@@ -3396,10 +3398,8 @@ def get_cached_data(token, interval="15minute", count=200):
             interval
         )
 
-        print(f"📦 Rows received: {len(data)}")
 
         df = pd.DataFrame(data)
-        print(f"📊 DF Shape: {df.shape}")
 
         return df.tail(count)
 

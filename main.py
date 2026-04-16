@@ -24,6 +24,13 @@ IST = pytz.timezone("Asia/Kolkata")
 kite = KiteConnect(api_key=config.API_KEY)
 kite.set_access_token(config.ACCESS_TOKEN)
 
+# 🌐 PRINT RAILWAY PUBLIC IP
+try:
+    ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+    print("🌐 Railway Public IP:", ip)
+except Exception as e:
+    print("❌ IP fetch failed:", e)
+
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
 # -----------------------------

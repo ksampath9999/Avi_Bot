@@ -49,7 +49,10 @@ def zerodha_auto_login():
     user_id     = os.environ.get("ZERODHA_USER_ID")
     password    = os.environ.get("ZERODHA_PASSWORD")
     totp_secret = os.environ.get("ZERODHA_TOTP_SECRET")
-    api_secret  = os.environ.get("KITE_API_SECRET") or getattr(config, "API_SECRET", None)
+    api_secret  = (os.environ.get("KITE_API_SECRET") or
+                   os.environ.get("API_SECRET") or
+                   getattr(config, "API_SECRET", None) or
+                   getattr(config, "SECRET", None))
 
     if not all([user_id, password, totp_secret, api_secret]):
         print("⚠️  Auto-login env vars not set — falling back to config.ACCESS_TOKEN")

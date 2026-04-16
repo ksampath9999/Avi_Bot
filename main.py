@@ -12,9 +12,10 @@ import os
 import json
 from datetime import datetime, timedelta
 
+# ── FIX: CSV header matches log_trade_full() column order exactly ──
 if not os.path.exists("trade_log.csv"):
     with open("trade_log.csv", "w") as f:
-        f.write("time,symbol,entry,exit,pnl\n")
+        f.write("time,instrument,symbol,signal,entry,exit,pnl,probability\n")
 
 
 
@@ -156,6 +157,21 @@ last_exit_reason = None
 nifty_trade_count = 0
 crude_trade_count = 0
 last_reset_day = None
+
+# Per-instrument daily P&L tracking (separate from combined portfolio_pnl)
+nifty_daily_pnl = 0
+crude_daily_pnl = 0
+nifty_daily_wins = 0
+nifty_daily_losses = 0
+crude_daily_wins = 0
+crude_daily_losses = 0
+
+# Telegram alert rate-limiting (avoid flooding on same state)
+_last_no_signal_alert_nifty = 0
+_last_no_signal_alert_crude = 0
+_last_trail_alert_nifty = 0.0
+_last_trail_alert_crude = 0.0
+NO_SIGNAL_ALERT_INTERVAL = 300   # send "no arrow" alert at most every 5 min
 last_no_arrow_log_time = 0
 last_logged_trend_nifty = None
 last_logged_arrow_nifty = None
@@ -1530,7 +1546,14 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         sl = entry + risk
         peak = entry
 
-    send_message(f"🚀 ELITE TRADE\n{symbol} @ {entry}")
+    send_message(
+        f"🚀 NEW TRADE ENTERED\n"
+        f"📌 {instrument} {signal} → {symbol}\n"
+        f"💰 Entry: ₹{entry:.1f}  |  Qty: {actual_qty}\n"
+        f"🛑 Initial SL: ₹{(entry*(1-0.20) if signal=='CALL' else entry*(1+0.20)):.1f}  "
+        f"(20% of premium)\n"
+        f"📊 Deployed: ₹{entry * actual_qty:,.0f}"
+    )
 
     try:
         while True:
@@ -1595,6 +1618,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 print(f"💰 Lock Active → Peak: {local_max_profit:.0f}, Lock: {lock_level:.0f}")
 
                 if current_pnl < lock_level:
+                    send_message(
+                        f"💰 PROFIT LOCK EXIT\n"
+                        f"📌 {instrument} {signal} → {symbol}\n"
+                        f"📈 Peak P&L: ₹{local_max_profit:.0f}  |  Current: ₹{current_pnl:.0f}\n"
+                        f"🔒 Lock level ({int(lock_pct*100)}%): ₹{lock_level:.0f} — exiting to protect gains"
+                    )
                     print("💰 Profit lock triggered — exit")
 
                     if not exit_done:
@@ -1626,11 +1655,27 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🚀 ATR TRAILING (ADAPTIVE)
             # ===============================
             trail_multiplier = 1.2
+            old_sl = sl
 
             if signal == "CALL":
                 sl = max(sl, peak - (atr_value * trail_multiplier))
             else:
                 sl = min(sl, peak + (atr_value * trail_multiplier))
+
+            # ── Send Telegram alert when SL moves by > 0.5% of entry ──────────
+            global _last_trail_alert_nifty, _last_trail_alert_crude
+            _trail_ref = _last_trail_alert_nifty if instrument == "NIFTY" else _last_trail_alert_crude
+            if abs(sl - old_sl) > entry * 0.005 and time.time() - _trail_ref > 60:
+                send_message(
+                    f"📈 TRAILING SL MOVED\n"
+                    f"📌 {instrument} {signal} → {symbol}\n"
+                    f"🛑 New SL: ₹{sl:.1f}  (was ₹{old_sl:.1f})\n"
+                    f"💰 Current P&L: ₹{current_pnl:.0f}  |  LTP: ₹{ltp:.1f}"
+                )
+                if instrument == "NIFTY":
+                    _last_trail_alert_nifty = time.time()
+                else:
+                    _last_trail_alert_crude = time.time()
 
             # ===============================
             # 🔥 STRONG TREND MODE (LET PROFITS RUN)
@@ -1642,12 +1687,20 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     sl = min(sl, peak + (atr_value * 0.8))
 
             # 🔥 HALF TREND EXIT — Pine-accurate: exit when opposite arrow fires on closed candle
+            # NOTE: nifty_loop / crude_loop is the PRIMARY flip handler (runs every 10s).
+            # This block is a safety fallback that fires inside manage_trade's 1.5s loop,
+            # covering the window between nifty_loop iterations.
+            # exit_position() is idempotent — it checks Kite positions before placing the
+            # sell order, so double-exit is impossible even if both paths fire.
             try:
                 df_ht_exit = get_cached_data(
                     CRUDE_TOKEN if instrument == "CRUDE" else config.NIFTY_TOKEN,
                     "15minute",
                     120
                 )
+
+                if df_ht_exit is None or len(df_ht_exit) < 10:
+                    raise ValueError("Insufficient data for HT exit check")
 
                 ht_df_exit = halftrend_tv(df_ht_exit)
 
@@ -1663,8 +1716,27 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     exit_signal = "PUT"
 
                 if exit_signal and exit_signal != signal:
+                    # Check whether nifty_loop already handled this flip
+                    # (pos dict will have been cleared or updated to the new signal)
+                    pos_dict = nifty_position if instrument == "NIFTY" else crude_position
+                    with lock:
+                        already_flipped = (pos_dict.get("symbol") != symbol)
+
+                    if already_flipped:
+                        # nifty_loop already exited this trade — just break cleanly
+                        print(f"ℹ️ HT exit: flip already handled by loop — breaking cleanly")
+                        pnl = current_pnl
+                        break
+
                     print(f"🔄 HalfTrend Exit Triggered — new arrow: {exit_signal}, was in: {signal}")
                     print(f"   HT={last_exit['ht']:.2f}  atrHigh={last_exit['atrHigh']:.2f}  atrLow={last_exit['atrLow']:.2f}")
+                    send_message(
+                        f"🔄 HALFTREND ARROW FLIP — EXIT\n"
+                        f"📌 {instrument}: was {signal} on {symbol}\n"
+                        f"🔁 New arrow: {exit_signal}\n"
+                        f"💰 Trade P&L: ₹{current_pnl:.0f}  |  LTP: ₹{ltp:.1f}\n"
+                        f"📊 HT line: {last_exit['ht']:.2f}"
+                    )
                     if not exit_done:
                         exit_position(symbol, remaining_qty, exchange)
                         exit_done = True
@@ -1675,32 +1747,51 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             except Exception as e:
                 print("HT exit error:", e)
 
-            # 🚨 HARD SL (Real ₹ Loss Based)
-            max_loss = risk * remaining_qty
+            # ================================================================
+            # 🛑 STOP LOSS EXITS  (checked in priority order every 1.5 s)
+            # ================================================================
 
-            if current_pnl <= -max_loss:
+            # ── 1. Trailing SL exit (ATR-based, premium scale) ──────────────
+            # sl starts at entry ± 20% and trails upward as price moves in
+            # our favour.  ltp and sl are both option premium prices — same
+            # scale — so the comparison is direct and correct.
+            trailing_hit = (signal == "CALL" and ltp <= sl) or \
+                           (signal == "PUT"  and ltp >= sl)
 
-                last_exit_reason = "SL"
-
-                print(f"🛑 HARD SL HIT | Loss: ₹{current_pnl:.0f} / Limit: ₹{max_loss:.0f}")
-                send_message(f"🛑 HARD SL HIT | Loss: ₹{current_pnl:.0f} / Limit: ₹{max_loss:.0f}")
-                if not exit_done:
-                    exit_position(symbol, remaining_qty, exchange)
-                    exit_done = True
-
+            if trailing_hit and not exit_done:
+                last_exit_reason = "TRAILING_SL"
+                print(f"🛑 TRAILING SL HIT | LTP={ltp:.1f}  SL={sl:.1f}")
+                send_message(
+                    f"🛑 TRAILING SL HIT — EXITING IMMEDIATELY\n"
+                    f"📌 {instrument} {signal} → {symbol}\n"
+                    f"📉 LTP: ₹{ltp:.1f}  |  Trailing SL: ₹{sl:.1f}\n"
+                    f"💔 P&L: ₹{current_pnl:.0f}\n"
+                    f"📊 Entry: ₹{entry:.1f}  |  Peak: ₹{peak:.1f}"
+                )
+                exit_position(symbol, remaining_qty, exchange)
+                exit_done = True
                 pnl = current_pnl
                 break
 
-            
+            # ── 2. Hard SL (absolute 20% of option premium) ─────────────────
+            # Safety net in case trailing SL fails to fire (e.g. gap-down open).
+            # Fires when total ₹ loss exceeds 20% of entry × qty.
+            max_loss = risk * remaining_qty   # risk = entry * 0.20
 
-            # 🚪 EXIT
-            #if (signal == "CALL" and ltp <= sl) or (signal == "PUT" and ltp >= sl):
-            #    pnl = profit * remaining_qty
-            #    if not exit_done:
-            #        exit_position(symbol, remaining_qty, exchange)
-            #        exit_done = True
-            #    send_message(f"🛑 Exit\n{symbol}")
-            #    break
+            if current_pnl <= -max_loss and not exit_done:
+                last_exit_reason = "HARD_SL"
+                print(f"🛑 HARD SL HIT | Loss: ₹{current_pnl:.0f} / Limit: ₹{-max_loss:.0f}")
+                send_message(
+                    f"🛑 HARD STOP LOSS HIT — EXITING IMMEDIATELY\n"
+                    f"📌 {instrument} {signal} → {symbol}\n"
+                    f"💔 Loss: ₹{current_pnl:.0f}  |  SL limit: ₹{-max_loss:.0f}\n"
+                    f"📉 Entry: ₹{entry:.1f}  |  Exit LTP: ₹{ltp:.1f}\n"
+                    f"📊 Hard SL = 20% of option premium × qty"
+                )
+                exit_position(symbol, remaining_qty, exchange)
+                exit_done = True
+                pnl = current_pnl
+                break
 
             # 🚀 Smart time exit (only if NO momentum)
             #if time.time() - entry_time > 900:
@@ -1724,24 +1815,39 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         # -----------------------------
         with lock:
             global global_trade_active
-            
+            global nifty_daily_pnl, crude_daily_pnl
+            global nifty_trade_count, crude_trade_count
+            global nifty_daily_wins, nifty_daily_losses
+            global crude_daily_wins, crude_daily_losses
+
             portfolio_pnl += pnl
             daily_pnl += pnl
 
-            update_streak(pnl)
-            update_exit_time(instrument)
-            
-
+            # ── Per-instrument accounting ──────────────────────────────────
             if instrument == "NIFTY":
+                nifty_daily_pnl += pnl
+                nifty_trade_count += 1
+                if pnl > 0:
+                    nifty_daily_wins += 1
+                else:
+                    nifty_daily_losses += 1
                 nifty_active = False
                 nifty_trade_active = False
             else:
+                crude_daily_pnl += pnl
+                crude_trade_count += 1
+                if pnl > 0:
+                    crude_daily_wins += 1
+                else:
+                    crude_daily_losses += 1
                 crude_active = False
                 crude_trade_active = False
-                
-            
+
+            update_streak(pnl)
+            update_exit_time(instrument)
+
             global_trade_active = False
-                
+
             # 🔥 CRITICAL FIX (MISSING)
             global trade_in_progress_nifty, trade_in_progress_crude
 
@@ -1750,8 +1856,18 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             else:
                 trade_in_progress_crude = False
 
-
+            exit_emoji = "✅" if pnl > 0 else "❌"
             print(f"✅ {instrument} trade closed — ready for next")
+
+            # ── Trade closed Telegram summary ─────────────────────────────
+            send_message(
+                f"{exit_emoji} TRADE CLOSED — {instrument}\n"
+                f"📌 {signal} → {symbol}\n"
+                f"💰 P&L: ₹{pnl:.0f}  ({'PROFIT' if pnl > 0 else 'LOSS'})\n"
+                f"📊 Entry: ₹{entry:.1f}  |  Exit: ₹{ltp:.1f}\n"
+                f"📅 Today {instrument} P&L so far: ₹"
+                f"{nifty_daily_pnl if instrument == 'NIFTY' else crude_daily_pnl:.0f}"
+            )
 
             log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
 
@@ -1773,6 +1889,109 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         # 📊 STRATEGY LOG (OUTSIDE LOCK OK)
         if market_type in strategy_log:
             strategy_log[market_type].append(pnl) 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔒 KITE POSITION GUARD
+# Primary defence against placing a second order while one is already live.
+# Uses the actual Kite positions API — not in-memory flags — so it works
+# correctly even after a bot restart while a trade is open.
+# ─────────────────────────────────────────────────────────────────────────────
+_kite_pos_cache: dict = {}   # { instrument: (timestamp, result_dict) }
+_KITE_POS_TTL = 5            # seconds — avoid hammering the API
+
+def get_open_kite_position(instrument):
+    """
+    Query Kite for open net positions belonging to this instrument.
+
+    Returns a dict  { "symbol": str, "qty": int, "exchange": str }
+    if an open position is found, otherwise returns None.
+
+    instrument : "NIFTY"  → looks for NFO CE/PE positions
+                 "CRUDE"  → looks for MCX CE/PE positions
+    """
+    global _kite_pos_cache
+
+    now_ts = time.time()
+    if instrument in _kite_pos_cache:
+        cached_ts, cached_result = _kite_pos_cache[instrument]
+        if now_ts - cached_ts < _KITE_POS_TTL:
+            return cached_result
+
+    try:
+        exchange_map = {"NIFTY": "NFO", "CRUDE": "MCX"}
+        target_exchange = exchange_map.get(instrument)
+
+        positions = kite.positions().get("net", [])
+        for p in positions:
+            # Only consider positions with non-zero open quantity
+            if p.get("quantity", 0) == 0:
+                continue
+            if p.get("exchange") != target_exchange:
+                continue
+            # Must be an option (CE or PE)
+            sym = p.get("tradingsymbol", "")
+            if not (sym.endswith("CE") or sym.endswith("PE")):
+                continue
+
+            result = {
+                "symbol":   sym,
+                "qty":      abs(p["quantity"]),
+                "exchange": p["exchange"],
+            }
+            _kite_pos_cache[instrument] = (now_ts, result)
+            return result
+
+        _kite_pos_cache[instrument] = (now_ts, None)
+        return None
+
+    except Exception as e:
+        print(f"⚠️ get_open_kite_position({instrument}) error: {e}")
+        return None   # fail-safe: assume no position rather than blocking forever
+
+
+def restore_position_state_from_kite():
+    """
+    Called once at bot startup.
+    If Kite already has open positions (e.g. from a previous session),
+    restore in-memory flags so the bot doesn't place duplicate orders.
+    """
+    global nifty_position, crude_position
+    global nifty_trade_active, crude_trade_active
+    global global_trade_active, last_executed_signal_nifty, last_executed_signal_crude
+
+    for instrument in ("NIFTY", "CRUDE"):
+        pos = get_open_kite_position(instrument)
+        if pos is None:
+            continue
+
+        sym      = pos["symbol"]
+        qty      = pos["qty"]
+        exchange = pos["exchange"]
+        signal   = "CALL" if sym.endswith("CE") else "PUT"
+
+        print(f"⚠️ Existing Kite position found on startup: {instrument} {sym} qty={qty}")
+        send_message(
+            f"⚠️ EXISTING POSITION DETECTED ON STARTUP\n"
+            f"📌 {instrument}: {sym}  qty={qty}\n"
+            f"🔄 Restoring in-memory state — bot will manage this trade normally"
+        )
+
+        with lock:
+            if instrument == "NIFTY":
+                nifty_position.update({"symbol": sym, "qty": qty,
+                                       "exchange": exchange, "signal": signal,
+                                       "active": True})
+                nifty_trade_active = True
+                last_executed_signal_nifty = signal
+            else:
+                crude_position.update({"symbol": sym, "qty": qty,
+                                       "exchange": exchange, "signal": signal,
+                                       "active": True})
+                crude_trade_active = True
+                last_executed_signal_crude = signal
+
+            global_trade_active = True
 
 
 #exit sell orders
@@ -1864,7 +2083,16 @@ def tune_strategy():
     
             
 def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probability, market_type):
+    """
+    Wrapper around manage_trade that safely clears per-instrument state when the trade ends.
 
+    RACE-CONDITION FIX:
+    After a HalfTrend flip, nifty_loop exits the old trade AND immediately places a new
+    trade in the opposite direction, writing new trade data into nifty_position.
+    If we unconditionally clear nifty_position in the finally block we would wipe the NEW
+    trade's state.  We guard this by checking that the symbol we were managing is still
+    the current one — if it has already changed (flip happened) we leave state alone.
+    """
     global nifty_active, crude_active
     global nifty_trade_active, crude_trade_active
     global nifty_position, crude_position
@@ -1876,19 +2104,29 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
         with lock:
             global global_trade_active
 
-            if instrument == "NIFTY":
-                nifty_active = False
-                nifty_trade_active = False
-                # Clear position dict so flip logic knows trade is closed
-                nifty_position.update({"symbol": None, "qty": 0, "exchange": None,
-                                       "signal": None, "active": False})
-            else:
-                crude_active = False
-                crude_trade_active = False
-                crude_position.update({"symbol": None, "qty": 0, "exchange": None,
-                                       "signal": None, "active": False})
+            pos_dict = nifty_position if instrument == "NIFTY" else crude_position
 
-            global_trade_active = False
+            # Only clear state when this trade's symbol is still the active one.
+            # If a flip happened and a new trade was already registered, pos_dict["symbol"]
+            # will be the NEW trade's symbol — leave it untouched.
+            if pos_dict.get("symbol") == symbol:
+                pos_dict.update({"symbol": None, "qty": 0, "exchange": None,
+                                 "signal": None, "active": False})
+
+                if instrument == "NIFTY":
+                    nifty_active = False
+                    nifty_trade_active = False
+                else:
+                    crude_active = False
+                    crude_trade_active = False
+
+                global_trade_active = False
+            else:
+                # A flip trade is already active — only clear the flags for THIS
+                # instrument's OLD trade, but don't touch global_trade_active or
+                # the position dict (which now belongs to the new flip trade).
+                print(f"ℹ️ run_trade_wrapper: symbol changed ({symbol} → {pos_dict.get('symbol')}) "
+                      f"— flip trade active, not clearing new position state")
 
             
             
@@ -2020,7 +2258,9 @@ def get_last_active_signal(ht_df):
           is_fresh       : True if arrow is on iloc[-2] (same-day),
                            False if it is a carried-over signal from prior bars
     """
-    MAX_LOOKBACK_BARS = 20   # how far back to scan (~2.5 hrs on 15-min chart)
+    # ── FIX: 20 bars = only 5 hours on 15-min — not enough for previous-day arrows.
+    # 1 trading day ≈ 25 bars (9:15–3:30).  60 bars covers ~2.4 days safely.
+    MAX_LOOKBACK_BARS = 60   # ~2.4 trading days on 15-min chart
 
     n = len(ht_df)
     if n < 4:
@@ -2126,11 +2366,39 @@ def nifty_loop():
                 status = "NO_ARROW_NIFTY"
                 if last_status != status or time.time() - last_weak_log_time > 60:
                     trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
-                    print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 10 bars — waiting")
+                    print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 60 bars — waiting")
                     last_status = status
                     last_weak_log_time = time.time()
+                # Throttled Telegram alert for no-signal state
+                global _last_no_signal_alert_nifty
+                if time.time() - _last_no_signal_alert_nifty > NO_SIGNAL_ALERT_INTERVAL:
+                    trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
+                    send_message(
+                        f"⏸️ NIFTY: No HalfTrend arrow found\n"
+                        f"📊 Current trend: {trend_name} | Lookback: 60 bars\n"
+                        f"⏳ Waiting for arrow signal..."
+                    )
+                    _last_no_signal_alert_nifty = time.time()
                 time.sleep(10)
                 continue
+
+            # ── Telegram: signal detected ─────────────────────────────────────
+            if signal is not None and arrow_idx is not None:
+                arrow_bar = ht_df.iloc[arrow_idx]
+                _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
+                _bars_ago = len(ht_df) - arrow_idx - 2
+                _freshness = "🆕 FRESH arrow" if is_fresh else f"♻️ CARRY-OVER ({_bars_ago * 15} min ago)"
+                # Only alert when signal is newly identified (fresh) or on first carry-over detection
+                _carryover_alerted_key = f"NIFTY_sig_{signal}_{datetime.now(IST).strftime('%Y-%m-%d')}"
+                if is_fresh or not getattr(nifty_loop, "_sig_alerted", None) == _carryover_alerted_key:
+                    send_message(
+                        f"🔔 NIFTY SIGNAL DETECTED\n"
+                        f"{'🟢 CALL (BUY CE)' if signal == 'CALL' else '🔴 PUT (BUY PE)'}\n"
+                        f"📊 Type: {_freshness}\n"
+                        f"🎯 Arrow level: ₹{_level:.2f}\n"
+                        f"📉 HT line: {arrow_bar['ht']:.2f}  |  atrHigh: {arrow_bar['atrHigh']:.2f}  atrLow: {arrow_bar['atrLow']:.2f}"
+                    )
+                    nifty_loop._sig_alerted = _carryover_alerted_key
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -2140,66 +2408,95 @@ def nifty_loop():
                     time.sleep(10)
                     continue
 
-            # ── Read current position state atomically ─────────────────────────
-            with lock:
-                pos_active    = nifty_position["active"]
-                pos_signal    = nifty_position["signal"]
-                pos_symbol    = nifty_position["symbol"]
-                pos_qty       = nifty_position["qty"]
-                pos_exchange  = nifty_position["exchange"]
+            # ══════════════════════════════════════════════════════════════
+            # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
+            # ══════════════════════════════════════════════════════════════
+            # Layer 1 — Kite ground truth (handles bot restarts / flag drift)
+            kite_pos = get_open_kite_position("NIFTY")
+            if kite_pos:
+                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
 
-            # ── FLIP DETECTION ─────────────────────────────────────────────────
-            # A flip = we are in an active trade AND the new signal is the opposite.
-            # Action: exit the current position FIRST, then re-enter with new signal.
-            if pos_active and pos_signal and signal != pos_signal:
-                print(f"🔁 NIFTY FLIP: {pos_signal} → {signal}")
-                print(f"   Exiting: {pos_symbol}  qty={pos_qty}")
-
-                # Exit the live position
-                exit_ok = exit_position(pos_symbol, pos_qty, pos_exchange)
-
-                if exit_ok:
-                    send_message(
-                        f"🔁 NIFTY flip exit\n"
-                        f"Closed: {pos_signal} ({pos_symbol})\n"
-                        f"New signal: {signal}"
-                    )
-                else:
-                    print("⚠️ Flip exit order failed — will retry next tick")
-                    time.sleep(5)
+                if kite_sig == signal:
+                    # Already have a live NFO position in the same direction — skip
+                    with lock:
+                        if not nifty_position["active"]:
+                            nifty_position.update({
+                                "symbol":   kite_pos["symbol"],
+                                "qty":      kite_pos["qty"],
+                                "exchange": kite_pos["exchange"],
+                                "signal":   kite_sig,
+                                "active":   True,
+                            })
+                            nifty_trade_active = True
+                    time.sleep(10)
                     continue
 
-                # Clear position state atomically
+                else:
+                    # Open position in opposite direction → flip
+                    print(f"🔁 NIFTY FLIP (Kite): {kite_sig} → {signal}")
+                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"],
+                                            kite_pos["exchange"])
+                    if exit_ok:
+                        send_message(
+                            f"🔁 NIFTY flip exit\n"
+                            f"Closed: {kite_sig} ({kite_pos['symbol']})\n"
+                            f"New signal: {signal}"
+                        )
+                        _kite_pos_cache.pop("NIFTY", None)
+                    else:
+                        print("⚠️ NIFTY flip exit failed — retrying next tick")
+                        time.sleep(5)
+                        continue
+
+                    with lock:
+                        nifty_position.update({"symbol": None, "qty": 0,
+                                               "exchange": None, "signal": None,
+                                               "active": False})
+                        nifty_trade_active = False
+                        global_trade_active = False
+                        last_running_signal = None
+                        last_executed_signal_nifty = None
+                    time.sleep(3)
+
+            else:
+                # No live Kite position — sync in-memory if drifted
                 with lock:
-                    nifty_position.update({"symbol": None, "qty": 0, "exchange": None,
-                                           "signal": None, "active": False})
-                    nifty_trade_active = False
-                    global_trade_active = False
-                    last_running_signal = None
-                    last_executed_signal_nifty = None
+                    if nifty_position["active"]:
+                        print("⚠️ NIFTY in-memory says active but Kite shows no position — resetting")
+                        nifty_position.update({"symbol": None, "qty": 0,
+                                               "exchange": None, "signal": None,
+                                               "active": False})
+                        nifty_trade_active = False
 
-                # Clear manage_trade's exit_done so it doesn't try to double-exit
-                # Small pause so Kite processes the exit before new order
-                time.sleep(3)
+            # Layer 2 — in-memory flag (fast path)
+            with lock:
+                pos_active = nifty_position["active"]
+                pos_signal = nifty_position["signal"]
 
-            # ── SAME SIGNAL — already in matching trade, nothing to do ─────────
-            elif pos_active and pos_signal == signal:
-                # Already in a trade in the same direction — no action needed
+            if pos_active and pos_signal == signal:
                 time.sleep(10)
                 continue
 
-            # ── DUPLICATE PREVENTION for fresh arrows ─────────────────────────
+            # Layer 3 — duplicate prevention for same fresh signal
             if is_fresh and signal == last_executed_signal_nifty:
                 time.sleep(10)
                 continue
 
-            # ── ENTRY — acquire lock and place order ──────────────────────────
+            # ══════════════════════════════════════════════════════════════
+            # 🚀  ENTRY — all guards passed, place the order
+            # ══════════════════════════════════════════════════════════════
+            # FIX: check flag then release lock; sleep OUTSIDE the lock.
             with lock:
                 if nifty_trade_active:
-                    time.sleep(10)
-                    continue
-                nifty_trade_active = True
-                global_trade_active = True
+                    already_active = True
+                else:
+                    already_active = False
+                    nifty_trade_active = True
+                    global_trade_active = True
+
+            if already_active:
+                time.sleep(10)
+                continue
 
             print(f"🧠 NIFTY entering: {signal}")
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
@@ -2214,20 +2511,21 @@ def nifty_loop():
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
             if filled_price:
-                # Store position state atomically so flip detection works
                 with lock:
                     nifty_position.update({
                         "symbol":   symbol,
                         "qty":      get_quantity(lot, exchange),
                         "exchange": exchange,
                         "signal":   signal,
-                        "active":   True
+                        "active":   True,
                     })
                     last_running_signal        = signal
                     last_executed_signal_nifty = signal
                     current_symbol             = symbol
                     current_qty                = lot
                     current_exchange           = exchange
+
+                _kite_pos_cache.pop("NIFTY", None)   # invalidate position cache
 
                 if not is_fresh:
                     nifty_loop._carryover_done = carryover_key
@@ -2252,6 +2550,12 @@ def nifty_loop():
 
         except Exception as e:
             print("❌ NIFTY LOOP ERROR:", e)
+            try:
+                if get_open_kite_position("NIFTY") is None:
+                    with lock:
+                        nifty_trade_active = False
+            except Exception:
+                pass
 
         time.sleep(10)
 
@@ -2313,8 +2617,34 @@ def crude_loop():
                     print(f"{'🟢' if signal=='CALL' else '🔴'} CARRY-OVER CRUDE {signal} — {bars_ago} bars ago @ {arrow_level:.2f}")
 
             if signal is None:
+                global _last_no_signal_alert_crude
+                if time.time() - _last_no_signal_alert_crude > NO_SIGNAL_ALERT_INTERVAL:
+                    trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
+                    send_message(
+                        f"⏸️ CRUDE: No HalfTrend arrow found\n"
+                        f"📊 Current trend: {trend_name} | Lookback: 60 bars\n"
+                        f"⏳ Waiting for arrow signal..."
+                    )
+                    _last_no_signal_alert_crude = time.time()
                 time.sleep(10)
                 continue
+
+            # ── Telegram: CRUDE signal detected ─────────────────────────────
+            if signal is not None and arrow_idx is not None:
+                _arrow_bar_c = ht_df.iloc[arrow_idx]
+                _level_c = _arrow_bar_c["atrLow"] if signal == "CALL" else _arrow_bar_c["atrHigh"]
+                _bars_ago_c = len(ht_df) - arrow_idx - 2
+                _freshness_c = "🆕 FRESH arrow" if is_fresh else f"♻️ CARRY-OVER ({_bars_ago_c * 15} min ago)"
+                _sig_key_c = f"CRUDE_sig_{signal}_{datetime.now(IST).strftime('%Y-%m-%d')}"
+                if is_fresh or not getattr(crude_loop, "_sig_alerted", None) == _sig_key_c:
+                    send_message(
+                        f"🔔 CRUDE SIGNAL DETECTED\n"
+                        f"{'🟢 CALL (BUY CE)' if signal == 'CALL' else '🔴 PUT (BUY PE)'}\n"
+                        f"📊 Type: {_freshness_c}\n"
+                        f"🎯 Arrow level: ₹{_level_c:.2f}\n"
+                        f"📉 HT line: {_arrow_bar_c['ht']:.2f}"
+                    )
+                    crude_loop._sig_alerted = _sig_key_c
 
             if is_fresh and signal == last_executed_signal_crude:
                 time.sleep(10)
@@ -2327,52 +2657,97 @@ def crude_loop():
                     time.sleep(10)
                     continue
 
-            # ── Read current position state atomically ─────────────────────────
+            # ══════════════════════════════════════════════════════════════
+            # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
+            # ══════════════════════════════════════════════════════════════
+            # Layer 1 — Kite ground truth (handles bot restarts / flag drift)
+            kite_pos = get_open_kite_position("CRUDE")
+            if kite_pos:
+                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
+
+                if kite_sig == signal:
+                    # Already have an open position in the same direction — skip
+                    # Sync in-memory state in case it drifted
+                    with lock:
+                        if not crude_position["active"]:
+                            crude_position.update({
+                                "symbol":   kite_pos["symbol"],
+                                "qty":      kite_pos["qty"],
+                                "exchange": kite_pos["exchange"],
+                                "signal":   kite_sig,
+                                "active":   True,
+                            })
+                            crude_trade_active = True
+                    time.sleep(10)
+                    continue
+
+                else:
+                    # Position exists in OPPOSITE direction → flip
+                    print(f"🔁 CRUDE FLIP (Kite): {kite_sig} → {signal}")
+                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"],
+                                            kite_pos["exchange"])
+                    if exit_ok:
+                        send_message(
+                            f"🔁 CRUDE flip exit\n"
+                            f"Closed: {kite_sig} ({kite_pos['symbol']})\n"
+                            f"New signal: {signal}"
+                        )
+                        _kite_pos_cache.pop("CRUDE", None)   # invalidate cache
+                    else:
+                        print("⚠️ CRUDE flip exit failed — retrying next tick")
+                        time.sleep(5)
+                        continue
+
+                    with lock:
+                        crude_position.update({"symbol": None, "qty": 0,
+                                               "exchange": None, "signal": None,
+                                               "active": False})
+                        crude_trade_active = False
+                        global_trade_active = False
+                        last_running_signal = None
+                    time.sleep(3)   # let Kite process exit before re-entry
+
+            else:
+                # No open Kite position — sync in-memory state if it drifted
+                with lock:
+                    if crude_position["active"]:
+                        print("⚠️ CRUDE in-memory says active but Kite shows no position — resetting")
+                        crude_position.update({"symbol": None, "qty": 0,
+                                               "exchange": None, "signal": None,
+                                               "active": False})
+                        crude_trade_active = False
+
+            # Layer 2 — in-memory flag (fast path, no API call)
             with lock:
                 pos_active   = crude_position["active"]
                 pos_signal   = crude_position["signal"]
-                pos_symbol   = crude_position["symbol"]
-                pos_qty      = crude_position["qty"]
-                pos_exchange = crude_position["exchange"]
 
-            # ── FLIP DETECTION ─────────────────────────────────────────────────
-            if pos_active and pos_signal and signal != pos_signal:
-                print(f"🔁 CRUDE FLIP: {pos_signal} → {signal}")
-                exit_ok = exit_position(pos_symbol, pos_qty, pos_exchange)
-                if exit_ok:
-                    send_message(
-                        f"🔁 CRUDE flip exit\n"
-                        f"Closed: {pos_signal} ({pos_symbol})\n"
-                        f"New signal: {signal}"
-                    )
-                else:
-                    print("⚠️ CRUDE flip exit failed — retrying next tick")
-                    time.sleep(5)
-                    continue
-
-                with lock:
-                    crude_position.update({"symbol": None, "qty": 0, "exchange": None,
-                                           "signal": None, "active": False})
-                    crude_trade_active = False
-                    global_trade_active = False
-                    last_running_signal = None
-                time.sleep(3)
-
-            elif pos_active and pos_signal == signal:
+            if pos_active and pos_signal == signal:
                 time.sleep(10)
                 continue
 
+            # Layer 3 — duplicate prevention for same fresh signal
             if is_fresh and signal == last_executed_signal_crude:
                 time.sleep(10)
                 continue
 
-            # Entry Logic — use per-instrument lock
+            # ══════════════════════════════════════════════════════════════
+            # 🚀  ENTRY — all guards passed, place the order
+            # ══════════════════════════════════════════════════════════════
+            # FIX: acquire lock → check flag → set flag → release lock.
+            # Do NOT sleep inside the lock (that holds the lock and blocks
+            # run_trade_wrapper's finally block from clearing state).
             with lock:
                 if crude_trade_active:
-                    time.sleep(10)
-                    continue
-                crude_trade_active = True
-                global_trade_active = True
+                    already_active = True
+                else:
+                    already_active = False
+                    crude_trade_active = True
+                    global_trade_active = True
+
+            if already_active:
+                time.sleep(10)   # sleep OUTSIDE lock
+                continue
 
             print(f"🧠 CRUDE Arrow Detected: {signal}")
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
@@ -2386,13 +2761,15 @@ def crude_loop():
                             "qty":      get_quantity(lot, exchange),
                             "exchange": exchange,
                             "signal":   signal,
-                            "active":   True
+                            "active":   True,
                         })
-                        last_running_signal       = signal
+                        last_running_signal        = signal
                         last_executed_signal_crude = signal
-                        current_symbol            = symbol
-                        current_qty               = lot
-                        current_exchange          = exchange
+                        current_symbol             = symbol
+                        current_qty                = lot
+                        current_exchange           = exchange
+
+                    _kite_pos_cache.pop("CRUDE", None)   # invalidate position cache
 
                     if not is_fresh:
                         crude_loop._carryover_done = carryover_key
@@ -2418,7 +2795,15 @@ def crude_loop():
 
         except Exception as e:
             print("❌ CRUDE LOOP ERROR:", e)
-        
+            # Safety reset: if flag was set True before the exception,
+            # only reset it if Kite confirms no open position
+            try:
+                if get_open_kite_position("CRUDE") is None:
+                    with lock:
+                        crude_trade_active = False
+            except Exception:
+                pass
+
         time.sleep(10)
 
 #==================        
@@ -2567,8 +2952,8 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
       6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
       7. Streak and drawdown adjustments applied last.
 
-    Nifty lot size = 75 (as of 2024 revision — update if SEBI changes it again).
-    Crude lot size = 100 bbls.
+    Nifty lot size = 65 
+    Crude lot size = 1 bbls.
     """
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio
@@ -2585,7 +2970,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
         lot_size = 65          # Current Nifty F&O lot size
         max_lots = MAX_LOTS_NIFTY
     else:
-        lot_size = 100         # Crude Oil MCX lot size
+        lot_size = 1         # Crude Oil MCX lot size
         max_lots = MAX_LOTS_CRUDE
 
     # ── 1. Live balance ───────────────────────────────────────────────────
@@ -2798,8 +3183,27 @@ def reset_daily_pnl():
         report_sent_today = False
         max_drawdown = 0
 
+        # ── Per-instrument reset ─────────────────────────────────────────
+        global nifty_daily_pnl, crude_daily_pnl
+        global nifty_trade_count, crude_trade_count
+        global nifty_daily_wins, nifty_daily_losses
+        global crude_daily_wins, crude_daily_losses
+        global _last_no_signal_alert_nifty, _last_no_signal_alert_crude
+
+        nifty_daily_pnl = 0
+        crude_daily_pnl = 0
+        nifty_trade_count = 0
+        crude_trade_count = 0
+        nifty_daily_wins = 0
+        nifty_daily_losses = 0
+        crude_daily_wins = 0
+        crude_daily_losses = 0
+        _last_no_signal_alert_nifty = 0
+        _last_no_signal_alert_crude = 0
+
         # Clear stale option chain cache from prior trading day
         instrument_cache.clear()
+        _data_cache_store.clear()   # also flush historical data cache
 
         last_reset_date = today
         
@@ -3383,31 +3787,40 @@ def choose_best_strategy(df, token):
 from datetime import datetime, timedelta
 import pandas as pd
 
+_data_cache_store: dict = {}   # { (token, interval): (timestamp, df) }  — populated by get_cached_data
+_DATA_CACHE_TTL = 20           # seconds — re-fetch if older than this
+
 def get_cached_data(token, interval="15minute", count=200):
+    """Fetch historical data from Kite with a 20-second in-memory cache."""
+    global _data_cache_store
+
+    cache_key = (token, interval)
+    now_ts = time.time()
+
+    # ── Cache hit ───────────────────────────────────────────────────────────
+    if cache_key in _data_cache_store:
+        cached_ts, cached_df = _data_cache_store[cache_key]
+        if now_ts - cached_ts < _DATA_CACHE_TTL:
+            return cached_df.tail(count) if not cached_df.empty else None
+
+    # ── Cache miss → fetch from Kite ────────────────────────────────────────
     try:
+        to_date   = datetime.now()
+        from_date = to_date - timedelta(days=10)   # enough history for HalfTrend warm-up
 
-        # ✅ DEFINE DATES FIRST
-        to_date = datetime.now()
-        from_date = to_date - timedelta(days=10)
+        data = kite.historical_data(token, from_date, to_date, interval)
+        df   = pd.DataFrame(data)
 
-        print("🌐 Requesting historical data from Kite...")
-       
+        if df.empty:
+            print(f"⚠️ get_cached_data: empty response for token={token}, interval={interval}")
+            return None
 
-        data = kite.historical_data(
-            token,
-            from_date,
-            to_date,
-            interval
-        )
-
-
-        df = pd.DataFrame(data)
-
+        _data_cache_store[cache_key] = (now_ts, df)
         return df.tail(count)
 
     except Exception as e:
-        print("❌ Data fetch error:", e)
-        return pd.DataFrame()
+        print(f"❌ Data fetch error (token={token}, interval={interval}): {e}")
+        return None
 
 
 
@@ -3480,58 +3893,125 @@ Win Rate: {round((wins/(wins+losses))*100 if (wins+losses)>0 else 0,2)}%
 Total PnL: {round(total_pnl,2)}
 """)
     
+def _instrument_report_section(today_df_inst, instrument_name, daily_pnl_val):
+    """Helper — builds a single-instrument section for the daily report."""
+    if today_df_inst.empty:
+        return f"\n📊 {instrument_name}: No trades today\n"
+
+    wins   = int((today_df_inst["pnl"] > 0).sum())
+    losses = int((today_df_inst["pnl"] <= 0).sum())
+    total  = wins + losses
+    wr     = (wins / total * 100) if total > 0 else 0
+    best   = float(today_df_inst["pnl"].max())
+    worst  = float(today_df_inst["pnl"].min())
+
+    return (
+        f"\n{'='*30}\n"
+        f"📌 {instrument_name} REPORT\n"
+        f"{'='*30}\n"
+        f"💰 Net P&L   : ₹{daily_pnl_val:,.0f}\n"
+        f"📈 Trades    : {total}  (✅ {wins} wins  ❌ {losses} losses)\n"
+        f"🎯 Win Rate  : {wr:.1f}%\n"
+        f"🏆 Best trade: ₹{best:,.0f}\n"
+        f"💔 Worst trade: ₹{worst:,.0f}\n"
+    )
+
+
 def send_daily_report():
-    
+    """
+    Per-instrument daily report sent after market close.
+    Nifty section  → sent at 3:31 PM (end of equity session).
+    Crude section  → included when called after 11 PM (end of MCX session).
+    The report scheduler calls this function; it handles both instruments.
+    """
     global report_sent_today
+    global portfolio_pnl, max_drawdown
+    global nifty_daily_pnl, crude_daily_pnl
+
     report_sent_today = True
 
-    global portfolio_pnl, max_drawdown
-
-    import pandas as pd
-
     if not os.path.exists(TRADE_LOG_FILE):
-        send_message("📊 No trades today")
+        send_message("📊 Daily Report: No trades recorded today")
         return
 
     try:
         df = pd.read_csv(TRADE_LOG_FILE)
 
-        if df.empty:
-            send_message("📊 No trades today")
-            return
+        # Ensure correct column names (8-column format)
+        expected_cols = ["time", "instrument", "symbol", "signal", "entry", "exit", "pnl", "probability"]
+        if list(df.columns) != expected_cols:
+            # Legacy 5-column file — rebuild header gracefully
+            df.columns = expected_cols[:len(df.columns)]
 
         df["time"] = pd.to_datetime(df["time"])
         from datetime import date
         today = date.today()
-
         today_df = df[df["time"].dt.date == today]
 
-        if today_df.empty:
-            send_message("📊 No trades today")
-            return
+        # ── Per-instrument split ───────────────────────────────────────────
+        nifty_df = today_df[today_df["instrument"].str.upper() == "NIFTY"] if "instrument" in today_df.columns else pd.DataFrame()
+        crude_df = today_df[today_df["instrument"].str.upper() == "CRUDE"] if "instrument" in today_df.columns else pd.DataFrame()
 
-        wins = (today_df["pnl"] > 0).sum()
-        losses = (today_df["pnl"] <= 0).sum()
+        nifty_section = _instrument_report_section(nifty_df, "NIFTY", nifty_daily_pnl)
+        crude_section = _instrument_report_section(crude_df, "CRUDE OIL", crude_daily_pnl)
+
+        total_pnl  = nifty_daily_pnl + crude_daily_pnl
         total_trades = len(today_df)
 
-        win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
-
-        report = f"""
-                📊 DAILY REPORT
-
-                💰 Total PnL: ₹{round(portfolio_pnl,2)}
-                📈 Trades: {total_trades}
-                ✅ Wins: {wins}
-                ❌ Losses: {losses}
-                🎯 Win Rate: {round(win_rate,2)}%
-
-                📉 Max Drawdown: ₹{round(max_drawdown,2)}
-                """
+        report = (
+            f"📅 DAILY TRADING REPORT — {today.strftime('%d %b %Y')}\n"
+            f"{'='*30}\n"
+            f"🏦 Combined Net P&L : ₹{total_pnl:,.0f}\n"
+            f"📊 Total Trades     : {total_trades}\n"
+            f"📉 Max Drawdown     : ₹{max_drawdown:,.0f}\n"
+            + nifty_section
+            + crude_section +
+            f"\n{'='*30}\n"
+            f"⏰ Report time: {datetime.now(IST).strftime('%H:%M:%S IST')}"
+        )
 
         send_message(report)
+        print("📊 Daily report sent")
 
     except Exception as e:
         print("Report error:", e)
+        send_message(f"❌ Daily report error: {e}")
+
+
+def send_nifty_eod_report():
+    """Sent at 3:31 PM after Nifty session ends (before Crude evening session)."""
+    global nifty_daily_pnl, nifty_trade_count, nifty_daily_wins, nifty_daily_losses
+
+    total = nifty_daily_wins + nifty_daily_losses
+    wr = (nifty_daily_wins / total * 100) if total > 0 else 0
+
+    send_message(
+        f"🔔 NIFTY SESSION CLOSED\n"
+        f"{'='*28}\n"
+        f"💰 Net P&L    : ₹{nifty_daily_pnl:,.0f}\n"
+        f"📈 Trades     : {total}  (✅ {nifty_daily_wins} wins  ❌ {nifty_daily_losses} losses)\n"
+        f"🎯 Win Rate   : {wr:.1f}%\n"
+        f"📊 Trade count: {nifty_trade_count}\n"
+        f"⏰ Nifty session ended 3:30 PM IST"
+    )
+
+
+def send_crude_eod_report():
+    """Sent after Crude MCX session (~11 PM)."""
+    global crude_daily_pnl, crude_trade_count, crude_daily_wins, crude_daily_losses
+
+    total = crude_daily_wins + crude_daily_losses
+    wr = (crude_daily_wins / total * 100) if total > 0 else 0
+
+    send_message(
+        f"🔔 CRUDE OIL SESSION CLOSED\n"
+        f"{'='*28}\n"
+        f"💰 Net P&L    : ₹{crude_daily_pnl:,.0f}\n"
+        f"📈 Trades     : {total}  (✅ {crude_daily_wins} wins  ❌ {crude_daily_losses} losses)\n"
+        f"🎯 Win Rate   : {wr:.1f}%\n"
+        f"📊 Trade count: {crude_trade_count}\n"
+        f"⏰ Crude session ended ~11 PM IST"
+    )
         
         
 
@@ -3649,6 +4129,53 @@ if __name__ == "__main__":
     # -----------------------------
     # 🚀 START TRADING LOOPS
     # -----------------------------
+    # ── Restore any open positions from previous session ────────────────────
+    print("🔍 Checking Kite for existing open positions...")
+    restore_position_state_from_kite()
+
+    # ── Daily report scheduler ──────────────────────────────────────────────
+    _nifty_eod_sent  = [False]   # mutable so inner function can write
+    _crude_eod_sent  = [False]
+    _full_report_sent = [False]
+
+    def daily_report_scheduler():
+        """
+        Sends end-of-day reports at precise times:
+          3:31 PM IST  → Nifty session closed report
+         11:01 PM IST  → Crude session closed report + combined daily report
+        Resets sent-flags at midnight.
+        """
+        while True:
+            try:
+                now = datetime.now(IST)
+
+                # Reset flags at midnight
+                if now.hour == 0 and now.minute < 2:
+                    _nifty_eod_sent[0]   = False
+                    _crude_eod_sent[0]   = False
+                    _full_report_sent[0] = False
+
+                # 3:31 PM — Nifty EOD report
+                if now.hour == 15 and now.minute == 31 and not _nifty_eod_sent[0]:
+                    send_nifty_eod_report()
+                    _nifty_eod_sent[0] = True
+
+                # 11:01 PM — Crude EOD + full daily combined report
+                if now.hour == 23 and now.minute == 1 and not _crude_eod_sent[0]:
+                    send_crude_eod_report()
+                    _crude_eod_sent[0] = True
+
+                if now.hour == 23 and now.minute == 2 and not _full_report_sent[0]:
+                    send_daily_report()
+                    _full_report_sent[0] = True
+
+            except Exception as e:
+                print(f"❌ Report scheduler error: {e}")
+
+            time.sleep(30)   # check every 30 seconds
+
+    threading.Thread(target=daily_report_scheduler, daemon=True, name="ReportScheduler").start()
+
     threading.Thread(target=nifty_loop, daemon=True).start()
 
     if CRUDE_TOKEN:
@@ -3663,9 +4190,27 @@ if __name__ == "__main__":
     # -----------------------------
     time.sleep(10)
     try:
-        send_message("🚀 Bot started successfully")
-    except:
-        pass
+        crude_status = f"✅ Token: {CRUDE_TOKEN}" if CRUDE_TOKEN else "⚠️ DISABLED (token not found)"
+        nifty_status = f"✅ Token: {config.NIFTY_TOKEN}"
+        send_message(
+            f"🚀 HALFTREND BOT STARTED\n"
+            f"{'='*28}\n"
+            f"📌 NIFTY  : {nifty_status}\n"
+            f"   Hours  : 9:15 AM – 3:30 PM IST\n"
+            f"   Lot    : 65 qty (MIS)\n"
+            f"   Signal : HalfTrend 15-min (lookback 60 bars)\n"
+            f"\n"
+            f"🛢️ CRUDE  : {crude_status}\n"
+            f"   Hours  : 3:30 PM – 11 PM IST\n"
+            f"   Signal : HalfTrend 15-min (lookback 60 bars)\n"
+            f"\n"
+            f"⚙️ SL     : 20% of option premium\n"
+            f"⚙️ Trail  : ATR-based adaptive trailing\n"
+            f"⚙️ Flip   : Immediate exit + re-entry on arrow reversal\n"
+            f"📅 Reports: Nifty@3:31PM | Crude@11:01PM | Combined@11:02PM"
+        )
+    except Exception as e:
+        print("Startup telegram failed:", e)
 
     # -----------------------------
     # 🔁 DAILY TOKEN REFRESH

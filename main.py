@@ -1124,7 +1124,7 @@ def find_option(signal, instrument):
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
         if balance <= 5000:
-            strike_shift = 8
+            strike_shift = 7
             max_price = 50 
         if balance <= 10000:
             strike_shift = 5      # deep OTM — cheap premium
@@ -1202,7 +1202,7 @@ def find_option(signal, instrument):
         trade_value = p * lot_size
 
         # Hard affordability: 1 lot must not exceed 40% of available balance
-        if trade_value > balance * 0.40:
+        if trade_value > balance * 0.70:
             continue
 
         score = score_option(
@@ -2564,7 +2564,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     # ── Risk parameters ──────────────────────────────────────────────────
     RISK_PCT         = 0.05    # 5% of balance risked per trade
     SL_PCT           = 0.20    # assume SL at 20% drop in option premium
-    MAX_CAPITAL_PCT  = 0.40    # never deploy more than 40% of balance in one trade
+    MAX_CAPITAL_PCT  = 0.70    # never deploy more than 40% of balance in one trade
     MAX_LOTS_NIFTY   = 5       # hard ceiling — adjust to your comfort
     MAX_LOTS_CRUDE   = 3
 

@@ -2104,6 +2104,8 @@ def nifty_loop():
                 continue
 
             ht_df = cached_nifty_ht
+            current_trend = int(ht_df.iloc[-2]["trend"])
+            print("🧠 Current Trend:", "CALL" if current_trend == 0 else "PUT")
 
             # ── Signal Detection (fresh arrow + carry-over) ───────────────────
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)

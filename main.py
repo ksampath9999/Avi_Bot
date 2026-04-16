@@ -1124,7 +1124,7 @@ def find_option(signal, instrument):
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
         if balance <= 5000:
-            strike_shift = 7
+            strike_shift = 9
             max_price = 50 
         if balance <= 10000:
             strike_shift = 5      # deep OTM — cheap premium

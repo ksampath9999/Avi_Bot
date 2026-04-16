@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.railway.app/railway-schema-v2.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "cronSchedule": "0 8 * * 1-5",
+    "startCommand": "python auto_token.py",
+    "restartPolicyType": "NEVER"
+  }
+}

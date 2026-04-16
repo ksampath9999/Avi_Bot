@@ -183,6 +183,15 @@ def zerodha_auto_login():
         print(f"   request_token: {request_token[:10]}...", flush=True)
 
         # ── Step 4: Generate access_token ───────────────────────────────────
+        # Re-read api_secret here in case env var wasn't loaded at function entry
+        if not api_secret:
+            api_secret = (os.environ.get("KITE_API_SECRET") or
+                          os.environ.get("API_SECRET") or
+                          getattr(config, "API_SECRET", None) or
+                          getattr(config, "SECRET", None))
+        print(f"   api_secret: {'SET len='+str(len(api_secret)) if api_secret else 'NONE — check KITE_API_SECRET in Railway'}", flush=True)
+        if not api_secret:
+            raise Exception("KITE_API_SECRET is not set or empty in Railway env vars.")
         session_data = kite.generate_session(request_token, api_secret=api_secret)
         access_token = session_data["access_token"]
         kite.set_access_token(access_token)

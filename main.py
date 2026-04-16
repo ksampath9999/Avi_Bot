@@ -2031,10 +2031,12 @@ def exit_position(symbol, qty, exchange):
         positions = kite.positions()["net"]
         found = False
         actual_qty = qty
+        position_product = None
         for p in positions:
             if p["tradingsymbol"] == symbol and p["quantity"] > 0:
                 found = True
-                actual_qty = p["quantity"]   # use actual open qty, not stale in-memory qty
+                actual_qty = p["quantity"]          # use actual open qty from Kite
+                position_product = p.get("product") # read product type from Kite position
                 break
 
         if not found:
@@ -2043,7 +2045,17 @@ def exit_position(symbol, qty, exchange):
 
         # Use actual qty from Kite (avoids partial-exit mismatch)
         exit_qty = min(qty, actual_qty)
-        print(f"🚪 EXITING: {symbol}, qty: {exit_qty}, exchange: {exchange}")
+
+        # FIX: use the SAME product type as the original position.
+        # If we bought MIS but exit with NRML (or vice versa), Kite treats the
+        # sell as opening a NEW naked short and demands full margin (~₹1.4 lakh).
+        # Reading product from the position ensures both legs always match.
+        if position_product:
+            exit_product = position_product
+        else:
+            exit_product = "MIS" if exchange == "NFO" else "NRML"
+
+        print(f"🚪 EXITING: {symbol}, qty: {exit_qty}, exchange: {exchange}, product: {exit_product}")
 
         # ===============================
         # 💰 GET LTP FOR LIMIT PRICE
@@ -2084,7 +2096,7 @@ def exit_position(symbol, qty, exchange):
                     quantity=exit_qty,
                     order_type=kite.ORDER_TYPE_LIMIT,
                     price=exit_price,
-                    product=kite.PRODUCT_MIS if exchange == "NFO" else kite.PRODUCT_NRML
+                    product=exit_product   # matches the original buy product type
                 )
                 print(f"   Order placed: {order_id}")
             except Exception as oe:
@@ -3067,8 +3079,8 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
       6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
       7. Streak and drawdown adjustments applied last.
 
-    Nifty lot size = 65 (as of 2024 revision — update if SEBI changes it again).
-    Crude lot size = 1 bbls.
+    Nifty lot size = 75 (as of 2024 revision — update if SEBI changes it again).
+    Crude lot size = 100 bbls.
     """
     global win_streak, loss_streak
     global portfolio_pnl, peak_portfolio
@@ -3085,7 +3097,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
         lot_size = 65          # Current Nifty F&O lot size
         max_lots = MAX_LOTS_NIFTY
     else:
-         lot_size = 1         # Crude Oil MCX lot size
+        lot_size = 100         # Crude Oil MCX lot size
         max_lots = MAX_LOTS_CRUDE
 
     # ── 1. Live balance ───────────────────────────────────────────────────

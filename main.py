@@ -118,41 +118,49 @@ def zerodha_auto_login():
         print("   ✅ 2FA passed")
 
         # ── Step 3: Get request_token via Kite Connect redirect ─────────────
-        # Zerodha redirect flow (2 hops):
-        #   Hop 1: /connect/login  → /connect/finish?sess_id=...
-        #   Hop 2: /connect/finish → <your redirect URL>?request_token=...
-        # We follow hop-by-hop with allow_redirects=False to avoid connecting
-        # to localhost (or any custom redirect URL) on the final hop.
+        # Strategy: let requests follow ALL redirects normally.
+        # A response hook captures the request_token from the Location header
+        # as each redirect passes through — before requests tries to connect
+        # to the final destination (e.g. localhost).
+        # The ConnectionRefused / ConnectionError on the final hop is caught
+        # and ignored since we already have the token by then.
         print("   Getting request_token from Kite Connect redirect...")
         login_url = f"https://kite.zerodha.com/connect/login?api_key={config.API_KEY}&v=3"
 
-        match = None
-        current_url = login_url
-        for hop in range(1, 6):   # follow up to 5 hops
-            resp_hop = session.get(current_url, allow_redirects=False, timeout=15)
-            location = resp_hop.headers.get("Location", "")
-            print(f"   Hop {hop}: {resp_hop.status_code} → {location[:100]}")
+        _captured_token = [None]
 
-            # Check this location for request_token
-            match = re.search(r"request_token=([^&]+)", location)
-            if match:
-                break
+        def _capture_token_from_redirect(resp, *args, **kwargs):
+            """Hook: called for every response including redirects."""
+            location = resp.headers.get("Location", "")
+            if location and not _captured_token[0]:
+                m = re.search(r"request_token=([^&]+)", location)
+                if m:
+                    _captured_token[0] = m.group(1)
+                    print(f"   ✅ request_token captured from redirect header")
 
-            # If no more redirects, stop
-            if not location or resp_hop.status_code not in (301, 302, 303, 307, 308):
-                break
+        session.hooks["response"].append(_capture_token_from_redirect)
 
-            # Build absolute URL if relative
-            if location.startswith("/"):
-                location = "https://kite.zerodha.com" + location
-            current_url = location
+        try:
+            session.get(login_url, allow_redirects=True, timeout=15)
+        except Exception as conn_err:
+            # Connection to final redirect URL (e.g. localhost) will fail —
+            # that's expected and fine as long as we captured the token.
+            if not _captured_token[0]:
+                raise Exception(
+                    f"Failed to get request_token: {conn_err}\n"
+                    "Check that your Kite app redirect URL is set in the Kite developer console."
+                )
+            print(f"   (Final redirect connection ignored: {type(conn_err).__name__})")
+        finally:
+            # Remove hook so it doesn't affect other requests
+            session.hooks["response"].remove(_capture_token_from_redirect)
 
-        if not match:
+        if not _captured_token[0]:
             raise Exception(
-                f"request_token not found after following redirects.\n"
-                "Check that your Kite app redirect URL is correctly set in the Kite developer console."
+                "request_token not found in any redirect.\n"
+                "Check that your Kite app redirect URL is set in the Kite developer console."
             )
-        request_token = match.group(1)
+        request_token = _captured_token[0]
         print(f"   request_token: {request_token[:10]}...")
 
         # ── Step 4: Generate access_token ───────────────────────────────────

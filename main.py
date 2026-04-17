@@ -203,18 +203,23 @@ def zerodha_auto_login():
         return access_token
 
     except Exception as e:
-        print(f"❌ Auto-login failed: {e}")
+        import traceback
+        print(f"❌ Auto-login failed: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
         # Fallback: use last known token from config so bot can still attempt to run
         try:
             kite.set_access_token(config.ACCESS_TOKEN)
-            print("⚠️  Falling back to config.ACCESS_TOKEN")
+            print("⚠️  Falling back to config.ACCESS_TOKEN", flush=True)
         except Exception:
             pass
-        return None
+        raise   # re-raise so caller can capture the error message
 
 
 # ── Initial login at startup ─────────────────────────────────────────────────
-_startup_token = zerodha_auto_login()
+try:
+    _startup_token = zerodha_auto_login()
+except Exception:
+    _startup_token = None
 
 # 🌐 PRINT RAILWAY PUBLIC IP
 try:
@@ -4558,8 +4563,18 @@ if __name__ == "__main__":
 
             # ── 8:00 AM — refresh Kite access token (before market opens) ──
             if now.hour == 8 and now.minute < 5 and not _access_token_refreshed_today[0]:
-                print("🔑 Daily access token refresh starting (8:00 AM)...")
-                new_token = zerodha_auto_login()
+                print("🔑 Daily access token refresh starting (8:00 AM)...", flush=True)
+                _refresh_error = [None]
+                _orig_except = None
+
+                # Patch zerodha_auto_login to capture the error message
+                try:
+                    new_token = zerodha_auto_login()
+                except Exception as _ex:
+                    new_token = None
+                    _refresh_error[0] = str(_ex)
+
+                # Also try to read the last printed error from the function
                 _access_token_refreshed_today[0] = True
                 ist_str = now.strftime("%d %b %Y %H:%M IST")
                 if new_token:
@@ -4574,12 +4589,14 @@ if __name__ == "__main__":
                     except Exception:
                         pass
                 else:
+                    err_detail = _refresh_error[0] or "Check Railway logs for details"
                     try:
                         send_message(
                             f"❌ KITE TOKEN REFRESH FAILED\n"
                             f"{'='*28}\n"
                             f"🕐 Time  : {ist_str}\n"
-                            f"⚠️ Using previous token — please check manually!"
+                            f"❗ Error : {err_detail[:200]}\n"
+                            f"⚠️ Please refresh token manually!"
                         )
                     except Exception:
                         pass

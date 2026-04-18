@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Railway Weekend Schedule  —  Stop on Friday night, Restart on Monday morning
+#
+# Saves ~28% of monthly Railway cost (2 weekend days out of 7).
+# Uses Railway's GraphQL API to set replicas = 0 (stop) / 1 (start).
+#
+# ── Setup (one-time) ─────────────────────────────────────────────────────────
+#  1. Railway Dashboard → Account Settings → Tokens → Create token
+#     Add as GitHub secret:  RAILWAY_API_TOKEN
+#
+#  2. Railway Dashboard → your project → Settings → copy the project ID
+#     Add as GitHub secret:  RAILWAY_PROJECT_ID
+#
+#  3. Railway Dashboard → your project → your service → Settings → copy service ID
+#     Add as GitHub secret:  RAILWAY_SERVICE_ID
+#
+#  4. Railway Dashboard → your project → Environments → copy environment ID
+#     (usually named "production")
+#     Add as GitHub secret:  RAILWAY_ENVIRONMENT_ID
+#
+# ── Schedule (IST = UTC+5:30) ────────────────────────────────────────────────
+#  Friday  11:40 PM IST  →  18:10 UTC Friday   →  stop  (replicas = 0)
+#  Monday   7:55 AM IST  →  02:25 UTC Monday   →  start (replicas = 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Railway Weekend Schedule
+
+on:
+  schedule:
+    # Friday 11:40 PM IST = Friday 18:10 UTC  → STOP
+    - cron: '10 18 * * 5'
+    # Monday 7:55 AM IST = Monday 02:25 UTC   → START
+    - cron: '25 2 * * 1'
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'start'
+        type: choice
+        options:
+          - start
+          - stop
+
+jobs:
+  manage-railway-service:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine action
+        id: action
+        run: |
+          # Scheduled runs: check day of week to decide stop or start
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "replicas=${{ github.event.inputs.action == 'start' && '1' || '0' }}" >> $GITHUB_OUTPUT
+            echo "label=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
+          else
+            DAY=$(date +%u)   # 1=Mon … 5=Fri … 7=Sun
+            if [ "$DAY" = "5" ]; then
+              echo "replicas=0" >> $GITHUB_OUTPUT
+              echo "label=STOP (Friday night)" >> $GITHUB_OUTPUT
+            else
+              echo "replicas=1" >> $GITHUB_OUTPUT
+              echo "label=START (Monday morning)" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Update Railway service replicas
+        run: |
+          REPLICAS="${{ steps.action.outputs.replicas }}"
+          LABEL="${{ steps.action.outputs.label }}"
+          echo "Action: $LABEL  (replicas=$REPLICAS)"
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.RAILWAY_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"query\": \"mutation { serviceInstanceUpdate(serviceId: \\\"${{ secrets.RAILWAY_SERVICE_ID }}\\\", environmentId: \\\"${{ secrets.RAILWAY_ENVIRONMENT_ID }}\\\", input: { numReplicas: $REPLICAS }) }\"
+            }" \
+            https://backboard.railway.app/graphql/v2)
+
+          echo "Railway API response: $RESPONSE"
+
+          # Fail the job if Railway returned an error
+          if echo "$RESPONSE" | grep -q '"errors"'; then
+            echo "❌ Railway API returned an error"
+            exit 1
+          fi
+
+          echo "✅ Railway service set to $REPLICAS replica(s) — $LABEL"

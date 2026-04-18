@@ -230,6 +230,13 @@ except Exception as e:
 
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔒 FIXED LOT MODE — set to False to enable balance-based lot sizing
+# While True : every order = exactly 1 lot (NIFTY 65 qty, CRUDE 100 qty)
+# While False: calculate_lots() uses balance/risk model automatically
+# ─────────────────────────────────────────────────────────────────────────────
+FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizing
+
 # -----------------------------
 # STATES
 # -----------------------------
@@ -345,9 +352,18 @@ strategy_weights = {
     "NORMAL": 0.9
 }
 
-exit_done = False
+exit_done = False          # kept for backward compat; manage_trade now uses a local copy
 partial_booked = False
 last_exit_reason = None
+
+# ── Trade generation counters ─────────────────────────────────────────────
+# Each counter is incremented every time a NEW trade is started for that
+# instrument.  manage_trade captures the counter value at entry and exits
+# its while-loop immediately if the counter has moved on (flip happened).
+# This prevents a superseded manage_trade thread from calling exit_position
+# on a position it no longer owns.
+_nifty_trade_gen = [0]   # mutable list so it can be mutated from any scope
+_crude_trade_gen = [0]
 
 
 nifty_trade_count = 0
@@ -1403,6 +1419,9 @@ def find_option(signal, instrument):
         key=lambda x: abs(int(x.get("strike", 0)) - target_strike)
     )
 
+    # Minimum premium: CRUDE ₹50 strictly, NIFTY ₹20
+    min_price = 50 if instrument == "CRUDE" else 20
+
     candidates = []
 
     for i in opts_sorted[:20]:   # reduce API load — now sorted by proximity
@@ -1418,9 +1437,39 @@ def find_option(signal, instrument):
         if p is None or p <= 0:
             continue
 
-        # premium filter
-        if p < 20 or p > max_price:
+        # ── Premium filter (CRUDE strictly ≥ ₹50, NIFTY ≥ ₹20) ──────────────
+        if p < min_price or p > max_price:
             continue
+
+        # ── Liquidity check — skip illiquid options ──────────────────────────
+        try:
+            q = kite.quote([sym])
+            if q and sym in q:
+                qd        = q[sym]
+                vol       = qd.get("volume", 0)
+                oi        = qd.get("oi", 0)
+                depth     = qd.get("depth", {})
+                best_bid  = depth.get("buy",  [{}])[0].get("price", 0) if depth.get("buy")  else 0
+                best_ask  = depth.get("sell", [{}])[0].get("price", 0) if depth.get("sell") else 0
+
+                # No market at all — skip
+                if best_bid <= 0 or best_ask <= 0:
+                    print(f"   ⚠️ No market (bid=0 or ask=0): {sym}")
+                    continue
+
+                # Spread > 15% of LTP = illiquid
+                spread_pct = (best_ask - best_bid) / p if p > 0 else 1.0
+                max_spread = 0.15
+                if spread_pct > max_spread:
+                    print(f"   ⚠️ Illiquid spread {spread_pct:.0%}: {sym} bid={best_bid} ask={best_ask}")
+                    continue
+
+                # Zero volume AND zero OI = completely untouched option
+                if vol == 0 and oi == 0:
+                    print(f"   ⚠️ Zero volume+OI: {sym}")
+                    continue
+        except Exception as liq_err:
+            print(f"   ⚠️ Liquidity check failed for {sym}: {liq_err} — proceeding")
 
         diff = abs(strike - target_strike)
         trade_value = p * lot_size
@@ -1500,7 +1549,25 @@ def find_option(signal, instrument):
         if p is None or p <= 0:
             continue
 
-        if 20 <= p <= max_price * 1.8:
+        # Fallback also respects min_price (CRUDE ≥ ₹50, NIFTY ≥ ₹20)
+        if min_price <= p <= max_price * 1.8:
+            # Liquidity check for fallback too
+            _liquid = True
+            try:
+                q = kite.quote([sym])
+                if q and sym in q:
+                    depth    = q[sym].get("depth", {})
+                    best_bid = depth.get("buy",  [{}])[0].get("price", 0) if depth.get("buy")  else 0
+                    best_ask = depth.get("sell", [{}])[0].get("price", 0) if depth.get("sell") else 0
+                    if best_bid <= 0 or best_ask <= 0:
+                        _liquid = False
+                    elif p > 0 and (best_ask - best_bid) / p > 0.15:
+                        _liquid = False
+            except Exception:
+                pass
+            if not _liquid:
+                continue
+
             fallback.append({
                 "symbol": i["tradingsymbol"],
                 "price": p,
@@ -1713,9 +1780,17 @@ def update_exit_time(instrument):
 # -----------------------------
 # TRADE MGMT
 # -----------------------------
-def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, market_type):
-    
-    
+def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, market_type,
+                 gen_id=None):
+    """
+    Manages an open option trade until it exits via SL, profit-lock, force-close, or flip.
+
+    gen_id  —  trade-generation counter value captured when this trade was placed.
+               If the global counter advances (a new flip trade started), this thread
+               detects it at the top of the loop and exits cleanly without touching
+               the new trade's position.  Pass None to disable generation checking
+               (legacy / unit-test path).
+    """
     global global_trade_active
     global daily_pnl, trade_count, last_loss_time
     global win_streak, loss_streak
@@ -1723,7 +1798,8 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global max_drawdown, last_exit_time_nifty, last_exit_time_crude
     global nifty_active, crude_active
     global last_exit_reason
-    global exit_done
+    # exit_done is intentionally LOCAL so two concurrent manage_trade threads
+    # (old + new after a flip) do not share state.
     exit_done = False
     local_max_profit = 0
 
@@ -1757,11 +1833,60 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
     try:
         while True:
+            # ─────────────────────────────────────────────────────────────────
+            # 🔄 GENERATION CHECK — exit if a newer trade has taken over
+            # This happens when the arrow flips: the loop exits the old Kite
+            # position and starts a new manage_trade thread with an incremented
+            # gen_id.  The superseded thread (this one) detects the mismatch
+            # here and breaks cleanly, ensuring it never calls exit_position on
+            # a position it no longer owns.
+            # ─────────────────────────────────────────────────────────────────
+            if gen_id is not None:
+                _cur_gen = (_nifty_trade_gen[0] if instrument == "NIFTY"
+                            else _crude_trade_gen[0])
+                if gen_id != _cur_gen:
+                    print(f"ℹ️ manage_trade [{instrument} {signal} {symbol}]: "
+                          f"superseded by gen {_cur_gen} (mine={gen_id}) — exiting cleanly",
+                          flush=True)
+                    # pnl may not be set if we exit on the very first iteration
+                    # before ltp was ever fetched — leave it at default 0.
+                    break
+
             ltp = safe_ltp(full_symbol)
 
             if ltp is None:
                 time.sleep(10)
                 continue
+
+            # ─────────────────────────────────────────────────────────────────
+            # ⏰ FORCE CLOSE — market hours ended
+            # NIFTY: force exit at 3:20 PM IST (10 min before 3:30 PM close)
+            # CRUDE: force exit at 11:25 PM IST (5 min before 11:30 PM close)
+            # Also exits on weekends (Saturday/Sunday) if trade carried over.
+            # ─────────────────────────────────────────────────────────────────
+            _now = datetime.now(IST)
+            _is_weekend = _now.weekday() >= 5   # Saturday=5, Sunday=6
+            _nifty_time_over = (instrument == "NIFTY" and
+                                (_now.hour > 15 or (_now.hour == 15 and _now.minute >= 20)))
+            _crude_time_over = (instrument == "CRUDE" and
+                                (_now.hour == 23 and _now.minute >= 25))
+            if (_is_weekend or _nifty_time_over or _crude_time_over) and not exit_done:
+                _reason = ("weekend" if _is_weekend
+                           else "NIFTY 3:20 PM force close" if _nifty_time_over
+                           else "CRUDE 11:25 PM force close")
+                # Compute live P&L for the message (current_pnl computed later in loop)
+                _ltp_now = ltp if ltp else entry
+                _pnl_now = (_ltp_now - entry if signal == "CALL" else entry - _ltp_now) * remaining_qty
+                print(f"⏰ Force close ({_reason}): {symbol}")
+                send_message(
+                    f"⏰ FORCE CLOSE — {_reason.upper()}\n"
+                    f"📌 {instrument} {signal} → {symbol}\n"
+                    f"💰 P&L: ₹{_pnl_now:.0f}\n"
+                    f"🚪 Exiting to avoid overnight / weekend hold"
+                )
+                exit_position(symbol, remaining_qty, exchange)
+                pnl = _pnl_now
+                break
 
             # ===============================
             # 🔥 ULTRA PRO EXIT SYSTEM
@@ -2403,7 +2528,8 @@ def tune_strategy():
     print(f"⚙️ New Config: {adaptive_config}")  
     
             
-def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probability, market_type):
+def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probability, market_type,
+                      gen_id=None):
     """
     Wrapper around manage_trade that safely clears per-instrument state when the trade ends.
 
@@ -2413,17 +2539,21 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
     If we unconditionally clear nifty_position in the finally block we would wipe the NEW
     trade's state.  We guard this by checking that the symbol we were managing is still
     the current one — if it has already changed (flip happened) we leave state alone.
+
+    gen_id — forwarded to manage_trade so it can self-terminate when superseded.
     """
     global nifty_active, crude_active
     global nifty_trade_active, crude_trade_active
     global nifty_position, crude_position
 
     try:
-        manage_trade(symbol, price, lot, exchange, instrument, signal, probability, market_type)
+        manage_trade(symbol, price, lot, exchange, instrument, signal, probability, market_type,
+                     gen_id=gen_id)
 
     finally:
         with lock:
             global global_trade_active
+            global last_executed_signal_nifty, last_executed_signal_crude
 
             pos_dict = nifty_position if instrument == "NIFTY" else crude_position
 
@@ -2441,13 +2571,39 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
                     crude_active = False
                     crude_trade_active = False
 
-                global_trade_active = False
+                # ── RE-ENTRY RESET (normal exit: SL / profit-lock / force-close) ──
+                # After a trade exits normally (not a flip), the arrow may still be
+                # pointing in the same direction.  We clear the duplicate-prevention
+                # flags so the loop can immediately re-enter on the same arrow.
+                #
+                # We do NOT do this in the flip path (else branch below) because
+                # flip exits already reset these flags themselves before placing the
+                # new trade in the opposite direction.
+                if instrument == "NIFTY":
+                    last_executed_signal_nifty = None   # clears Layer 3 duplicate block
+                    nifty_loop._carryover_done = None   # clears carry-over re-entry block
+                    nifty_loop._sig_alerted    = None   # allows fresh signal alert on re-entry
+                else:
+                    last_executed_signal_crude = None
+                    crude_loop._carryover_done = None
+                    crude_loop._sig_alerted    = None
+
+                print(f"♻️ {instrument} re-entry unblocked — will re-enter if arrow still active",
+                      flush=True)
+
             else:
                 # A flip trade is already active — only clear the flags for THIS
                 # instrument's OLD trade, but don't touch global_trade_active or
                 # the position dict (which now belongs to the new flip trade).
                 print(f"ℹ️ run_trade_wrapper: symbol changed ({symbol} → {pos_dict.get('symbol')}) "
                       f"— flip trade active, not clearing new position state")
+
+            # ── Always recompute global_trade_active from instrument flags ───
+            # Using a simple OR means that if NIFTY and CRUDE ever run at the
+            # same time (e.g. CRUDE morning session added later), one instrument
+            # exiting will NOT incorrectly clear the flag while the other is
+            # still in a live trade.
+            global_trade_active = nifty_trade_active or crude_trade_active
 
             
             
@@ -2635,14 +2791,37 @@ def nifty_loop():
     global last_fetch_nifty, cached_nifty_df, cached_nifty_ht
     global nifty_trade_active, nifty_position
 
+    _nifty_weekend_msg_sent = [False]   # send "sleeping" msg only once per weekend
+    _nifty_wakeup_msg_sent  = [False]   # send "waking up" msg only once per Monday
+
     while True:
         try:
             now_dt = datetime.now(IST)
 
-            # Stop after market close
+            # ── Weekend: sleep and do nothing ────────────────────────────────
+            if now_dt.weekday() >= 5:   # Saturday=5, Sunday=6
+                if not _nifty_weekend_msg_sent[0]:
+                    send_message("😴 NIFTY: Weekend — bot sleeping until Monday 8:55 AM IST")
+                    _nifty_weekend_msg_sent[0] = True
+                    _nifty_wakeup_msg_sent[0]  = False   # reset so Monday msg fires
+                time.sleep(300)   # check every 5 min
+                continue
+
+            # ── Pre-market: before 9:00 AM on weekdays ───────────────────────
+            if now_dt.hour < 9:
+                _nifty_weekend_msg_sent[0] = False   # reset for next weekend
+                if not _nifty_wakeup_msg_sent[0] and now_dt.weekday() == 0:
+                    send_message("🌅 NIFTY: Monday — bot active, waiting for 9:15 AM market open")
+                    _nifty_wakeup_msg_sent[0] = True
+                time.sleep(60)
+                continue
+
+            # ── After market close: sleep until next day ──────────────────────
+            # DO NOT break — just sleep so the thread survives to trade tomorrow.
             if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
-                print("🛑 NIFTY time over — stopping")
-                break
+                print("🛑 NIFTY market closed — sleeping until tomorrow 9:00 AM")
+                time.sleep(60)   # check every minute, loop will skip until morning
+                continue
 
             # Reset daily stats at start of new trading day
             reset_daily_pnl()
@@ -2774,8 +2953,7 @@ def nifty_loop():
                                                "exchange": None, "signal": None,
                                                "active": False})
                         nifty_trade_active = False
-                        global_trade_active = False
-                        last_running_signal = None
+                        global_trade_active = nifty_trade_active or crude_trade_active
                         last_executed_signal_nifty = None
                     time.sleep(3)
 
@@ -2825,7 +3003,7 @@ def nifty_loop():
             if not symbol or price is None:
                 with lock:
                     nifty_trade_active = False
-                    global_trade_active = False
+                    global_trade_active = nifty_trade_active or crude_trade_active
                 time.sleep(10)
                 continue
 
@@ -2833,6 +3011,10 @@ def nifty_loop():
 
             if filled_price:
                 with lock:
+                    # Increment generation INSIDE the lock so manage_trade's
+                    # generation check is consistent with position state.
+                    _nifty_trade_gen[0] += 1
+                    _nifty_gen_id = _nifty_trade_gen[0]
                     nifty_position.update({
                         "symbol":   symbol,
                         "qty":      get_quantity(lot, exchange),
@@ -2840,11 +3022,12 @@ def nifty_loop():
                         "signal":   signal,
                         "active":   True,
                     })
-                    last_running_signal        = signal
                     last_executed_signal_nifty = signal
-                    current_symbol             = symbol
-                    current_qty                = lot
-                    current_exchange           = exchange
+                    # NOTE: last_running_signal / current_symbol / current_qty /
+                    # current_exchange are legacy shared globals. We no longer
+                    # write them here so that concurrent CRUDE trades (morning
+                    # session) do not overwrite NIFTY's values and vice versa.
+                    # All position state lives in nifty_position / crude_position.
 
                 _kite_pos_cache.pop("NIFTY", None)   # invalidate position cache
 
@@ -2861,13 +3044,14 @@ def nifty_loop():
                 threading.Thread(
                     target=run_trade_wrapper,
                     args=(symbol, filled_price, lot, exchange, "NIFTY", signal, 0, "TREND"),
+                    kwargs={"gen_id": _nifty_gen_id},
                     daemon=True
                 ).start()
-                print(f"🎯 NIFTY Trade: {symbol} @ ₹{filled_price}  lots={lot}")
+                print(f"🎯 NIFTY Trade: {symbol} @ ₹{filled_price}  lots={lot}  gen={_nifty_gen_id}")
             else:
                 with lock:
                     nifty_trade_active = False
-                    global_trade_active = False
+                    global_trade_active = nifty_trade_active or crude_trade_active
 
         except Exception as e:
             print("❌ NIFTY LOOP ERROR:", e)
@@ -2892,13 +3076,32 @@ def crude_loop():
     global last_fetch_crude, cached_crude_15m, cached_crude_ht
     global crude_trade_active
 
+    _crude_weekend_msg_sent = [False]
+
     while True:
         try:
             now_dt = datetime.now(IST)
 
-            # Crude trades after Nifty hours
+            # ── Weekend: sleep and do nothing ────────────────────────────────
+            if now_dt.weekday() >= 5:   # Saturday=5, Sunday=6
+                if not _crude_weekend_msg_sent[0]:
+                    send_message("😴 CRUDE: Weekend — bot sleeping until Monday evening session")
+                    _crude_weekend_msg_sent[0] = True
+                time.sleep(300)
+                continue
+
+            # Reset weekend flag on weekdays
+            _crude_weekend_msg_sent[0] = False
+
+            # ── Crude trades only during evening session ──────────────────────
+            # Session: 3:31 PM – 11:30 PM IST.  Sleep during off-hours.
             if now_dt.hour < 15 or (now_dt.hour == 15 and now_dt.minute <= 30):
                 time.sleep(30)
+                continue
+
+            # ── After session close: sleep until tomorrow ─────────────────────
+            if now_dt.hour == 23 and now_dt.minute >= 31:
+                time.sleep(60)
                 continue
 
             # Reset daily stats at start of new day
@@ -2950,7 +3153,18 @@ def crude_loop():
                 time.sleep(10)
                 continue
 
-            # ── Telegram: CRUDE signal detected ─────────────────────────────
+            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+            carryover_key = f"CRUDE_{signal}_{today_str}"
+
+            # FIX: Check carry-over guard BEFORE sending Telegram alert.
+            # Previously the alert was sent here, but the carry-over guard below
+            # would silently skip the order — causing "alert sent but no order" bug.
+            if not is_fresh:
+                if getattr(crude_loop, "_carryover_done", None) == carryover_key:
+                    time.sleep(10)
+                    continue
+
+            # ── Telegram: CRUDE signal detected (only sent when order will proceed) ─
             if signal is not None and arrow_idx is not None:
                 _arrow_bar_c = ht_df.iloc[arrow_idx]
                 _level_c = _arrow_bar_c["atrLow"] if signal == "CALL" else _arrow_bar_c["atrHigh"]
@@ -2966,13 +3180,6 @@ def crude_loop():
                         f"📉 HT line: {_arrow_bar_c['ht']:.2f}"
                     )
                     crude_loop._sig_alerted = _sig_key_c
-
-            today_str = datetime.now(IST).strftime("%Y-%m-%d")
-            carryover_key = f"CRUDE_{signal}_{today_str}"
-            if not is_fresh:
-                if getattr(crude_loop, "_carryover_done", None) == carryover_key:
-                    time.sleep(10)
-                    continue
 
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
@@ -3022,9 +3229,11 @@ def crude_loop():
                                                "exchange": None, "signal": None,
                                                "active": False})
                         crude_trade_active = False
-                        global_trade_active = False
-                        last_running_signal = None
+                        global_trade_active = nifty_trade_active or crude_trade_active
                         last_executed_signal_crude = None   # FIX: reset so flip re-entry isn't blocked by Layer 3
+                    # FIX: reset carryover guard so new direction isn't blocked
+                    crude_loop._carryover_done = None
+                    crude_loop._sig_alerted = None
                     time.sleep(3)   # let Kite process exit before re-entry
 
             else:
@@ -3074,11 +3283,22 @@ def crude_loop():
 
             print(f"🧠 CRUDE Arrow Detected: {signal}")
             symbol, price, lot, exchange = find_option(signal, "CRUDE")
+            print(f"   find_option → symbol={symbol} price={price} lot={lot} exchange={exchange}")
+
+            if not symbol:
+                send_message(
+                    f"⚠️ CRUDE {signal}: No suitable option found\n"
+                    f"Check option chain — price may be out of range or expiry unavailable"
+                )
 
             if symbol:
                 filled_price = place_order(symbol, lot, exchange, "CRUDE")
                 if filled_price:
                     with lock:
+                        # Increment generation INSIDE the lock so manage_trade's
+                        # generation check is consistent with position state.
+                        _crude_trade_gen[0] += 1
+                        _crude_gen_id = _crude_trade_gen[0]
                         crude_position.update({
                             "symbol":   symbol,
                             "qty":      get_quantity(lot, exchange),
@@ -3086,11 +3306,10 @@ def crude_loop():
                             "signal":   signal,
                             "active":   True,
                         })
-                        last_running_signal        = signal
                         last_executed_signal_crude = signal
-                        current_symbol             = symbol
-                        current_qty                = lot
-                        current_exchange           = exchange
+                        # NOTE: legacy shared globals (last_running_signal,
+                        # current_symbol, current_qty, current_exchange) are no
+                        # longer written here — see nifty_loop comment above.
 
                     _kite_pos_cache.pop("CRUDE", None)   # invalidate position cache
 
@@ -3105,16 +3324,18 @@ def crude_loop():
                     threading.Thread(
                         target=run_trade_wrapper,
                         args=(symbol, filled_price, lot, exchange, "CRUDE", signal, 0, "TREND"),
+                        kwargs={"gen_id": _crude_gen_id},
                         daemon=True
                     ).start()
+                    print(f"🎯 CRUDE Trade: {symbol} @ ₹{filled_price}  lots={lot}  gen={_crude_gen_id}")
                 else:
                     with lock:
                         crude_trade_active = False
-                        global_trade_active = False
+                        global_trade_active = nifty_trade_active or crude_trade_active
             else:
                 with lock:
                     crude_trade_active = False
-                    global_trade_active = False
+                    global_trade_active = nifty_trade_active or crude_trade_active
 
         except Exception as e:
             print("❌ CRUDE LOOP ERROR:", e)
@@ -3287,6 +3508,10 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     MAX_CAPITAL_PCT  = 0.70    # never deploy more than 40% of balance in one trade
     MAX_LOTS_NIFTY   = 5       # hard ceiling — adjust to your comfort
     MAX_LOTS_CRUDE   = 3
+
+    # ── Fixed lot mode — 1 lot for both instruments until strategy confirmed ──
+    if FIXED_LOT_MODE:
+        return 1   # ← remove FIXED_LOT_MODE flag above to enable balance sizing
 
     # ── Lot sizes ─────────────────────────────────────────────────────────
     if instrument == "NIFTY":
@@ -4333,7 +4558,7 @@ def send_crude_eod_report():
         f"📈 Trades     : {total}  (✅ {crude_daily_wins} wins  ❌ {crude_daily_losses} losses)\n"
         f"🎯 Win Rate   : {wr:.1f}%\n"
         f"📊 Trade count: {crude_trade_count}\n"
-        f"⏰ Crude session ended ~11 PM IST"
+        f"⏰ Crude session ended 11:30 PM IST"
     )
         
         
@@ -4468,7 +4693,8 @@ if __name__ == "__main__":
         """
         Sends end-of-day reports at precise times:
           3:31 PM IST  → Nifty session closed report
-         11:01 PM IST  → Crude session closed report + combined daily report
+         11:31 PM IST  → Crude session closed report  (after 11:25 PM force-close)
+         11:32 PM IST  → Combined NIFTY + CRUDE daily report
         Resets sent-flags at midnight.
         """
         while True:
@@ -4486,12 +4712,13 @@ if __name__ == "__main__":
                     send_nifty_eod_report()
                     _nifty_eod_sent[0] = True
 
-                # 11:01 PM — Crude EOD + full daily combined report
-                if now.hour == 23 and now.minute == 1 and not _crude_eod_sent[0]:
+                # 11:31 PM — Crude EOD report (after force-close at 11:25 PM, all trades done)
+                if now.hour == 23 and now.minute == 31 and not _crude_eod_sent[0]:
                     send_crude_eod_report()
                     _crude_eod_sent[0] = True
 
-                if now.hour == 23 and now.minute == 2 and not _full_report_sent[0]:
+                # 11:32 PM — Combined daily report (NIFTY + CRUDE together)
+                if now.hour == 23 and now.minute == 32 and not _full_report_sent[0]:
                     send_daily_report()
                     _full_report_sent[0] = True
 
@@ -4533,7 +4760,7 @@ if __name__ == "__main__":
             f"⚙️ SL     : 20% of option premium\n"
             f"⚙️ Trail  : ATR-based adaptive trailing\n"
             f"⚙️ Flip   : Immediate exit + re-entry on arrow reversal\n"
-            f"📅 Reports: Nifty@3:31PM | Crude@11:01PM | Combined@11:02PM"
+            f"📅 Reports: Nifty@3:31PM | Crude@11:31PM | Combined@11:32PM"
         )
     except Exception as e:
         print("Startup telegram failed:", e)
@@ -4561,8 +4788,9 @@ if __name__ == "__main__":
                 _access_token_refreshed_today[0] = False
                 _last_refresh_date[0] = today
 
-            # ── 8:00 AM — refresh Kite access token (before market opens) ──
-            if now.hour == 8 and now.minute < 5 and not _access_token_refreshed_today[0]:
+            # ── 8:00 AM weekdays — refresh Kite access token (before market opens) ──
+            # weekday() 0=Mon … 4=Fri, 5=Sat, 6=Sun — skip weekends
+            if now.hour == 8 and now.minute < 5 and now.weekday() < 5 and not _access_token_refreshed_today[0]:
                 print("🔑 Daily access token refresh starting (8:00 AM)...", flush=True)
                 _refresh_error = [None]
                 _orig_except = None

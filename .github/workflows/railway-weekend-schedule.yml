@@ -1,26 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Railway Weekend Schedule  —  Stop on Friday night, Restart on Monday morning
-#
-# Saves ~28% of monthly Railway cost (2 weekend days out of 7).
-# Uses Railway's GraphQL API to set replicas = 0 (stop) / 1 (start).
-#
-# ── Setup (one-time) ─────────────────────────────────────────────────────────
-#  1. Railway Dashboard → Account Settings → Tokens → Create token
-#     Add as GitHub secret:  RAILWAY_API_TOKEN
-#
-#  2. Railway Dashboard → your project → Settings → copy the project ID
-#     Add as GitHub secret:  RAILWAY_PROJECT_ID
-#
-#  3. Railway Dashboard → your project → your service → Settings → copy service ID
-#     Add as GitHub secret:  RAILWAY_SERVICE_ID
-#
-#  4. Railway Dashboard → your project → Environments → copy environment ID
-#     (usually named "production")
-#     Add as GitHub secret:  RAILWAY_ENVIRONMENT_ID
-#
-# ── Schedule (IST = UTC+5:30) ────────────────────────────────────────────────
-#  Friday  11:40 PM IST  →  18:10 UTC Friday   →  stop  (replicas = 0)
-#  Monday   7:55 AM IST  →  02:25 UTC Monday   →  start (replicas = 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Railway Weekend Schedule
@@ -32,7 +11,6 @@ on:
     # Monday 7:55 AM IST = Monday 02:25 UTC   → START
     - cron: '25 2 * * 1'
 
-  # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
     inputs:
       action:
@@ -48,16 +26,21 @@ jobs:
   manage-railway-service:
     runs-on: ubuntu-latest
     environment: production
+
     steps:
       - name: Determine action
         id: action
         run: |
-          # Scheduled runs: check day of week to decide stop or start
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "replicas=${{ github.event.inputs.action == 'start' && '1' || '0' }}" >> $GITHUB_OUTPUT
-            echo "label=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
+            if [ "${{ github.event.inputs.action }}" = "start" ]; then
+              echo "replicas=1" >> $GITHUB_OUTPUT
+              echo "label=START" >> $GITHUB_OUTPUT
+            else
+              echo "replicas=0" >> $GITHUB_OUTPUT
+              echo "label=STOP" >> $GITHUB_OUTPUT
+            fi
           else
-            DAY=$(date +%u)   # 1=Mon … 5=Fri … 7=Sun
+            DAY=$(date +%u)
             if [ "$DAY" = "5" ]; then
               echo "replicas=0" >> $GITHUB_OUTPUT
               echo "label=STOP (Friday night)" >> $GITHUB_OUTPUT
@@ -67,7 +50,24 @@ jobs:
             fi
           fi
 
-      - name: Update Railway service replicas
+      # ── Step 1: Verify token works ──────────────────────────────────────────
+      - name: Verify Railway token
+        run: |
+          echo "Checking Railway token..."
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.RAILWAY_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"query": "{ me { name email } }"}' \
+            https://backboard.railway.app/graphql/v2)
+          echo "Token check response: $RESPONSE"
+          if echo "$RESPONSE" | grep -q '"errors"'; then
+            echo "❌ Token is invalid or expired — create a new one from Railway Account Settings → Tokens"
+            exit 1
+          fi
+          echo "✅ Token is valid"
+
+      # ── Step 2: Stop or start the service ───────────────────────────────────
+      - name: Update Railway service
         run: |
           REPLICAS="${{ steps.action.outputs.replicas }}"
           LABEL="${{ steps.action.outputs.label }}"
@@ -77,16 +77,20 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.RAILWAY_API_TOKEN }}" \
             -H "Content-Type: application/json" \
             --data "{
-              \"query\": \"mutation { serviceInstanceUpdate(serviceId: \\\"${{ secrets.RAILWAY_SERVICE_ID }}\\\", environmentId: \\\"${{ secrets.RAILWAY_ENVIRONMENT_ID }}\\\", input: { numReplicas: $REPLICAS }) }\"
+              \"query\": \"mutation serviceInstanceUpdate(\$serviceId: String!, \$environmentId: String!, \$input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(serviceId: \$serviceId, environmentId: \$environmentId, input: \$input) }\",
+              \"variables\": {
+                \"serviceId\": \"${{ secrets.RAILWAY_SERVICE_ID }}\",
+                \"environmentId\": \"${{ secrets.RAILWAY_ENVIRONMENT_ID }}\",
+                \"input\": { \"numReplicas\": $REPLICAS }
+              }
             }" \
             https://backboard.railway.app/graphql/v2)
 
           echo "Railway API response: $RESPONSE"
 
-          # Fail the job if Railway returned an error
           if echo "$RESPONSE" | grep -q '"errors"'; then
-            echo "❌ Railway API returned an error"
+            echo "❌ Railway API error — see response above for details"
             exit 1
           fi
 
-          echo "✅ Railway service set to $REPLICAS replica(s) — $LABEL"
+          echo "✅ Done — service set to $REPLICAS replica(s)"

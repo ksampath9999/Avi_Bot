@@ -47,6 +47,7 @@ on:
 jobs:
   manage-railway-service:
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - name: Determine action
         id: action

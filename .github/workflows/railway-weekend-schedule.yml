@@ -50,7 +50,15 @@ jobs:
             fi
           fi
 
-      # ── Step 1: Verify token works ──────────────────────────────────────────
+      # ── Step 1: Debug token ─────────────────────────────────────────────────
+      - name: Debug token
+        run: |
+          TOKEN="${{ secrets.RAILWAY_API_TOKEN }}"
+          echo "Token length: ${#TOKEN}"
+          echo "Token first 10 chars: ${TOKEN:0:10}"
+          echo "Token last 4 chars: ${TOKEN: -4}"
+
+      # ── Step 2: Verify token works ──────────────────────────────────────────
       - name: Verify Railway token
         run: |
           echo "Checking Railway token..."
@@ -61,7 +69,7 @@ jobs:
             https://backboard.railway.app/graphql/v2)
           echo "Token check response: $RESPONSE"
           if echo "$RESPONSE" | grep -q '"errors"'; then
-            echo "❌ Token is invalid or expired — create a new one from Railway Account Settings → Tokens"
+            echo "❌ Token is invalid — check debug step above"
             exit 1
           fi
           echo "✅ Token is valid"

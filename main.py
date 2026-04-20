@@ -241,7 +241,7 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # Toggle each filter on/off with True/False.
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ADX_FILTER     = False   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
+USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
 ADX_MIN_VALUE      = 20     # Below 25 = choppy/ranging market = skip entry
 
 USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
@@ -2938,17 +2938,27 @@ def get_last_active_signal(ht_df):
     expected_signal = "CALL" if current_trend == 0 else "PUT"
 
     # Scan from most-recent closed candle backward.
-    # We do NOT break on opposite-trend bars — the HalfTrend can briefly
-    # flicker to the opposite direction for 1-2 bars and recover, which
-    # would cause a premature break and miss the real arrow.
-    # Safety is preserved because we only accept arrows matching expected_signal:
-    #   • CALL → only accept a buy arrow  (trend turned bullish)
-    #   • PUT  → only accept a sell arrow (trend turned bearish)
-    # The FIRST matching arrow found (newest-first scan) is always the most
-    # recent valid entry point for the current trend direction.
+    #
+    # Rule: return the FIRST arrow that matches the current trend direction.
+    # BUT — if we encounter an OPPOSITE arrow before finding a matching one,
+    # STOP immediately. That opposite arrow means the trend reversed between
+    # the old signal and now. Entering on the older arrow would be trading
+    # against the reversal.
+    #
+    # Example that caused the bug (DO NOT revert):
+    #   Bar -28: BUY arrow (old crash-bottom signal)
+    #   Bar -5:  SELL arrow (trend flipped bearish at 1 PM)
+    #   Bar -2:  still shows trend=BULLISH (1-bar lag on last closed candle)
+    #   → Without this break, scan skips SELL arrow, finds old BUY → enters CALL ❌
+    #   → With this break, scan hits SELL arrow → stops → returns None ✅
+    #
+    # NOTE: We break on ARROWS (meaningful reversals), NOT on every opposite-trend
+    # bar. A single opposite-trend bar with no arrow is just a 1-bar flicker and
+    # is ignored — this avoids the original over-sensitivity problem.
     for offset in range(2, min(n, MAX_LOOKBACK_BARS + 2)):
         bar = ht_df.iloc[-offset]
 
+        # ── Matching arrow found — valid entry ───────────────────────────────
         if bar["buy"] and expected_signal == "CALL":
             is_fresh = (offset == 2)
             return "CALL", n - offset, is_fresh
@@ -2957,7 +2967,18 @@ def get_last_active_signal(ht_df):
             is_fresh = (offset == 2)
             return "PUT", n - offset, is_fresh
 
-    # No matching arrow found within lookback window
+        # ── Opposite arrow found — trend reversed, stop scanning ─────────────
+        if bar["sell"] and expected_signal == "CALL":
+            # A sell arrow sits between now and any older buy arrow.
+            # That sell arrow invalidates the older buy — do not enter.
+            break
+
+        if bar["buy"] and expected_signal == "PUT":
+            # A buy arrow sits between now and any older sell arrow.
+            # That buy arrow invalidates the older sell — do not enter.
+            break
+
+    # No valid arrow found within lookback window
     return None, None, False
 
 
@@ -3015,10 +3036,14 @@ def nifty_loop():
             # Reset daily stats at start of new trading day
             reset_daily_pnl()
 
-            # Loss streak cooldown — sleep OUTSIDE lock
+            # Loss streak cooldown — pause then RESET (same fix as CRUDE).
             if loss_streak >= 3:
-                print("⚠️ Loss streak >= 3 — pausing NIFTY 2 min")
-                time.sleep(120)
+                print("⚠️ Loss streak >= 3 — pausing NIFTY 15 min then resetting streak", flush=True)
+                send_message("⚠️ NIFTY: 3 consecutive losses — pausing 15 min then resuming")
+                time.sleep(900)   # 15-minute cooldown
+                loss_streak = 0   # reset so trading can resume
+                print("♻️ NIFTY loss streak reset — resuming trading", flush=True)
+                send_message("♻️ NIFTY: Cooldown done — resuming trading")
                 continue
 
             # Refresh data cache every 30 seconds
@@ -3325,10 +3350,16 @@ def crude_loop():
             # Reset daily stats at start of new day
             reset_daily_pnl()
 
-            # Loss streak cooldown — sleep OUTSIDE lock
+            # Loss streak cooldown — pause then RESET so CRUDE can resume trading.
+            # Without reset, bot loops on this check forever (streak never clears
+            # unless a trade wins, but no trades are placed = permanent deadlock).
             if loss_streak >= 3:
-                print("⚠️ Loss streak >= 3 — pausing CRUDE 2 min")
-                time.sleep(120)
+                print("⚠️ Loss streak >= 3 — pausing CRUDE 15 min then resetting streak", flush=True)
+                send_message("⚠️ CRUDE: 3 consecutive losses — pausing 15 min then resuming")
+                time.sleep(900)   # 15-minute cooldown
+                loss_streak = 0   # reset so trading can resume after cooldown
+                print("♻️ CRUDE loss streak reset — resuming trading", flush=True)
+                send_message("♻️ CRUDE: Cooldown done — resuming trading")
                 continue
 
             # Refresh data cache every 20 seconds

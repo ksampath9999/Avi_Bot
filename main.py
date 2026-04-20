@@ -200,6 +200,19 @@ def zerodha_auto_login():
         access_token = session_data["access_token"]
         kite.set_access_token(access_token)
         print(f"✅ Auto-login successful | token: {access_token[:8]}...{access_token[-4:]}")
+
+        # ── Notify ML server of fresh token ──────────────────────────────────
+        if USE_ML_FILTER:
+            try:
+                resp = requests.post(
+                    f"{ML_SERVER_URL}/set_token",
+                    json={"access_token": access_token},
+                    timeout=5
+                )
+                print(f"🤖 ML server token update: {resp.json()}", flush=True)
+            except Exception as _ml_e:
+                print(f"⚠️ Could not notify ML server: {_ml_e}", flush=True)
+
         return access_token
 
     except Exception as e:
@@ -242,7 +255,7 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
 USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
-ADX_MIN_VALUE      = 20     # Below 25 = choppy/ranging market = skip entry
+ADX_MIN_VALUE      = 25     # Below 25 = choppy/ranging market = skip entry
 
 USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
                             # handles direction; ADX handles the real failure mode)
@@ -252,6 +265,19 @@ VIX_MIN            = 11     # (used only when USE_VIX_FILTER = True)
 VIX_MAX            = 22     # (used only when USE_VIX_FILTER = True)
 
 USE_SESSION_FILTER = False  # Session dead-zone filter (off)
+
+# ── ML Signal Filter ──────────────────────────────────────────────────────────
+# ml_signal_server.py must be running (separate Railway/Render service).
+# The bot calls /signal before each NIFTY entry:
+#   • ML must AGREE with HalfTrend direction (CALL/PUT)
+#   • ML confidence must be >= ML_MIN_CONFIDENCE
+#   • If ML returns HOLD → entry is skipped
+#   • If ML server is unreachable and ML_REQUIRED=False → bot trades anyway
+# ─────────────────────────────────────────────────────────────────────────────
+USE_ML_FILTER      = True   # ✅ ACTIVE — ML must confirm HalfTrend signal
+ML_SERVER_URL      = "avibot-production.up.railway.app"   # change to your Render/Railway ML URL
+ML_MIN_CONFIDENCE  = 50     # minimum ML confidence % to allow entry
+ML_REQUIRED        = False  # False = trade even if ML server is down (safe fallback)
 
 # -----------------------------
 # STATES
@@ -619,6 +645,31 @@ def get_mtf_trend(token, instrument):
 # ──────────────────────────────────────────────────────────────────────────────
 # 🔍 apply_entry_filters(signal, instrument, df_15m)
 # Single function that runs ALL enabled filters.
+# ──────────────────────────────────────────────────────────────────────────────
+# ML SIGNAL HELPER
+# ──────────────────────────────────────────────────────────────────────────────
+def get_ml_signal():
+    """
+    Call the ML signal server and return (signal, confidence, reason).
+    signal     : "CALL" | "PUT" | "HOLD"
+    confidence : float 0-100
+    reason     : string explanation
+
+    If server unreachable:
+      • ML_REQUIRED=True  → returns ("HOLD", 0, "ML server down") — blocks entry
+      • ML_REQUIRED=False → returns (None, 0, "ML skipped")      — entry allowed
+    """
+    try:
+        resp = requests.get(f"{ML_SERVER_URL}/signal", timeout=3)
+        data = resp.json()
+        return data.get("signal", "HOLD"), float(data.get("confidence", 0)), data.get("reason", "")
+    except Exception as e:
+        print(f"⚠️ ML server unreachable: {e}", flush=True)
+        if ML_REQUIRED:
+            return "HOLD", 0, f"ML server down: {e}"
+        return None, 0, "ML server skipped (not required)"
+
+
 # Returns (passed: bool, reason: str)
 # Call this right before order placement in nifty_loop / crude_loop.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -677,7 +728,27 @@ def apply_entry_filters(signal, instrument, df_15m, token):
     else:
         _vix_str = "VIX=off"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_mtf_str} | {_vix_str}"
+    # ── 5. ML Signal filter (NIFTY only) ─────────────────────────────────────
+    _ml_str = "ML=off"
+    if USE_ML_FILTER and instrument == "NIFTY":
+        ml_sig, ml_conf, ml_reason = get_ml_signal()
+
+        if ml_sig is None:
+            # Server unreachable and ML_REQUIRED=False → allow trade, log it
+            _ml_str = "ML=skipped(server down)"
+        elif ml_sig == "HOLD":
+            return False, f"🤖 ML filter: HOLD — {ml_reason} (confidence: {ml_conf:.0f}%)"
+        elif ml_sig != signal:
+            return False, (f"🤖 ML filter: disagreement — ML={ml_sig} vs HalfTrend={signal} "
+                           f"(confidence: {ml_conf:.0f}%)")
+        elif ml_conf < ML_MIN_CONFIDENCE:
+            return False, (f"🤖 ML filter: low confidence — {ml_conf:.0f}% below {ML_MIN_CONFIDENCE}% "
+                           f"({ml_reason})")
+        else:
+            _ml_str = f"ML={ml_sig}({ml_conf:.0f}%)"
+            print(f"🤖 ML confirmed: {ml_sig} | confidence={ml_conf:.1f}% | {ml_reason}", flush=True)
+
+    return True, f"✅ Filters passed — {_adx_str} | {_mtf_str} | {_vix_str} | {_ml_str}"
 
 
 # ======================================
@@ -1875,7 +1946,7 @@ def place_order(symbol, qty, exchange, instrument):
             f"📥 Order placed: {symbol}\n"
             f"   Price: ₹{price:.1f}  |  Qty: {quantity}  |  Lots: {qty}\n"
             f"   Total deployed: ₹{price * quantity:,.0f}\n"
-            f"   Max risk (20% SL): ₹{price * 0.20 * quantity:,.0f}"
+            f"   Max risk (25% SL): ₹{price * 0.25 * quantity:,.0f}"
         )
 
         filled_price = None
@@ -2003,7 +2074,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     ltp = entry
 
     # 🔥 CORE RISK MODEL
-    risk = entry * 0.20
+    risk = entry * 0.25
 
     if signal == "CALL":
         sl = entry - risk
@@ -2016,7 +2087,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         f"🚀 NEW TRADE ENTERED\n"
         f"📌 {instrument} {signal} → {symbol}\n"
         f"💰 Entry: ₹{entry:.1f}  |  Qty: {actual_qty}\n"
-        f"🛑 Initial SL: ₹{(entry*(1-0.20) if signal=='CALL' else entry*(1+0.20)):.1f}  "
+        f"🛑 Initial SL: ₹{(entry*(1-0.25) if signal=='CALL' else entry*(1+0.25)):.1f}  "
         f"(20% of premium)\n"
         f"📊 Deployed: ₹{entry * actual_qty:,.0f}"
     )
@@ -2288,10 +2359,10 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 pnl = current_pnl
                 break
 
-            # ── 2. Hard SL (absolute 20% of option premium) ─────────────────
+            # ── 2. Hard SL (absolute 25% of option premium) ─────────────────
             # Safety net in case trailing SL fails to fire (e.g. gap-down open).
             # Fires when total ₹ loss exceeds 20% of entry × qty.
-            max_loss = risk * remaining_qty   # risk = entry * 0.20
+            max_loss = risk * remaining_qty   # risk = entry * 0.25
 
             if current_pnl <= -max_loss and not exit_done:
                 last_exit_reason = "HARD_SL"
@@ -2301,7 +2372,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     f"📌 {instrument} {signal} → {symbol}\n"
                     f"💔 Loss: ₹{current_pnl:.0f}  |  SL limit: ₹{-max_loss:.0f}\n"
                     f"📉 Entry: ₹{entry:.1f}  |  Exit LTP: ₹{ltp:.1f}\n"
-                    f"📊 Hard SL = 20% of option premium × qty"
+                    f"📊 Hard SL = 25% of option premium × qty"
                 )
                 exit_position(symbol, remaining_qty, exchange)
                 exit_done = True
@@ -3766,7 +3837,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     Logic:
       1. Fetch live available balance from Kite.
       2. Risk amount = balance * RISK_PCT (5% by default).
-      3. SL is assumed at 20% of option premium (i.e. exit if premium drops 20%).
+      3. SL is assumed at 25% of option premium (i.e. exit if premium drops 25%).
       4. risk_per_lot = SL_points * lot_size
       5. lots = floor(risk_amount / risk_per_lot)
       6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
@@ -3780,7 +3851,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
 
     # ── Risk parameters ──────────────────────────────────────────────────
     RISK_PCT         = 0.05    # 5% of balance risked per trade
-    SL_PCT           = 0.20    # assume SL at 20% drop in option premium
+    SL_PCT           = 0.25    # assume SL at 25% drop in option premium
     MAX_CAPITAL_PCT  = 0.70    # never deploy more than 40% of balance in one trade
     MAX_LOTS_NIFTY   = 5       # hard ceiling — adjust to your comfort
     MAX_LOTS_CRUDE   = 3
@@ -5033,7 +5104,7 @@ if __name__ == "__main__":
             f"   Hours  : 3:30 PM – 11 PM IST\n"
             f"   Signal : HalfTrend 15-min (lookback 120 bars)\n"
             f"\n"
-            f"⚙️ SL     : 20% of option premium\n"
+            f"⚙️ SL     : 25% of option premium\n"
             f"⚙️ Trail  : ATR-based adaptive trailing\n"
             f"⚙️ Flip   : Immediate exit + re-entry on arrow reversal\n"
             f"📅 Reports: Nifty@3:31PM | Crude@11:31PM | Combined@11:32PM"
@@ -5123,4 +5194,4 @@ if __name__ == "__main__":
     # 🔁 KEEP ALIVE
     # -----------------------------
     while True:
-        time.sleep(60) 
+        time.sleep(60) 

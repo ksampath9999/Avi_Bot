@@ -1,9 +1,10 @@
 flask
+kiteconnect
 pandas
 numpy
-kiteconnect
 scikit-learn
-joblib
-requests
 pytz
 pyotp
+requests
+python-telegram-bot
+joblib

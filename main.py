@@ -2917,7 +2917,7 @@ def get_last_active_signal(ht_df):
       3. Returns that signal so the bot can re-enter at market open.
 
     Safety rules:
-      - Only looks back MAX_LOOKBACK_BARS candles (default 10 = ~2.5 hours on 15-min).
+      - Only looks back MAX_LOOKBACK_BARS candles (default 120 = ~5 trading days on 15-min).
       - Signal must AGREE with current trend (trend==0 → CALL, trend==1 → PUT).
       - If the last arrow found disagrees with current trend (reversal happened
         but no re-entry arrow yet), returns None — do not trade.
@@ -2927,9 +2927,9 @@ def get_last_active_signal(ht_df):
           is_fresh       : True if arrow is on iloc[-2] (same-day),
                            False if it is a carried-over signal from prior bars
     """
-    # ── FIX: 20 bars = only 5 hours on 15-min — not enough for previous-day arrows.
-    # 1 trading day ≈ 25 bars (9:15–3:30).  60 bars covers ~2.4 days safely.
-    MAX_LOOKBACK_BARS = 60   # ~2.4 trading days on 15-min chart
+    # 1 trading day ≈ 25 bars (9:15–3:30).  120 bars ≈ 5 trading days (1 full week).
+    # Increased from 60 → 120 so arrows from up to ~1 week ago are still detected.
+    MAX_LOOKBACK_BARS = 120   # ~5 trading days on 15-min chart
 
     n = len(ht_df)
     if n < 4:
@@ -3025,7 +3025,7 @@ def nifty_loop():
 
             # Refresh data cache every 30 seconds
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
-                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 200)
+                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 600)
                 if cached_nifty_df is not None and len(cached_nifty_df) >= 120:
                     cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=2, channel_deviation=2)
                 last_fetch_nifty = time.time()
@@ -3057,7 +3057,7 @@ def nifty_loop():
                 status = "NO_ARROW_NIFTY"
                 if last_status != status or time.time() - last_weak_log_time > 60:
                     trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
-                    print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 60 bars — waiting")
+                    print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 120 bars — waiting")
                     last_status = status
                     last_weak_log_time = time.time()
                 # Throttled Telegram alert for no-signal state
@@ -3066,7 +3066,7 @@ def nifty_loop():
                     trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
                     send_message(
                         f"⏸️ NIFTY: No HalfTrend arrow found\n"
-                        f"📊 Current trend: {trend_name} | Lookback: 60 bars\n"
+                        f"📊 Current trend: {trend_name} | Lookback: 120 bars\n"
                         f"⏳ Waiting for arrow signal..."
                     )
                     _last_no_signal_alert_nifty = time.time()
@@ -3330,7 +3330,7 @@ def crude_loop():
 
             # Refresh data cache every 20 seconds
             if time.time() - last_fetch_crude > 20 or cached_crude_15m is None:
-                cached_crude_15m = get_cached_data(CRUDE_TOKEN, "15minute", 150)
+                cached_crude_15m = get_cached_data(CRUDE_TOKEN, "15minute", 600)
                 # Recompute HalfTrend only when data refreshes
                 if cached_crude_15m is not None and len(cached_crude_15m) >= 50:
                     cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=2, channel_deviation=2)
@@ -3361,7 +3361,7 @@ def crude_loop():
                     trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
                     send_message(
                         f"⏸️ CRUDE: No HalfTrend arrow found\n"
-                        f"📊 Current trend: {trend_name} | Lookback: 60 bars\n"
+                        f"📊 Current trend: {trend_name} | Lookback: 120 bars\n"
                         f"⏳ Waiting for arrow signal..."
                     )
                     _last_no_signal_alert_crude = time.time()
@@ -4593,7 +4593,7 @@ def get_cached_data(token, interval="15minute", count=200):
     # ── Cache miss → fetch from Kite ────────────────────────────────────────
     try:
         to_date   = datetime.now()
-        from_date = to_date - timedelta(days=10)   # enough history for HalfTrend warm-up
+        from_date = to_date - timedelta(days=30)   # 30 days for HalfTrend ATR(100) warm-up + lookback
 
         data = kite.historical_data(token, from_date, to_date, interval)
         df   = pd.DataFrame(data)
@@ -4990,11 +4990,11 @@ if __name__ == "__main__":
             f"📌 NIFTY  : {nifty_status}\n"
             f"   Hours  : 9:15 AM – 3:30 PM IST\n"
             f"   Lot    : 65 qty (MIS)\n"
-            f"   Signal : HalfTrend 15-min (lookback 60 bars)\n"
+            f"   Signal : HalfTrend 15-min (lookback 120 bars)\n"
             f"\n"
             f"🛢️ CRUDE  : {crude_status}\n"
             f"   Hours  : 3:30 PM – 11 PM IST\n"
-            f"   Signal : HalfTrend 15-min (lookback 60 bars)\n"
+            f"   Signal : HalfTrend 15-min (lookback 120 bars)\n"
             f"\n"
             f"⚙️ SL     : 20% of option premium\n"
             f"⚙️ Trail  : ATR-based adaptive trailing\n"

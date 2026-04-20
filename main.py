@@ -286,7 +286,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 #   • If ML returns HOLD → entry is skipped
 #   • If ML server is unreachable and ML_REQUIRED=False → bot trades anyway
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ML_FILTER      = True  # ⛔ ML filter disabled — HalfTrend signal only
+USE_ML_FILTER      = False  # ⛔ ML filter disabled — HalfTrend signal only
 ML_SERVER_URL      = "https://avibot-production.up.railway.app"   # ML signal server URL
 ML_MIN_CONFIDENCE  = 50     # minimum ML confidence % to allow entry
 ML_REQUIRED        = False  # False = trade even if ML server is down (safe fallback)
@@ -2192,7 +2192,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         remaining_qty -= half_qty
                         partial_booked = True
 
-                        send_message(f"💰 Partial booked\n{symbol}")
+                        print(f"💰 Partial booked: {symbol}", flush=True)
 
             # ===============================
             # 💰 GLOBAL PROFIT PROTECTION
@@ -2260,20 +2260,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             else:
                 sl = min(sl, peak + (atr_value * trail_multiplier))
 
-            # ── Send Telegram alert when SL moves by > 0.5% of entry ──────────
-            global _last_trail_alert_nifty, _last_trail_alert_crude
-            _trail_ref = _last_trail_alert_nifty if instrument == "NIFTY" else _last_trail_alert_crude
-            if abs(sl - old_sl) > entry * 0.005 and time.time() - _trail_ref > 60:
-                send_message(
-                    f"📈 TRAILING SL MOVED\n"
-                    f"📌 {instrument} {signal} → {symbol}\n"
-                    f"🛑 New SL: ₹{sl:.1f}  (was ₹{old_sl:.1f})\n"
-                    f"💰 Current P&L: ₹{current_pnl:.0f}  |  LTP: ₹{ltp:.1f}"
-                )
-                if instrument == "NIFTY":
-                    _last_trail_alert_nifty = time.time()
-                else:
-                    _last_trail_alert_crude = time.time()
+            # Trailing SL update logged to console only
+            if abs(sl - old_sl) > entry * 0.005:
+                print(f"📈 {instrument} trailing SL: ₹{old_sl:.1f} → ₹{sl:.1f}  P&L: ₹{current_pnl:.0f}", flush=True)
 
             # ===============================
             # 🔥 STRONG TREND MODE (LET PROFITS RUN)
@@ -2466,13 +2455,16 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             print(f"✅ {instrument} trade closed — ready for next")
 
             # ── Trade closed Telegram summary ─────────────────────────────
+            _combined_pnl = nifty_daily_pnl + crude_daily_pnl
             send_message(
-                f"{exit_emoji} TRADE CLOSED — {instrument}\n"
-                f"📌 {signal} → {symbol}\n"
-                f"💰 P&L: ₹{pnl:.0f}  ({'PROFIT' if pnl > 0 else 'LOSS'})\n"
+                f"{exit_emoji} TRADE CLOSED — {instrument} {signal}\n"
+                f"📌 {symbol}\n"
+                f"💰 P&L : ₹{pnl:+.0f}  ({'PROFIT' if pnl > 0 else 'LOSS'})\n"
                 f"📊 Entry: ₹{entry:.1f}  |  Exit: ₹{ltp:.1f}\n"
-                f"📅 Today {instrument} P&L so far: ₹"
-                f"{nifty_daily_pnl if instrument == 'NIFTY' else crude_daily_pnl:.0f}"
+                f"{'─'*28}\n"
+                f"📅 NIFTY today  : ₹{nifty_daily_pnl:+.0f}\n"
+                f"📅 CRUDE today  : ₹{crude_daily_pnl:+.0f}\n"
+                f"💼 Combined     : ₹{_combined_pnl:+.0f}"
             )
 
             log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
@@ -3122,11 +3114,10 @@ def nifty_loop():
             # Loss streak cooldown — pause then RESET (same fix as CRUDE).
             if loss_streak >= 3:
                 print("⚠️ Loss streak >= 3 — pausing NIFTY 15 min then resetting streak", flush=True)
-                send_message("⚠️ NIFTY: 3 consecutive losses — pausing 15 min then resuming")
+                send_message("❌ NIFTY: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)   # 15-minute cooldown
                 loss_streak = 0   # reset so trading can resume
                 print("♻️ NIFTY loss streak reset — resuming trading", flush=True)
-                send_message("♻️ NIFTY: Cooldown done — resuming trading")
                 continue
 
             # Refresh data cache every 30 seconds
@@ -3166,36 +3157,16 @@ def nifty_loop():
                     print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 120 bars — waiting")
                     last_status = status
                     last_weak_log_time = time.time()
-                # Throttled Telegram alert for no-signal state
-                global _last_no_signal_alert_nifty
-                if time.time() - _last_no_signal_alert_nifty > NO_SIGNAL_ALERT_INTERVAL:
-                    trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
-                    send_message(
-                        f"⏸️ NIFTY: No HalfTrend arrow found\n"
-                        f"📊 Current trend: {trend_name} | Lookback: 120 bars\n"
-                        f"⏳ Waiting for arrow signal..."
-                    )
-                    _last_no_signal_alert_nifty = time.time()
                 time.sleep(10)
                 continue
 
-            # ── Telegram: signal detected ─────────────────────────────────────
+            # ── Signal detected — log only, no Telegram ──────────────────────
             if signal is not None and arrow_idx is not None:
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
-                _freshness = "🆕 FRESH arrow" if is_fresh else f"♻️ CARRY-OVER ({_bars_ago * 15} min ago)"
-                # Only alert when signal is newly identified (fresh) or on first carry-over detection
-                _carryover_alerted_key = f"NIFTY_sig_{signal}_{datetime.now(IST).strftime('%Y-%m-%d')}"
-                if is_fresh or not getattr(nifty_loop, "_sig_alerted", None) == _carryover_alerted_key:
-                    send_message(
-                        f"🔔 NIFTY SIGNAL DETECTED\n"
-                        f"{'🟢 CALL (BUY CE)' if signal == 'CALL' else '🔴 PUT (BUY PE)'}\n"
-                        f"📊 Type: {_freshness}\n"
-                        f"🎯 Arrow level: ₹{_level:.2f}\n"
-                        f"📉 HT line: {arrow_bar['ht']:.2f}  |  atrHigh: {arrow_bar['atrHigh']:.2f}  atrLow: {arrow_bar['atrLow']:.2f}"
-                    )
-                    nifty_loop._sig_alerted = _carryover_alerted_key
+                _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
+                print(f"🔔 NIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -3214,21 +3185,14 @@ def nifty_loop():
 
             if not _filter_ok:
                 print(f"🚫 NIFTY entry blocked — {_filter_reason}", flush=True)
-                # Send alert once per candle-bar (15-min) so user always knows why no order.
-                # Key includes the reason text so a fresh alert fires if the block reason changes.
-                _fkey = f"NIFTY_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H%M') [:13]}_{_filter_reason[:30]}"
+                # Alert once per 15-min candle; re-fires if block reason changes
+                _fkey = f"NIFTY_f_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
                 if getattr(nifty_loop, "_filter_alerted", None) != _fkey:
                     try:
-                        send_message(
-                            f"🚫 NIFTY ORDER BLOCKED\n"
-                            f"Signal: {signal}\n"
-                            f"{_filter_reason}\n"
-                            f"Will retry on next candle"
-                        )
-                        nifty_loop._filter_alerted = _fkey   # only mark sent if no exception
+                        send_message(f"🚫 NIFTY ORDER BLOCKED\n{_filter_reason}")
+                        nifty_loop._filter_alerted = _fkey
                     except Exception as _e:
                         print(f"⚠️ Filter alert send failed: {_e}", flush=True)
-                        # _filter_alerted NOT set — will retry next iteration
                 time.sleep(30)
                 continue
 
@@ -3439,11 +3403,10 @@ def crude_loop():
             # unless a trade wins, but no trades are placed = permanent deadlock).
             if loss_streak >= 3:
                 print("⚠️ Loss streak >= 3 — pausing CRUDE 15 min then resetting streak", flush=True)
-                send_message("⚠️ CRUDE: 3 consecutive losses — pausing 15 min then resuming")
+                send_message("❌ CRUDE: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)   # 15-minute cooldown
                 loss_streak = 0   # reset so trading can resume after cooldown
                 print("♻️ CRUDE loss streak reset — resuming trading", flush=True)
-                send_message("♻️ CRUDE: Cooldown done — resuming trading")
                 continue
 
             # Refresh data cache every 20 seconds
@@ -3474,15 +3437,6 @@ def crude_loop():
                     print(f"{'🟢' if signal=='CALL' else '🔴'} CARRY-OVER CRUDE {signal} — {bars_ago} bars ago @ {arrow_level:.2f}")
 
             if signal is None:
-                global _last_no_signal_alert_crude
-                if time.time() - _last_no_signal_alert_crude > NO_SIGNAL_ALERT_INTERVAL:
-                    trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
-                    send_message(
-                        f"⏸️ CRUDE: No HalfTrend arrow found\n"
-                        f"📊 Current trend: {trend_name} | Lookback: 120 bars\n"
-                        f"⏳ Waiting for arrow signal..."
-                    )
-                    _last_no_signal_alert_crude = time.time()
                 time.sleep(10)
                 continue
 
@@ -3497,22 +3451,13 @@ def crude_loop():
                     time.sleep(10)
                     continue
 
-            # ── Telegram: CRUDE signal detected (only sent when order will proceed) ─
+            # ── Signal detected — log only, no Telegram ──────────────────────
             if signal is not None and arrow_idx is not None:
                 _arrow_bar_c = ht_df.iloc[arrow_idx]
                 _level_c = _arrow_bar_c["atrLow"] if signal == "CALL" else _arrow_bar_c["atrHigh"]
                 _bars_ago_c = len(ht_df) - arrow_idx - 2
-                _freshness_c = "🆕 FRESH arrow" if is_fresh else f"♻️ CARRY-OVER ({_bars_ago_c * 15} min ago)"
-                _sig_key_c = f"CRUDE_sig_{signal}_{datetime.now(IST).strftime('%Y-%m-%d')}"
-                if is_fresh or not getattr(crude_loop, "_sig_alerted", None) == _sig_key_c:
-                    send_message(
-                        f"🔔 CRUDE SIGNAL DETECTED\n"
-                        f"{'🟢 CALL (BUY CE)' if signal == 'CALL' else '🔴 PUT (BUY PE)'}\n"
-                        f"📊 Type: {_freshness_c}\n"
-                        f"🎯 Arrow level: ₹{_level_c:.2f}\n"
-                        f"📉 HT line: {_arrow_bar_c['ht']:.2f}"
-                    )
-                    crude_loop._sig_alerted = _sig_key_c
+                _freshness_c = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago_c * 15} min ago)"
+                print(f"🔔 CRUDE {signal} {_freshness_c} @ ₹{_level_c:.2f}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
             # 📊  STRATEGY FILTERS  (ADX / MTF / VIX)
@@ -3524,16 +3469,11 @@ def crude_loop():
 
             if not _filter_ok:
                 print(f"🚫 CRUDE entry blocked — {_filter_reason}", flush=True)
-                _fkey = f"CRUDE_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
+                _fkey = f"CRUDE_f_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
                 if getattr(crude_loop, "_filter_alerted", None) != _fkey:
                     try:
-                        send_message(
-                            f"🚫 CRUDE ORDER BLOCKED\n"
-                            f"Signal: {signal}\n"
-                            f"{_filter_reason}\n"
-                            f"Will retry on next candle"
-                        )
-                        crude_loop._filter_alerted = _fkey   # only mark sent if no exception
+                        send_message(f"🚫 CRUDE ORDER BLOCKED\n{_filter_reason}")
+                        crude_loop._filter_alerted = _fkey
                     except Exception as _e:
                         print(f"⚠️ Filter alert send failed: {_e}", flush=True)
                 time.sleep(30)
@@ -5166,12 +5106,11 @@ if __name__ == "__main__":
                 _access_token_refreshed_today[0] = True
                 ist_str = now.strftime("%d %b %Y %H:%M IST")
                 if new_token:
+                    print(f"✅ Kite token refreshed at {ist_str}", flush=True)
                     try:
                         send_message(
                             f"✅ KITE TOKEN REFRESHED\n"
-                            f"{'='*28}\n"
-                            f"🕐 Time  : {ist_str}\n"
-                            f"🔑 Token : {new_token[:8]}...{new_token[-4:]}\n"
+                            f"🕐 {ist_str}\n"
                             f"📈 Bot ready for market open at 9:15 AM"
                         )
                     except Exception:

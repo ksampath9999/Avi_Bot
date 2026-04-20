@@ -237,6 +237,24 @@ SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 # ─────────────────────────────────────────────────────────────────────────────
 FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizing
 
+# ── Strategy Filters ─────────────────────────────────────────────────────────
+# Toggle each filter on/off with True/False.
+# All filters must pass before an order is placed.
+# ─────────────────────────────────────────────────────────────────────────────
+USE_ADX_FILTER     = True   # ✅ ACTIVE — ADX > 25: only enter in strong trending markets
+ADX_MIN_VALUE      = 25     # HalfTrend's biggest weakness is choppy markets.
+                            # ADX directly fixes that — below 25 = ranging = skip.
+                            # Uses same 15-min data already fetched, no extra API call.
+
+USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
+                            # handles direction; ADX handles the real failure mode)
+
+USE_VIX_FILTER     = False  # India VIX range filter (off)
+VIX_MIN            = 11     # (used only when USE_VIX_FILTER = True)
+VIX_MAX            = 22     # (used only when USE_VIX_FILTER = True)
+
+USE_SESSION_FILTER = False  # Session dead-zone filter (off)
+
 # -----------------------------
 # STATES
 # -----------------------------
@@ -488,6 +506,180 @@ def ATR(df, period=100):
     atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
     return atr
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 📊 ADX  —  Average Directional Index (Wilder, period=14)
+# Measures trend STRENGTH (not direction).
+# ADX > 25 → strong trend → HalfTrend signals have high follow-through
+# ADX < 20 → choppy/ranging → HalfTrend gives many false signals
+# ──────────────────────────────────────────────────────────────────────────────
+def ADX(df, period=14):
+    high  = df["high"]
+    low   = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    prev_high  = high.shift(1)
+    prev_low   = low.shift(1)
+
+    # True Range
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    # Directional Movement
+    up_move   = high - prev_high
+    down_move = prev_low - low
+
+    plus_dm  = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index)
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index)
+
+    # Wilder smoothing (RMA = EWM with alpha=1/period)
+    alpha  = 1.0 / period
+    atr_s  = tr.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    pdi    = 100 * plus_dm.ewm(alpha=alpha,  min_periods=period, adjust=False).mean() / atr_s
+    mdi    = 100 * minus_dm.ewm(alpha=alpha, min_periods=period, adjust=False).mean() / atr_s
+
+    dx     = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    adx    = dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    return adx
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 📈 India VIX  —  fetch live VIX from Kite
+# VIX 12–22 → ideal option-buying zone
+# VIX < 11  → premiums too cheap to move enough (time decay wins)
+# VIX > 22  → gap-risk, chaotic fills, wide spreads
+# ──────────────────────────────────────────────────────────────────────────────
+_vix_cache = {"value": None, "ts": 0}   # simple 5-min cache so every loop tick
+                                        # doesn't hammer the Kite LTP endpoint
+
+def get_india_vix():
+    try:
+        if time.time() - _vix_cache["ts"] < 300:   # reuse cached value for 5 min
+            return _vix_cache["value"]
+        q   = kite.ltp(["NSE:INDIA VIX"])
+        vix = q["NSE:INDIA VIX"]["last_price"]
+        _vix_cache["value"] = vix
+        _vix_cache["ts"]    = time.time()
+        return vix
+    except Exception as _e:
+        print(f"⚠️ VIX fetch error: {_e}")
+        return None   # return None → VIX filter is skipped gracefully
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🕐 MTF (Multi-Time-Frame) 1-Hour HalfTrend confirmation
+# 15-min arrow must agree with the 1-hour trend direction.
+# Counter-trend entries on 15-min are the most dangerous in options because
+# the larger trend fights you while time decay erodes the premium.
+# ──────────────────────────────────────────────────────────────────────────────
+_last_fetch_nifty_1h = [0]
+_last_fetch_crude_1h = [0]
+_cached_nifty_ht_1h  = [None]
+_cached_crude_ht_1h  = [None]
+
+def get_mtf_trend(token, instrument):
+    """
+    Fetches 1-hour HalfTrend and returns the trend direction of the last
+    closed 1-hour candle: "CALL" (bullish), "PUT" (bearish), or None on error.
+    Cached for 3 minutes to avoid hammering the Kite historical API.
+    """
+    try:
+        if instrument == "NIFTY":
+            if time.time() - _last_fetch_nifty_1h[0] > 180 or _cached_nifty_ht_1h[0] is None:
+                df_1h = get_cached_data(token, "60minute", 100)
+                if df_1h is not None and len(df_1h) >= 30:
+                    _cached_nifty_ht_1h[0] = halftrend_tv(df_1h, amplitude=2, channel_deviation=2)
+                _last_fetch_nifty_1h[0] = time.time()
+            ht_1h = _cached_nifty_ht_1h[0]
+        else:
+            if time.time() - _last_fetch_crude_1h[0] > 180 or _cached_crude_ht_1h[0] is None:
+                df_1h = get_cached_data(token, "60minute", 100)
+                if df_1h is not None and len(df_1h) >= 30:
+                    _cached_crude_ht_1h[0] = halftrend_tv(df_1h, amplitude=2, channel_deviation=2)
+                _last_fetch_crude_1h[0] = time.time()
+            ht_1h = _cached_crude_ht_1h[0]
+
+        if ht_1h is None or len(ht_1h) < 5:
+            return None
+
+        trend_1h = int(ht_1h.iloc[-2]["trend"])   # last CLOSED 1-hour candle
+        return "CALL" if trend_1h == 0 else "PUT"
+
+    except Exception as _e:
+        print(f"⚠️ MTF error ({instrument}): {_e}")
+        return None   # return None → MTF filter skipped gracefully
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🔍 apply_entry_filters(signal, instrument, df_15m)
+# Single function that runs ALL enabled filters.
+# Returns (passed: bool, reason: str)
+# Call this right before order placement in nifty_loop / crude_loop.
+# ──────────────────────────────────────────────────────────────────────────────
+def apply_entry_filters(signal, instrument, df_15m, token):
+    """
+    Runs ADX, MTF, VIX, and Session filters.
+    Returns True if ALL enabled filters pass, False if any blocks entry.
+    Also returns a human-readable reason string for logging / Telegram.
+    """
+    now_ist = datetime.now(IST)
+
+    # ── 1. Session timing filter (NIFTY only) ─────────────────────────────────
+    if USE_SESSION_FILTER and instrument == "NIFTY":
+        _dead = (
+            (now_ist.hour == 11 and now_ist.minute >= 30) or
+            (now_ist.hour == 12) or
+            (now_ist.hour == 13 and now_ist.minute < 30)
+        )
+        if _dead:
+            return False, "⏸️ Session filter: 11:30 AM–1:30 PM dead zone (low momentum)"
+
+    # ── 2. ADX filter (trend strength) ────────────────────────────────────────
+    if USE_ADX_FILTER and df_15m is not None:
+        try:
+            adx_s   = ADX(df_15m, period=14)
+            adx_val = adx_s.iloc[-2]   # last CLOSED candle
+            if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
+                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} < {ADX_MIN_VALUE} (choppy market)"
+            _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
+        except Exception as _e:
+            _adx_str = f"ADX=err({_e})"
+    else:
+        _adx_str = "ADX=off"
+
+    # ── 3. MTF 1-hour confirmation ─────────────────────────────────────────────
+    if USE_MTF_FILTER:
+        trend_1h = get_mtf_trend(token, instrument)
+        if trend_1h is not None and trend_1h != signal:
+            return False, (f"⏸️ MTF filter: 1h trend={trend_1h} ≠ 15m signal={signal} "
+                           f"(counter-trend — skip)")
+        _mtf_str = f"1h={trend_1h or 'N/A'}"
+    else:
+        _mtf_str = "MTF=off"
+
+    # ── 4. India VIX filter ───────────────────────────────────────────────────
+    if USE_VIX_FILTER:
+        vix = get_india_vix()
+        if vix is not None:
+            if vix < VIX_MIN:
+                return False, f"⏸️ VIX filter: VIX={vix:.1f} < {VIX_MIN} (premiums too cheap)"
+            if vix > VIX_MAX:
+                return False, f"⏸️ VIX filter: VIX={vix:.1f} > {VIX_MAX} (too volatile)"
+            _vix_str = f"VIX={vix:.1f}"
+        else:
+            _vix_str = "VIX=N/A"
+    else:
+        _vix_str = "VIX=off"
+
+    return True, f"✅ Filters passed — {_adx_str} | {_mtf_str} | {_vix_str}"
 
 
 # ======================================
@@ -2747,24 +2939,23 @@ def get_last_active_signal(ht_df):
     current_trend = int(ht_df.iloc[-2]["trend"])   # 0=bullish, 1=bearish
     expected_signal = "CALL" if current_trend == 0 else "PUT"
 
-    # Scan from most-recent closed candle backward
+    # Scan from most-recent closed candle backward.
+    # We do NOT break on opposite-trend bars — the HalfTrend can briefly
+    # flicker to the opposite direction for 1-2 bars and recover, which
+    # would cause a premature break and miss the real arrow.
+    # Safety is preserved because we only accept arrows matching expected_signal:
+    #   • CALL → only accept a buy arrow  (trend turned bullish)
+    #   • PUT  → only accept a sell arrow (trend turned bearish)
+    # The FIRST matching arrow found (newest-first scan) is always the most
+    # recent valid entry point for the current trend direction.
     for offset in range(2, min(n, MAX_LOOKBACK_BARS + 2)):
         bar = ht_df.iloc[-offset]
-        bar_trend = int(bar["trend"])
 
-        # Stop as soon as we hit a bar where trend was opposite —
-        # means there was a full reversal cycle with no re-entry yet.
-        if bar_trend != current_trend:
-            break
-
-        is_buy_arrow  = bar["buy"]
-        is_sell_arrow = bar["sell"]
-
-        if is_buy_arrow and expected_signal == "CALL":
+        if bar["buy"] and expected_signal == "CALL":
             is_fresh = (offset == 2)
             return "CALL", n - offset, is_fresh
 
-        if is_sell_arrow and expected_signal == "PUT":
+        if bar["sell"] and expected_signal == "PUT":
             is_fresh = (offset == 2)
             return "PUT", n - offset, is_fresh
 
@@ -2907,6 +3098,30 @@ def nifty_loop():
                 if getattr(nifty_loop, "_carryover_done", None) == carryover_key:
                     time.sleep(10)
                     continue
+
+            # ══════════════════════════════════════════════════════════════
+            # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session)
+            # All filters must pass before order placement.
+            # ══════════════════════════════════════════════════════════════
+            _filter_ok, _filter_reason = apply_entry_filters(
+                signal, "NIFTY", cached_nifty_df, config.NIFTY_TOKEN)
+
+            if not _filter_ok:
+                print(f"🚫 NIFTY entry blocked — {_filter_reason}", flush=True)
+                # Throttled Telegram so user knows why no order was placed
+                _fkey = f"NIFTY_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(nifty_loop, "_filter_alerted", None) != _fkey:
+                    send_message(
+                        f"🚫 NIFTY ORDER BLOCKED BY FILTER\n"
+                        f"📌 Signal: {signal}\n"
+                        f"{_filter_reason}\n"
+                        f"⏳ Will retry on next valid candle"
+                    )
+                    nifty_loop._filter_alerted = _fkey
+                time.sleep(30)
+                continue
+
+            print(f"   {_filter_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
@@ -3180,6 +3395,30 @@ def crude_loop():
                         f"📉 HT line: {_arrow_bar_c['ht']:.2f}"
                     )
                     crude_loop._sig_alerted = _sig_key_c
+
+            # ══════════════════════════════════════════════════════════════
+            # 📊  STRATEGY FILTERS  (ADX / MTF / VIX)
+            # Note: Session filter not applied for CRUDE (evening session
+            # has no lunch dead-zone equivalent).
+            # ══════════════════════════════════════════════════════════════
+            _filter_ok, _filter_reason = apply_entry_filters(
+                signal, "CRUDE", cached_crude_15m, CRUDE_TOKEN)
+
+            if not _filter_ok:
+                print(f"🚫 CRUDE entry blocked — {_filter_reason}", flush=True)
+                _fkey = f"CRUDE_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(crude_loop, "_filter_alerted", None) != _fkey:
+                    send_message(
+                        f"🚫 CRUDE ORDER BLOCKED BY FILTER\n"
+                        f"📌 Signal: {signal}\n"
+                        f"{_filter_reason}\n"
+                        f"⏳ Will retry on next valid candle"
+                    )
+                    crude_loop._filter_alerted = _fkey
+                time.sleep(30)
+                continue
+
+            print(f"   {_filter_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)

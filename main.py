@@ -5194,4 +5194,8 @@ if __name__ == "__main__":
     # 🔁 KEEP ALIVE
     # -----------------------------
     while True:
-        time.sleep(60) 
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()

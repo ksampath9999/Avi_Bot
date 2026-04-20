@@ -287,7 +287,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 #   • If ML server is unreachable and ML_REQUIRED=False → bot trades anyway
 # ─────────────────────────────────────────────────────────────────────────────
 USE_ML_FILTER      = True   # ✅ ACTIVE — ML must confirm HalfTrend signal
-ML_SERVER_URL      = "avibot-production.up.railway.app"   # change to your Render/Railway ML URL
+ML_SERVER_URL      = "https://avibot-production.up.railway.app"   # ML signal server URL
 ML_MIN_CONFIDENCE  = 50     # minimum ML confidence % to allow entry
 ML_REQUIRED        = False  # False = trade even if ML server is down (safe fallback)
 

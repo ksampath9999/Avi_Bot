@@ -267,7 +267,7 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
 USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
-ADX_MIN_VALUE      = 25     # Below 25 = choppy/ranging market = skip entry
+ADX_MIN_VALUE      = 20     # Below 25 = choppy/ranging market = skip entry
 
 USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
                             # handles direction; ADX handles the real failure mode)
@@ -286,7 +286,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 #   • If ML returns HOLD → entry is skipped
 #   • If ML server is unreachable and ML_REQUIRED=False → bot trades anyway
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ML_FILTER      = True   # ✅ ACTIVE — ML must confirm HalfTrend signal
+USE_ML_FILTER      = True  # ⛔ ML filter disabled — HalfTrend signal only
 ML_SERVER_URL      = "https://avibot-production.up.railway.app"   # ML signal server URL
 ML_MIN_CONFIDENCE  = 50     # minimum ML confidence % to allow entry
 ML_REQUIRED        = False  # False = trade even if ML server is down (safe fallback)

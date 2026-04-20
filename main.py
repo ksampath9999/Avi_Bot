@@ -241,10 +241,8 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # Toggle each filter on/off with True/False.
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ADX_FILTER     = True   # ✅ ACTIVE — ADX > 25: only enter in strong trending markets
-ADX_MIN_VALUE      = 25     # HalfTrend's biggest weakness is choppy markets.
-                            # ADX directly fixes that — below 25 = ranging = skip.
-                            # Uses same 15-min data already fetched, no extra API call.
+USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
+ADX_MIN_VALUE      = 25     # Below 25 = choppy/ranging market = skip entry
 
 USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
                             # handles direction; ADX handles the real failure mode)
@@ -648,7 +646,7 @@ def apply_entry_filters(signal, instrument, df_15m, token):
             adx_s   = ADX(df_15m, period=14)
             adx_val = adx_s.iloc[-2]   # last CLOSED candle
             if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
-                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} < {ADX_MIN_VALUE} (choppy market)"
+                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} below {ADX_MIN_VALUE} (choppy market)"
             _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
         except Exception as _e:
             _adx_str = f"ADX=err({_e})"
@@ -3108,16 +3106,21 @@ def nifty_loop():
 
             if not _filter_ok:
                 print(f"🚫 NIFTY entry blocked — {_filter_reason}", flush=True)
-                # Throttled Telegram so user knows why no order was placed
-                _fkey = f"NIFTY_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                # Send alert once per candle-bar (15-min) so user always knows why no order.
+                # Key includes the reason text so a fresh alert fires if the block reason changes.
+                _fkey = f"NIFTY_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H%M') [:13]}_{_filter_reason[:30]}"
                 if getattr(nifty_loop, "_filter_alerted", None) != _fkey:
-                    send_message(
-                        f"🚫 NIFTY ORDER BLOCKED BY FILTER\n"
-                        f"📌 Signal: {signal}\n"
-                        f"{_filter_reason}\n"
-                        f"⏳ Will retry on next valid candle"
-                    )
-                    nifty_loop._filter_alerted = _fkey
+                    try:
+                        send_message(
+                            f"🚫 NIFTY ORDER BLOCKED\n"
+                            f"Signal: {signal}\n"
+                            f"{_filter_reason}\n"
+                            f"Will retry on next candle"
+                        )
+                        nifty_loop._filter_alerted = _fkey   # only mark sent if no exception
+                    except Exception as _e:
+                        print(f"⚠️ Filter alert send failed: {_e}", flush=True)
+                        # _filter_alerted NOT set — will retry next iteration
                 time.sleep(30)
                 continue
 
@@ -3406,15 +3409,18 @@ def crude_loop():
 
             if not _filter_ok:
                 print(f"🚫 CRUDE entry blocked — {_filter_reason}", flush=True)
-                _fkey = f"CRUDE_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                _fkey = f"CRUDE_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
                 if getattr(crude_loop, "_filter_alerted", None) != _fkey:
-                    send_message(
-                        f"🚫 CRUDE ORDER BLOCKED BY FILTER\n"
-                        f"📌 Signal: {signal}\n"
-                        f"{_filter_reason}\n"
-                        f"⏳ Will retry on next valid candle"
-                    )
-                    crude_loop._filter_alerted = _fkey
+                    try:
+                        send_message(
+                            f"🚫 CRUDE ORDER BLOCKED\n"
+                            f"Signal: {signal}\n"
+                            f"{_filter_reason}\n"
+                            f"Will retry on next candle"
+                        )
+                        crude_loop._filter_alerted = _fkey   # only mark sent if no exception
+                    except Exception as _e:
+                        print(f"⚠️ Filter alert send failed: {_e}", flush=True)
                 time.sleep(30)
                 continue
 
@@ -5086,4 +5092,4 @@ if __name__ == "__main__":
     # 🔁 KEEP ALIVE
     # -----------------------------
     while True:
-        time.sleep(60)
+        time.sleep(60) 

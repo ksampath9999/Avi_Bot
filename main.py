@@ -202,10 +202,17 @@ def zerodha_auto_login():
         print(f"✅ Auto-login successful | token: {access_token[:8]}...{access_token[-4:]}")
 
         # ── Notify ML server of fresh token ──────────────────────────────────
-        if USE_ML_FILTER:
+        # Use globals().get() to safely read USE_ML_FILTER and ML_SERVER_URL —
+        # this function is called at module load (line ~233) before those
+        # constants are defined at line ~257, so a direct reference would raise
+        # NameError, get caught by the except below, and silently overwrite the
+        # freshly-set access token with the stale config.ACCESS_TOKEN.
+        _use_ml  = globals().get("USE_ML_FILTER", False)
+        _ml_url  = globals().get("ML_SERVER_URL", "")
+        if _use_ml and _ml_url:
             try:
                 resp = requests.post(
-                    f"{ML_SERVER_URL}/set_token",
+                    f"{_ml_url}/set_token",
                     json={"access_token": access_token},
                     timeout=5
                 )
@@ -219,12 +226,17 @@ def zerodha_auto_login():
         import traceback
         print(f"❌ Auto-login failed: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
-        # Fallback: use last known token from config so bot can still attempt to run
-        try:
-            kite.set_access_token(config.ACCESS_TOKEN)
-            print("⚠️  Falling back to config.ACCESS_TOKEN", flush=True)
-        except Exception:
-            pass
+        # Fallback: use last known token from config so bot can still attempt to run.
+        # Only apply fallback if the kite object does NOT already have a fresh token
+        # (i.e. the exception happened BEFORE kite.set_access_token was called).
+        _current = getattr(kite, "access_token", None)
+        _cfg_tok = getattr(config, "ACCESS_TOKEN", None)
+        if not _current or _current == _cfg_tok:
+            try:
+                kite.set_access_token(config.ACCESS_TOKEN)
+                print("⚠️  Falling back to config.ACCESS_TOKEN", flush=True)
+            except Exception:
+                pass
         raise   # re-raise so caller can capture the error message
 
 

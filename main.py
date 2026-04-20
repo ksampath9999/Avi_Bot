@@ -3389,6 +3389,7 @@ def crude_loop():
     global last_status, last_weak_log_time
     global last_fetch_crude, cached_crude_15m, cached_crude_ht
     global crude_trade_active
+    global win_streak, loss_streak
 
     _crude_weekend_msg_sent = [False]
 

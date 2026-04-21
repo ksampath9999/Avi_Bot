@@ -3248,14 +3248,6 @@ def nifty_loop():
             current_trend = int(ht_df.iloc[-2]["trend"])
             print("🧠 Current Trend:", "CALL" if current_trend == 0 else "PUT")
 
-            # ── DIAG: show last 4 bars so we can see when trend flipped ──────
-            _diag_cols = ["close","trend","buy","sell"]
-            for _di in [-4, -3, -2, -1]:
-                _r = ht_df.iloc[_di]
-                _lbl = ["iloc-4","iloc-3","iloc-2(closed)","iloc-1(forming)"][_di+4]
-                print(f"  📊 {_lbl}: close={_r['close']:.1f} trend={'CALL' if _r['trend']==0 else 'PUT'} buy={bool(_r['buy'])} sell={bool(_r['sell'])}", flush=True)
-            # ── END DIAG ────────────────────────────────────────────────────
-
             # ── Signal Detection (fresh arrow + carry-over) ───────────────────
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
 
@@ -4774,8 +4766,13 @@ def get_cached_data(token, interval="15minute", count=200):
 
     # ── Cache miss → fetch from Kite ────────────────────────────────────────
     try:
-        to_date   = datetime.now()
-        from_date = to_date - timedelta(days=30)   # 30 days for HalfTrend ATR(100) warm-up + lookback
+        # CRITICAL: Railway server runs in UTC. datetime.now() returns UTC time.
+        # Kite historical_data API expects IST (UTC+5:30) naive datetimes.
+        # Sending UTC time makes Kite think it's 5h30m in the past → returns
+        # yesterday's/previous session's data instead of today's live candles.
+        # Fix: always derive to_date in IST, strip tzinfo so Kite gets a naive IST datetime.
+        to_date   = datetime.now(IST).replace(tzinfo=None)   # IST naive — correct for Kite API
+        from_date = to_date - timedelta(days=30)              # 30 days back in IST
 
         data = kite.historical_data(token, from_date, to_date, interval)
         df   = pd.DataFrame(data)

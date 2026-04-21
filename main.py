@@ -347,6 +347,15 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
 ADX_MIN_VALUE      = 20     # Below 25 = choppy/ranging market = skip entry
 
+# ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
+# Both HalfTrend AND 9/15 EMA must agree before an order is placed.
+# CALL entry: 9 EMA must be above 15 EMA (bullish alignment)
+# PUT  entry: 9 EMA must be below 15 EMA (bearish alignment)
+# Applies to both NIFTY and CRUDE on 15-min chart.
+# Set False to disable and trade on HalfTrend signal alone.
+# ─────────────────────────────────────────────────────────────────────────────
+USE_EMA_FILTER     = True   # ✅ ACTIVE — 9/15 EMA must confirm HalfTrend signal
+
 USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
                             # handles direction; ADX handles the real failure mode)
 
@@ -818,7 +827,29 @@ def apply_entry_filters(signal, instrument, df_15m, token):
     else:
         _vix_str = "VIX=off"
 
-    # ── 5. ML Signal filter (NIFTY only) ─────────────────────────────────────
+    # ── 5. 9/15 EMA second signal source (NIFTY + CRUDE) ─────────────────────
+    # 9 EMA must be on the correct side of 15 EMA to confirm HalfTrend direction.
+    # Uses last CLOSED candle (-2) — same anti-repaint rule as HalfTrend.
+    _ema_str = "EMA=off"
+    if USE_EMA_FILTER and df_15m is not None:
+        try:
+            ema9  = df_15m["close"].ewm(span=9,  adjust=False).mean()
+            ema15 = df_15m["close"].ewm(span=15, adjust=False).mean()
+            e9    = round(float(ema9.iloc[-2]),  2)
+            e15   = round(float(ema15.iloc[-2]), 2)
+
+            if signal == "CALL" and e9 < e15:
+                return False, (f"⏸️ EMA filter: 9 EMA ({e9:.1f}) below 15 EMA ({e15:.1f}) "
+                               f"— bearish EMA, HalfTrend says CALL (disagreement)")
+            if signal == "PUT" and e9 > e15:
+                return False, (f"⏸️ EMA filter: 9 EMA ({e9:.1f}) above 15 EMA ({e15:.1f}) "
+                               f"— bullish EMA, HalfTrend says PUT (disagreement)")
+
+            _ema_str = f"EMA9={e9:.1f} {'>' if e9 > e15 else '<'} EMA15={e15:.1f}"
+        except Exception as _e:
+            _ema_str = f"EMA=err({_e})"
+
+    # ── 6. ML Signal filter (NIFTY only) ─────────────────────────────────────
     _ml_str = "ML=off"
     if USE_ML_FILTER and instrument == "NIFTY":
         ml_sig, ml_conf, ml_reason = get_ml_signal()
@@ -838,7 +869,7 @@ def apply_entry_filters(signal, instrument, df_15m, token):
             _ml_str = f"ML={ml_sig}({ml_conf:.0f}%)"
             print(f"🤖 ML confirmed: {ml_sig} | confidence={ml_conf:.1f}% | {ml_reason}", flush=True)
 
-    return True, f"✅ Filters passed — {_adx_str} | {_mtf_str} | {_vix_str} | {_ml_str}"
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str}"
 
 
 # ======================================

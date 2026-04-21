@@ -3245,6 +3245,13 @@ def nifty_loop():
             current_trend = int(ht_df.iloc[-2]["trend"])
             print("🧠 Current Trend:", "CALL" if current_trend == 0 else "PUT")
 
+            # ── DEBUG: last 6 bars of HalfTrend (remove after diagnosis) ────
+            _dbg = ht_df.iloc[-7:-1][["trend","buy","sell","ht","atrHigh","atrLow"]].copy()
+            _dbg["trend_str"] = _dbg["trend"].apply(lambda x: "CALL" if x==0 else "PUT")
+            for _idx, _row in _dbg.iterrows():
+                _arr = "🟢BUY" if _row["buy"] else ("🔴SELL" if _row["sell"] else "·")
+                print(f"   {str(_idx)[-8:]}  trend={_row['trend_str']}  {_arr}  ht={_row['ht']:.1f}", flush=True)
+
             # ── Signal Detection (fresh arrow + carry-over) ───────────────────
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
 

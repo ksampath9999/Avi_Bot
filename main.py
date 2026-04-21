@@ -345,8 +345,9 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
 USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
-ADX_MIN_VALUE      = 15     # Below 15 = choppy/ranging market = skip entry
-                            # (TradingView ADX on slow grinds = 15-20; 22 was too strict)
+ADX_MIN_VALUE      = 12     # Kite API data gives ~3 pts lower ADX than TradingView
+                            # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
+                            # only true choppy/sideways (TV ADX would be ~15 or below)
 
 # ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
 # Both HalfTrend AND 9/15 EMA must agree before an order is placed.
@@ -3247,6 +3248,13 @@ def nifty_loop():
             current_trend = int(ht_df.iloc[-2]["trend"])
             print("🧠 Current Trend:", "CALL" if current_trend == 0 else "PUT")
 
+            # ── DIAG: show last 4 bars so we can see when trend flipped ──────
+            _diag_cols = ["close","trend","buy","sell"]
+            for _di in [-4, -3, -2, -1]:
+                _r = ht_df.iloc[_di]
+                _lbl = ["iloc-4","iloc-3","iloc-2(closed)","iloc-1(forming)"][_di+4]
+                print(f"  📊 {_lbl}: close={_r['close']:.1f} trend={'CALL' if _r['trend']==0 else 'PUT'} buy={bool(_r['buy'])} sell={bool(_r['sell'])}", flush=True)
+            # ── END DIAG ────────────────────────────────────────────────────
 
             # ── Signal Detection (fresh arrow + carry-over) ───────────────────
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)

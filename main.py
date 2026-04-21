@@ -367,6 +367,13 @@ VIX_MAX            = 22     # (used only when USE_VIX_FILTER = True)
 
 USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 
+# ── Instrument Enable / Disable ───────────────────────────────────────────────
+# Set False to completely stop trading that instrument.
+# The loop stays running (no restart needed) — just skips all entries.
+# Flip back to True to resume immediately on next cycle.
+ENABLE_NIFTY = True         # ✅ NIFTY trading active
+ENABLE_CRUDE = True         # ✅ CRUDE trading active
+
 # ── Daily Trade Limits ────────────────────────────────────────────────────────
 # Hard cap on number of trades per instrument per day.
 # Once the limit is reached the loop waits until next market day.
@@ -471,7 +478,6 @@ pyramid_done = False
 TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
-ENABLE_CRUDE = True
 last_log_time = 0
 last_running_signal = None
 performance_log = []
@@ -3232,6 +3238,14 @@ def nifty_loop():
 
     while True:
         try:
+            # ── Instrument kill-switch ────────────────────────────────────────
+            if not ENABLE_NIFTY:
+                if last_status != "NIFTY_DISABLED":
+                    print("⛔ NIFTY trading disabled (ENABLE_NIFTY=False)", flush=True)
+                    last_status = "NIFTY_DISABLED"
+                time.sleep(30)
+                continue
+
             now_dt = datetime.now(IST)
 
             # ── Weekend: sleep and do nothing ────────────────────────────────
@@ -3532,6 +3546,14 @@ def crude_loop():
 
     while True:
         try:
+            # ── Instrument kill-switch ────────────────────────────────────────
+            if not ENABLE_CRUDE:
+                if last_status != "CRUDE_DISABLED":
+                    print("⛔ CRUDE trading disabled (ENABLE_CRUDE=False)", flush=True)
+                    last_status = "CRUDE_DISABLED"
+                time.sleep(30)
+                continue
+
             now_dt = datetime.now(IST)
 
             # ── Weekend: sleep and do nothing ────────────────────────────────

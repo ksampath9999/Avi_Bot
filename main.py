@@ -345,7 +345,7 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
 USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
-ADX_MIN_VALUE      = 20     # Below 25 = choppy/ranging market = skip entry
+ADX_MIN_VALUE      = 22     # Below 22 = choppy/ranging market = skip entry
 
 # ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
 # Both HalfTrend AND 9/15 EMA must agree before an order is placed.

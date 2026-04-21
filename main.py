@@ -3153,6 +3153,7 @@ def nifty_loop():
     global last_status, last_weak_log_time
     global last_fetch_nifty, cached_nifty_df, cached_nifty_ht
     global nifty_trade_active, nifty_position
+    global win_streak, loss_streak
 
     _nifty_weekend_msg_sent = [False]   # send "sleeping" msg only once per weekend
     _nifty_wakeup_msg_sent  = [False]   # send "waking up" msg only once per Monday

@@ -1743,18 +1743,22 @@ def find_option(signal, instrument):
     balance = get_balance(instrument) or 10000
 
     if instrument == "CRUDE":
+        # MCX Crude Oil lot = 100 barrels. Strikes move in ₹100 steps.
+        # ATM crude option ~₹50-150. Deep OTM (7 steps = ₹700 away) costs ₹1-10
+        # which falls below any min_price filter — that's why no option was found.
+        # Fix: keep strike close to ATM (1-2 steps OTM) and widen max_price.
         if balance <= 5000:
-            strike_shift = 7
-            max_price = 50
+            strike_shift = 2       # 2 × ₹100 = ₹200 OTM — cheap but tradeable
+            max_price = 80         # 1 lot cost = ₹80 × 100 = ₹8,000 → use 1 lot
         elif balance <= 10000:
-            strike_shift = 5
-            max_price = 80
-        elif balance <= 20000:
-            strike_shift = 3
+            strike_shift = 2
             max_price = 100
+        elif balance <= 20000:
+            strike_shift = 1
+            max_price = 130
         else:
             strike_shift = 1
-            max_price = 120
+            max_price = 160
     else:
         # NIFTY — lot size 65, 5% risk model
         # 1 lot value = premium * 65
@@ -1822,8 +1826,10 @@ def find_option(signal, instrument):
         key=lambda x: abs(int(x.get("strike", 0)) - target_strike)
     )
 
-    # Minimum premium: CRUDE ₹50 strictly, NIFTY ₹20
-    min_price = 50 if instrument == "CRUDE" else 20
+    # Minimum premium floor — filters out near-zero illiquid options
+    # CRUDE: ₹10/barrel minimum (1 lot = ₹1,000 trade value — below this is too illiquid)
+    # NIFTY: ₹20/point minimum
+    min_price = 10 if instrument == "CRUDE" else 20
 
     candidates = []
 
@@ -1952,7 +1958,7 @@ def find_option(signal, instrument):
         if p is None or p <= 0:
             continue
 
-        # Fallback also respects min_price (CRUDE ≥ ₹50, NIFTY ≥ ₹20)
+        # Fallback also respects min_price (CRUDE ≥ ₹10, NIFTY ≥ ₹20)
         if min_price <= p <= max_price * 1.8:
             # Liquidity check for fallback too
             _liquid = True
@@ -3779,10 +3785,19 @@ def crude_loop():
             print(f"   find_option → symbol={symbol} price={price} lot={lot} exchange={exchange}")
 
             if not symbol:
-                send_message(
-                    f"⚠️ CRUDE {signal}: No suitable option found\n"
-                    f"Check option chain — price may be out of range or expiry unavailable"
-                )
+                # Send alert only once per 15-min candle to avoid Telegram spam
+                _noopt_key = f"CRUDE_noopt_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:14]}"
+                if getattr(crude_loop, "_noopt_alerted", None) != _noopt_key:
+                    send_message(
+                        f"⚠️ CRUDE {signal}: No suitable option found\n"
+                        f"Check option chain — price may be out of range or expiry unavailable"
+                    )
+                    crude_loop._noopt_alerted = _noopt_key
+                with lock:
+                    crude_trade_active = False
+                    global_trade_active = nifty_trade_active or crude_trade_active
+                time.sleep(30)
+                continue
 
             if symbol:
                 filled_price = place_order(symbol, lot, exchange, "CRUDE")

@@ -200,18 +200,43 @@ def zerodha_auto_login():
         access_token = session_data["access_token"]
         kite.set_access_token(access_token)
         print(f"✅ Auto-login successful | token: {access_token[:8]}...{access_token[-4:]}")
+
+        # ── Notify ML server of fresh token ──────────────────────────────────
+        # Use globals().get() to safely read USE_ML_FILTER and ML_SERVER_URL —
+        # this function is called at module load (line ~233) before those
+        # constants are defined at line ~257, so a direct reference would raise
+        # NameError, get caught by the except below, and silently overwrite the
+        # freshly-set access token with the stale config.ACCESS_TOKEN.
+        _use_ml  = globals().get("USE_ML_FILTER", False)
+        _ml_url  = globals().get("ML_SERVER_URL", "")
+        if _use_ml and _ml_url:
+            try:
+                resp = requests.post(
+                    f"{_ml_url}/set_token",
+                    json={"access_token": access_token},
+                    timeout=5
+                )
+                print(f"🤖 ML server token update: {resp.json()}", flush=True)
+            except Exception as _ml_e:
+                print(f"⚠️ Could not notify ML server: {_ml_e}", flush=True)
+
         return access_token
 
     except Exception as e:
         import traceback
         print(f"❌ Auto-login failed: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
-        # Fallback: use last known token from config so bot can still attempt to run
-        try:
-            kite.set_access_token(config.ACCESS_TOKEN)
-            print("⚠️  Falling back to config.ACCESS_TOKEN", flush=True)
-        except Exception:
-            pass
+        # Fallback: use last known token from config so bot can still attempt to run.
+        # Only apply fallback if the kite object does NOT already have a fresh token
+        # (i.e. the exception happened BEFORE kite.set_access_token was called).
+        _current = getattr(kite, "access_token", None)
+        _cfg_tok = getattr(config, "ACCESS_TOKEN", None)
+        if not _current or _current == _cfg_tok:
+            try:
+                kite.set_access_token(config.ACCESS_TOKEN)
+                print("⚠️  Falling back to config.ACCESS_TOKEN", flush=True)
+            except Exception:
+                pass
         raise   # re-raise so caller can capture the error message
 
 
@@ -227,6 +252,84 @@ try:
     print("🌐 Railway Public IP:", ip)
 except Exception as e:
     print("❌ IP fetch failed:", e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🌐 AUTO IP WHITELIST — updates Kite developer app IP on every deploy
+#
+# Required Railway env vars:
+#   KITE_DEV_USER_ID  — your Zerodha user ID (same as trading login)
+#   KITE_DEV_PASSWORD — your Zerodha password
+#   KITE_APP_ID       — numeric app ID from developers.kite.trade URL
+#                       e.g. https://developers.kite.trade/apps/12345 → 12345
+# ─────────────────────────────────────────────────────────────────────────────
+def update_kite_ip_whitelist():
+    """
+    Fetch Railway's current public IP and whitelist it in the Kite Connect
+    developer app settings. Safe to call on every startup — if IP hasn't
+    changed, Kite simply accepts the same value.
+    """
+    dev_user = os.environ.get("KITE_DEV_USER_ID")
+    dev_pass = os.environ.get("KITE_DEV_PASSWORD")
+    app_id   = os.environ.get("KITE_APP_ID")
+
+    if not all([dev_user, dev_pass, app_id]):
+        print("⚠️ IP whitelist auto-update skipped — set KITE_DEV_USER_ID / "
+              "KITE_DEV_PASSWORD / KITE_APP_ID in Railway env vars", flush=True)
+        return False
+
+    try:
+        # ── Step 1: Get current Railway public IP ─────────────────────────────
+        current_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        print(f"🌐 Railway IP for whitelist: {current_ip}", flush=True)
+
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+
+        # ── Step 2: Login to Kite developer portal ───────────────────────────
+        r1 = sess.post(
+            "https://developers.kite.trade/api/users/signin",
+            json={"user_id": dev_user, "password": dev_pass},
+            timeout=10
+        )
+        d1 = r1.json()
+        if d1.get("status") != "success":
+            print(f"❌ Kite dev portal login failed: {d1.get('message')}", flush=True)
+            return False
+
+        print(f"✅ Kite dev portal logged in", flush=True)
+
+        # ── Step 3: Update IP whitelist for the app ──────────────────────────
+        r2 = sess.put(
+            f"https://developers.kite.trade/api/apps/{app_id}",
+            json={"ip_whitelist": [current_ip]},
+            timeout=10
+        )
+        d2 = r2.json()
+        if d2.get("status") == "success":
+            print(f"✅ Kite IP whitelist updated → {current_ip}", flush=True)
+            try:
+                send_message(f"🌐 Railway IP auto-whitelisted\n{current_ip}")
+            except Exception:
+                pass
+            return True
+        else:
+            print(f"❌ IP whitelist update failed: {d2}", flush=True)
+            try:
+                send_message(f"❌ IP whitelist update failed\n{d2.get('message', str(d2))}")
+            except Exception:
+                pass
+            return False
+
+    except Exception as e:
+        import traceback
+        print(f"❌ IP whitelist error: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return False
+
+
+# Run at startup — updates IP immediately when Railway redeploys
+threading.Thread(target=update_kite_ip_whitelist, daemon=True).start()
 
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
@@ -244,6 +347,15 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
 ADX_MIN_VALUE      = 20     # Below 25 = choppy/ranging market = skip entry
 
+# ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
+# Both HalfTrend AND 9/15 EMA must agree before an order is placed.
+# CALL entry: 9 EMA must be above 15 EMA (bullish alignment)
+# PUT  entry: 9 EMA must be below 15 EMA (bearish alignment)
+# Applies to both NIFTY and CRUDE on 15-min chart.
+# Set False to disable and trade on HalfTrend signal alone.
+# ─────────────────────────────────────────────────────────────────────────────
+USE_EMA_FILTER     = True   # ✅ ACTIVE — 9/15 EMA must confirm HalfTrend signal
+
 USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
                             # handles direction; ADX handles the real failure mode)
 
@@ -252,6 +364,19 @@ VIX_MIN            = 11     # (used only when USE_VIX_FILTER = True)
 VIX_MAX            = 22     # (used only when USE_VIX_FILTER = True)
 
 USE_SESSION_FILTER = False  # Session dead-zone filter (off)
+
+# ── ML Signal Filter ──────────────────────────────────────────────────────────
+# ml_signal_server.py must be running (separate Railway/Render service).
+# The bot calls /signal before each NIFTY entry:
+#   • ML must AGREE with HalfTrend direction (CALL/PUT)
+#   • ML confidence must be >= ML_MIN_CONFIDENCE
+#   • If ML returns HOLD → entry is skipped
+#   • If ML server is unreachable and ML_REQUIRED=False → bot trades anyway
+# ─────────────────────────────────────────────────────────────────────────────
+USE_ML_FILTER      = False  # ⛔ ML filter disabled — HalfTrend signal only
+ML_SERVER_URL      = "https://avibot-production.up.railway.app"   # ML signal server URL
+ML_MIN_CONFIDENCE  = 50     # minimum ML confidence % to allow entry
+ML_REQUIRED        = False  # False = trade even if ML server is down (safe fallback)
 
 # -----------------------------
 # STATES
@@ -619,6 +744,31 @@ def get_mtf_trend(token, instrument):
 # ──────────────────────────────────────────────────────────────────────────────
 # 🔍 apply_entry_filters(signal, instrument, df_15m)
 # Single function that runs ALL enabled filters.
+# ──────────────────────────────────────────────────────────────────────────────
+# ML SIGNAL HELPER
+# ──────────────────────────────────────────────────────────────────────────────
+def get_ml_signal():
+    """
+    Call the ML signal server and return (signal, confidence, reason).
+    signal     : "CALL" | "PUT" | "HOLD"
+    confidence : float 0-100
+    reason     : string explanation
+
+    If server unreachable:
+      • ML_REQUIRED=True  → returns ("HOLD", 0, "ML server down") — blocks entry
+      • ML_REQUIRED=False → returns (None, 0, "ML skipped")      — entry allowed
+    """
+    try:
+        resp = requests.get(f"{ML_SERVER_URL}/signal", timeout=3)
+        data = resp.json()
+        return data.get("signal", "HOLD"), float(data.get("confidence", 0)), data.get("reason", "")
+    except Exception as e:
+        print(f"⚠️ ML server unreachable: {e}", flush=True)
+        if ML_REQUIRED:
+            return "HOLD", 0, f"ML server down: {e}"
+        return None, 0, "ML server skipped (not required)"
+
+
 # Returns (passed: bool, reason: str)
 # Call this right before order placement in nifty_loop / crude_loop.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -677,7 +827,49 @@ def apply_entry_filters(signal, instrument, df_15m, token):
     else:
         _vix_str = "VIX=off"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_mtf_str} | {_vix_str}"
+    # ── 5. 9/15 EMA second signal source (NIFTY + CRUDE) ─────────────────────
+    # 9 EMA must be on the correct side of 15 EMA to confirm HalfTrend direction.
+    # Uses last CLOSED candle (-2) — same anti-repaint rule as HalfTrend.
+    _ema_str = "EMA=off"
+    if USE_EMA_FILTER and df_15m is not None:
+        try:
+            ema9  = df_15m["close"].ewm(span=9,  adjust=False).mean()
+            ema15 = df_15m["close"].ewm(span=15, adjust=False).mean()
+            e9    = round(float(ema9.iloc[-2]),  2)
+            e15   = round(float(ema15.iloc[-2]), 2)
+
+            if signal == "CALL" and e9 < e15:
+                return False, (f"⏸️ EMA filter: 9 EMA ({e9:.1f}) below 15 EMA ({e15:.1f}) "
+                               f"— bearish EMA, HalfTrend says CALL (disagreement)")
+            if signal == "PUT" and e9 > e15:
+                return False, (f"⏸️ EMA filter: 9 EMA ({e9:.1f}) above 15 EMA ({e15:.1f}) "
+                               f"— bullish EMA, HalfTrend says PUT (disagreement)")
+
+            _ema_str = f"EMA9={e9:.1f} {'>' if e9 > e15 else '<'} EMA15={e15:.1f}"
+        except Exception as _e:
+            _ema_str = f"EMA=err({_e})"
+
+    # ── 6. ML Signal filter (NIFTY only) ─────────────────────────────────────
+    _ml_str = "ML=off"
+    if USE_ML_FILTER and instrument == "NIFTY":
+        ml_sig, ml_conf, ml_reason = get_ml_signal()
+
+        if ml_sig is None:
+            # Server unreachable and ML_REQUIRED=False → allow trade, log it
+            _ml_str = "ML=skipped(server down)"
+        elif ml_sig == "HOLD":
+            return False, f"🤖 ML filter: HOLD — {ml_reason} (confidence: {ml_conf:.0f}%)"
+        elif ml_sig != signal:
+            return False, (f"🤖 ML filter: disagreement — ML={ml_sig} vs HalfTrend={signal} "
+                           f"(confidence: {ml_conf:.0f}%)")
+        elif ml_conf < ML_MIN_CONFIDENCE:
+            return False, (f"🤖 ML filter: low confidence — {ml_conf:.0f}% below {ML_MIN_CONFIDENCE}% "
+                           f"({ml_reason})")
+        else:
+            _ml_str = f"ML={ml_sig}({ml_conf:.0f}%)"
+            print(f"🤖 ML confirmed: {ml_sig} | confidence={ml_conf:.1f}% | {ml_reason}", flush=True)
+
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str}"
 
 
 # ======================================
@@ -1549,10 +1741,10 @@ def find_option(signal, instrument):
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
         if balance <= 5000:
-            strike_shift = 5
+            strike_shift = 7
             max_price = 50
         elif balance <= 10000:
-            strike_shift = 4      # deep OTM — cheap premium
+            strike_shift = 5      # deep OTM — cheap premium
             max_price = 80        # ₹50 × 65 = ₹3,250 per lot
         elif balance <= 20000:
             strike_shift = 3      # OTM
@@ -1875,7 +2067,7 @@ def place_order(symbol, qty, exchange, instrument):
             f"📥 Order placed: {symbol}\n"
             f"   Price: ₹{price:.1f}  |  Qty: {quantity}  |  Lots: {qty}\n"
             f"   Total deployed: ₹{price * quantity:,.0f}\n"
-            f"   Max risk (20% SL): ₹{price * 0.20 * quantity:,.0f}"
+            f"   Max risk (25% SL): ₹{price * 0.25 * quantity:,.0f}"
         )
 
         filled_price = None
@@ -2003,7 +2195,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     ltp = entry
 
     # 🔥 CORE RISK MODEL
-    risk = entry * 0.20
+    risk = entry * 0.25
 
     if signal == "CALL":
         sl = entry - risk
@@ -2016,7 +2208,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         f"🚀 NEW TRADE ENTERED\n"
         f"📌 {instrument} {signal} → {symbol}\n"
         f"💰 Entry: ₹{entry:.1f}  |  Qty: {actual_qty}\n"
-        f"🛑 Initial SL: ₹{(entry*(1-0.20) if signal=='CALL' else entry*(1+0.20)):.1f}  "
+        f"🛑 Initial SL: ₹{(entry*(1-0.25) if signal=='CALL' else entry*(1+0.25)):.1f}  "
         f"(20% of premium)\n"
         f"📊 Deployed: ₹{entry * actual_qty:,.0f}"
     )
@@ -2109,7 +2301,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         remaining_qty -= half_qty
                         partial_booked = True
 
-                        send_message(f"💰 Partial booked\n{symbol}")
+                        print(f"💰 Partial booked: {symbol}", flush=True)
 
             # ===============================
             # 💰 GLOBAL PROFIT PROTECTION
@@ -2177,20 +2369,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             else:
                 sl = min(sl, peak + (atr_value * trail_multiplier))
 
-            # ── Send Telegram alert when SL moves by > 0.5% of entry ──────────
-            global _last_trail_alert_nifty, _last_trail_alert_crude
-            _trail_ref = _last_trail_alert_nifty if instrument == "NIFTY" else _last_trail_alert_crude
-            if abs(sl - old_sl) > entry * 0.005 and time.time() - _trail_ref > 60:
-                send_message(
-                    f"📈 TRAILING SL MOVED\n"
-                    f"📌 {instrument} {signal} → {symbol}\n"
-                    f"🛑 New SL: ₹{sl:.1f}  (was ₹{old_sl:.1f})\n"
-                    f"💰 Current P&L: ₹{current_pnl:.0f}  |  LTP: ₹{ltp:.1f}"
-                )
-                if instrument == "NIFTY":
-                    _last_trail_alert_nifty = time.time()
-                else:
-                    _last_trail_alert_crude = time.time()
+            # Trailing SL update logged to console only
+            if abs(sl - old_sl) > entry * 0.005:
+                print(f"📈 {instrument} trailing SL: ₹{old_sl:.1f} → ₹{sl:.1f}  P&L: ₹{current_pnl:.0f}", flush=True)
 
             # ===============================
             # 🔥 STRONG TREND MODE (LET PROFITS RUN)
@@ -2288,10 +2469,10 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 pnl = current_pnl
                 break
 
-            # ── 2. Hard SL (absolute 20% of option premium) ─────────────────
+            # ── 2. Hard SL (absolute 25% of option premium) ─────────────────
             # Safety net in case trailing SL fails to fire (e.g. gap-down open).
             # Fires when total ₹ loss exceeds 20% of entry × qty.
-            max_loss = risk * remaining_qty   # risk = entry * 0.20
+            max_loss = risk * remaining_qty   # risk = entry * 0.25
 
             if current_pnl <= -max_loss and not exit_done:
                 last_exit_reason = "HARD_SL"
@@ -2301,7 +2482,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     f"📌 {instrument} {signal} → {symbol}\n"
                     f"💔 Loss: ₹{current_pnl:.0f}  |  SL limit: ₹{-max_loss:.0f}\n"
                     f"📉 Entry: ₹{entry:.1f}  |  Exit LTP: ₹{ltp:.1f}\n"
-                    f"📊 Hard SL = 20% of option premium × qty"
+                    f"📊 Hard SL = 25% of option premium × qty"
                 )
                 exit_position(symbol, remaining_qty, exchange)
                 exit_done = True
@@ -2383,13 +2564,16 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             print(f"✅ {instrument} trade closed — ready for next")
 
             # ── Trade closed Telegram summary ─────────────────────────────
+            _combined_pnl = nifty_daily_pnl + crude_daily_pnl
             send_message(
-                f"{exit_emoji} TRADE CLOSED — {instrument}\n"
-                f"📌 {signal} → {symbol}\n"
-                f"💰 P&L: ₹{pnl:.0f}  ({'PROFIT' if pnl > 0 else 'LOSS'})\n"
+                f"{exit_emoji} TRADE CLOSED — {instrument} {signal}\n"
+                f"📌 {symbol}\n"
+                f"💰 P&L : ₹{pnl:+.0f}  ({'PROFIT' if pnl > 0 else 'LOSS'})\n"
                 f"📊 Entry: ₹{entry:.1f}  |  Exit: ₹{ltp:.1f}\n"
-                f"📅 Today {instrument} P&L so far: ₹"
-                f"{nifty_daily_pnl if instrument == 'NIFTY' else crude_daily_pnl:.0f}"
+                f"{'─'*28}\n"
+                f"📅 NIFTY today  : ₹{nifty_daily_pnl:+.0f}\n"
+                f"📅 CRUDE today  : ₹{crude_daily_pnl:+.0f}\n"
+                f"💼 Combined     : ₹{_combined_pnl:+.0f}"
             )
 
             log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
@@ -3000,6 +3184,7 @@ def nifty_loop():
     global last_status, last_weak_log_time
     global last_fetch_nifty, cached_nifty_df, cached_nifty_ht
     global nifty_trade_active, nifty_position
+    global win_streak, loss_streak
 
     _nifty_weekend_msg_sent = [False]   # send "sleeping" msg only once per weekend
     _nifty_wakeup_msg_sent  = [False]   # send "waking up" msg only once per Monday
@@ -3039,11 +3224,10 @@ def nifty_loop():
             # Loss streak cooldown — pause then RESET (same fix as CRUDE).
             if loss_streak >= 3:
                 print("⚠️ Loss streak >= 3 — pausing NIFTY 15 min then resetting streak", flush=True)
-                send_message("⚠️ NIFTY: 3 consecutive losses — pausing 15 min then resuming")
+                send_message("❌ NIFTY: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)   # 15-minute cooldown
                 loss_streak = 0   # reset so trading can resume
                 print("♻️ NIFTY loss streak reset — resuming trading", flush=True)
-                send_message("♻️ NIFTY: Cooldown done — resuming trading")
                 continue
 
             # Refresh data cache every 30 seconds
@@ -3060,6 +3244,21 @@ def nifty_loop():
             ht_df = cached_nifty_ht
             current_trend = int(ht_df.iloc[-2]["trend"])
             print("🧠 Current Trend:", "CALL" if current_trend == 0 else "PUT")
+
+            # ── DEBUG: last 6 bars of HalfTrend with real timestamps ─────────
+            # Print actual candle times from raw data
+            _raw_tail = cached_nifty_df.tail(7)
+            print(f"   📊 Raw data last 7 candle times:", flush=True)
+            for _ti in _raw_tail.index:
+                print(f"      {_ti}", flush=True)
+            print(f"   📊 ht_df length={len(ht_df)}  iloc[-2] index={ht_df.index[-2]}  iloc[-1] index={ht_df.index[-1]}", flush=True)
+            # HalfTrend last 6 bars
+            for _off in range(7, 1, -1):
+                _row = ht_df.iloc[-_off]
+                # Get matching raw candle time
+                _raw_idx = cached_nifty_df.index[-_off] if len(cached_nifty_df) >= _off else "?"
+                _arr = "🟢BUY" if _row["buy"] else ("🔴SELL" if _row["sell"] else "·")
+                print(f"   {_raw_idx}  trend={'CALL' if _row['trend']==0 else 'PUT'}  {_arr}  ht={_row['ht']:.2f}  close={cached_nifty_df['close'].iloc[-_off]:.1f}", flush=True)
 
             # ── Signal Detection (fresh arrow + carry-over) ───────────────────
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
@@ -3083,36 +3282,16 @@ def nifty_loop():
                     print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 120 bars — waiting")
                     last_status = status
                     last_weak_log_time = time.time()
-                # Throttled Telegram alert for no-signal state
-                global _last_no_signal_alert_nifty
-                if time.time() - _last_no_signal_alert_nifty > NO_SIGNAL_ALERT_INTERVAL:
-                    trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
-                    send_message(
-                        f"⏸️ NIFTY: No HalfTrend arrow found\n"
-                        f"📊 Current trend: {trend_name} | Lookback: 120 bars\n"
-                        f"⏳ Waiting for arrow signal..."
-                    )
-                    _last_no_signal_alert_nifty = time.time()
                 time.sleep(10)
                 continue
 
-            # ── Telegram: signal detected ─────────────────────────────────────
+            # ── Signal detected — log only, no Telegram ──────────────────────
             if signal is not None and arrow_idx is not None:
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
-                _freshness = "🆕 FRESH arrow" if is_fresh else f"♻️ CARRY-OVER ({_bars_ago * 15} min ago)"
-                # Only alert when signal is newly identified (fresh) or on first carry-over detection
-                _carryover_alerted_key = f"NIFTY_sig_{signal}_{datetime.now(IST).strftime('%Y-%m-%d')}"
-                if is_fresh or not getattr(nifty_loop, "_sig_alerted", None) == _carryover_alerted_key:
-                    send_message(
-                        f"🔔 NIFTY SIGNAL DETECTED\n"
-                        f"{'🟢 CALL (BUY CE)' if signal == 'CALL' else '🔴 PUT (BUY PE)'}\n"
-                        f"📊 Type: {_freshness}\n"
-                        f"🎯 Arrow level: ₹{_level:.2f}\n"
-                        f"📉 HT line: {arrow_bar['ht']:.2f}  |  atrHigh: {arrow_bar['atrHigh']:.2f}  atrLow: {arrow_bar['atrLow']:.2f}"
-                    )
-                    nifty_loop._sig_alerted = _carryover_alerted_key
+                _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
+                print(f"🔔 NIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -3131,21 +3310,14 @@ def nifty_loop():
 
             if not _filter_ok:
                 print(f"🚫 NIFTY entry blocked — {_filter_reason}", flush=True)
-                # Send alert once per candle-bar (15-min) so user always knows why no order.
-                # Key includes the reason text so a fresh alert fires if the block reason changes.
-                _fkey = f"NIFTY_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H%M') [:13]}_{_filter_reason[:30]}"
+                # Alert once per 15-min candle; re-fires if block reason changes
+                _fkey = f"NIFTY_f_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
                 if getattr(nifty_loop, "_filter_alerted", None) != _fkey:
                     try:
-                        send_message(
-                            f"🚫 NIFTY ORDER BLOCKED\n"
-                            f"Signal: {signal}\n"
-                            f"{_filter_reason}\n"
-                            f"Will retry on next candle"
-                        )
-                        nifty_loop._filter_alerted = _fkey   # only mark sent if no exception
+                        send_message(f"🚫 NIFTY ORDER BLOCKED\n{_filter_reason}")
+                        nifty_loop._filter_alerted = _fkey
                     except Exception as _e:
                         print(f"⚠️ Filter alert send failed: {_e}", flush=True)
-                        # _filter_alerted NOT set — will retry next iteration
                 time.sleep(30)
                 continue
 
@@ -3318,6 +3490,7 @@ def crude_loop():
     global last_status, last_weak_log_time
     global last_fetch_crude, cached_crude_15m, cached_crude_ht
     global crude_trade_active
+    global win_streak, loss_streak
 
     _crude_weekend_msg_sent = [False]
 
@@ -3355,11 +3528,10 @@ def crude_loop():
             # unless a trade wins, but no trades are placed = permanent deadlock).
             if loss_streak >= 3:
                 print("⚠️ Loss streak >= 3 — pausing CRUDE 15 min then resetting streak", flush=True)
-                send_message("⚠️ CRUDE: 3 consecutive losses — pausing 15 min then resuming")
+                send_message("❌ CRUDE: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)   # 15-minute cooldown
                 loss_streak = 0   # reset so trading can resume after cooldown
                 print("♻️ CRUDE loss streak reset — resuming trading", flush=True)
-                send_message("♻️ CRUDE: Cooldown done — resuming trading")
                 continue
 
             # Refresh data cache every 20 seconds
@@ -3390,15 +3562,6 @@ def crude_loop():
                     print(f"{'🟢' if signal=='CALL' else '🔴'} CARRY-OVER CRUDE {signal} — {bars_ago} bars ago @ {arrow_level:.2f}")
 
             if signal is None:
-                global _last_no_signal_alert_crude
-                if time.time() - _last_no_signal_alert_crude > NO_SIGNAL_ALERT_INTERVAL:
-                    trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
-                    send_message(
-                        f"⏸️ CRUDE: No HalfTrend arrow found\n"
-                        f"📊 Current trend: {trend_name} | Lookback: 120 bars\n"
-                        f"⏳ Waiting for arrow signal..."
-                    )
-                    _last_no_signal_alert_crude = time.time()
                 time.sleep(10)
                 continue
 
@@ -3413,22 +3576,13 @@ def crude_loop():
                     time.sleep(10)
                     continue
 
-            # ── Telegram: CRUDE signal detected (only sent when order will proceed) ─
+            # ── Signal detected — log only, no Telegram ──────────────────────
             if signal is not None and arrow_idx is not None:
                 _arrow_bar_c = ht_df.iloc[arrow_idx]
                 _level_c = _arrow_bar_c["atrLow"] if signal == "CALL" else _arrow_bar_c["atrHigh"]
                 _bars_ago_c = len(ht_df) - arrow_idx - 2
-                _freshness_c = "🆕 FRESH arrow" if is_fresh else f"♻️ CARRY-OVER ({_bars_ago_c * 15} min ago)"
-                _sig_key_c = f"CRUDE_sig_{signal}_{datetime.now(IST).strftime('%Y-%m-%d')}"
-                if is_fresh or not getattr(crude_loop, "_sig_alerted", None) == _sig_key_c:
-                    send_message(
-                        f"🔔 CRUDE SIGNAL DETECTED\n"
-                        f"{'🟢 CALL (BUY CE)' if signal == 'CALL' else '🔴 PUT (BUY PE)'}\n"
-                        f"📊 Type: {_freshness_c}\n"
-                        f"🎯 Arrow level: ₹{_level_c:.2f}\n"
-                        f"📉 HT line: {_arrow_bar_c['ht']:.2f}"
-                    )
-                    crude_loop._sig_alerted = _sig_key_c
+                _freshness_c = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago_c * 15} min ago)"
+                print(f"🔔 CRUDE {signal} {_freshness_c} @ ₹{_level_c:.2f}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
             # 📊  STRATEGY FILTERS  (ADX / MTF / VIX)
@@ -3440,16 +3594,11 @@ def crude_loop():
 
             if not _filter_ok:
                 print(f"🚫 CRUDE entry blocked — {_filter_reason}", flush=True)
-                _fkey = f"CRUDE_filter_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
+                _fkey = f"CRUDE_f_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
                 if getattr(crude_loop, "_filter_alerted", None) != _fkey:
                     try:
-                        send_message(
-                            f"🚫 CRUDE ORDER BLOCKED\n"
-                            f"Signal: {signal}\n"
-                            f"{_filter_reason}\n"
-                            f"Will retry on next candle"
-                        )
-                        crude_loop._filter_alerted = _fkey   # only mark sent if no exception
+                        send_message(f"🚫 CRUDE ORDER BLOCKED\n{_filter_reason}")
+                        crude_loop._filter_alerted = _fkey
                     except Exception as _e:
                         print(f"⚠️ Filter alert send failed: {_e}", flush=True)
                 time.sleep(30)
@@ -3766,7 +3915,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     Logic:
       1. Fetch live available balance from Kite.
       2. Risk amount = balance * RISK_PCT (5% by default).
-      3. SL is assumed at 20% of option premium (i.e. exit if premium drops 20%).
+      3. SL is assumed at 25% of option premium (i.e. exit if premium drops 25%).
       4. risk_per_lot = SL_points * lot_size
       5. lots = floor(risk_amount / risk_per_lot)
       6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
@@ -3780,7 +3929,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
 
     # ── Risk parameters ──────────────────────────────────────────────────
     RISK_PCT         = 0.05    # 5% of balance risked per trade
-    SL_PCT           = 0.20    # assume SL at 20% drop in option premium
+    SL_PCT           = 0.25    # assume SL at 25% drop in option premium
     MAX_CAPITAL_PCT  = 0.70    # never deploy more than 40% of balance in one trade
     MAX_LOTS_NIFTY   = 5       # hard ceiling — adjust to your comfort
     MAX_LOTS_CRUDE   = 3
@@ -5033,7 +5182,7 @@ if __name__ == "__main__":
             f"   Hours  : 3:30 PM – 11 PM IST\n"
             f"   Signal : HalfTrend 15-min (lookback 120 bars)\n"
             f"\n"
-            f"⚙️ SL     : 20% of option premium\n"
+            f"⚙️ SL     : 25% of option premium\n"
             f"⚙️ Trail  : ATR-based adaptive trailing\n"
             f"⚙️ Flip   : Immediate exit + re-entry on arrow reversal\n"
             f"📅 Reports: Nifty@3:31PM | Crude@11:31PM | Combined@11:32PM"
@@ -5071,6 +5220,9 @@ if __name__ == "__main__":
                 _refresh_error = [None]
                 _orig_except = None
 
+                # Update IP whitelist before login (Railway may assign new IP after restart)
+                threading.Thread(target=update_kite_ip_whitelist, daemon=True).start()
+
                 # Patch zerodha_auto_login to capture the error message
                 try:
                     new_token = zerodha_auto_login()
@@ -5082,12 +5234,11 @@ if __name__ == "__main__":
                 _access_token_refreshed_today[0] = True
                 ist_str = now.strftime("%d %b %Y %H:%M IST")
                 if new_token:
+                    print(f"✅ Kite token refreshed at {ist_str}", flush=True)
                     try:
                         send_message(
                             f"✅ KITE TOKEN REFRESHED\n"
-                            f"{'='*28}\n"
-                            f"🕐 Time  : {ist_str}\n"
-                            f"🔑 Token : {new_token[:8]}...{new_token[-4:]}\n"
+                            f"🕐 {ist_str}\n"
                             f"📈 Bot ready for market open at 9:15 AM"
                         )
                     except Exception:
@@ -5123,4 +5274,8 @@ if __name__ == "__main__":
     # 🔁 KEEP ALIVE
     # -----------------------------
     while True:
-        time.sleep(60) 
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()

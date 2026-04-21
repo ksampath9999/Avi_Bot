@@ -344,7 +344,7 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # Toggle each filter on/off with True/False.
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
+USE_ADX_FILTER     = False   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
 ADX_MIN_VALUE      = 22     # Kite API data gives ~3 pts lower ADX than TradingView
                             # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
                             # only true choppy/sideways (TV ADX would be ~15 or below)
@@ -366,6 +366,18 @@ VIX_MIN            = 11     # (used only when USE_VIX_FILTER = True)
 VIX_MAX            = 22     # (used only when USE_VIX_FILTER = True)
 
 USE_SESSION_FILTER = False  # Session dead-zone filter (off)
+
+# ── Daily Trade Limits ────────────────────────────────────────────────────────
+# Hard cap on number of trades per instrument per day.
+# Once the limit is reached the loop waits until next market day.
+MAX_NIFTY_TRADES_PER_DAY  = 4   # NIFTY: max 4 trades/day
+MAX_CRUDE_TRADES_PER_DAY  = 3   # CRUDE: max 3 trades/day
+
+# ── Stop Loss ─────────────────────────────────────────────────────────────────
+# Set False to disable ALL SL logic (trailing + hard SL).
+# Profit-lock logic is NOT affected — it always stays active.
+# Re-enable by setting back to True.
+USE_STOP_LOSS = False           # ⛔ SL disabled — profit lock only
 
 # ── ML Signal Filter ──────────────────────────────────────────────────────────
 # ml_signal_server.py must be running (separate Railway/Render service).
@@ -2455,67 +2467,68 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🛑 STOP LOSS EXITS  (checked in priority order every 1.5 s)
             # ================================================================
 
-            # ── 1. Trailing SL exit — Two-tier spike protection ──────────────
-            # Tier 1 (25%): first touch → don't exit, expand SL to 45% (spike buffer)
-            # Tier 2 (45%): confirmed move → exit immediately
-            # This prevents single-candle wick/spike from stopping out the trade.
-            trailing_hit = (signal == "CALL" and ltp <= sl) or \
-                           (signal == "PUT"  and ltp >= sl)
+            # ── 1 & 2. Stop Loss (controlled by USE_STOP_LOSS flag) ──────────
+            # Set USE_STOP_LOSS = True to re-enable at any time.
+            # Profit-lock above is always active regardless of this flag.
+            if USE_STOP_LOSS:
+                # ── 1. Trailing SL — Two-tier spike protection ───────────────
+                # Tier 1 (25%): first touch → expand to 45% (don't exit)
+                # Tier 2 (45%): confirmed move → exit immediately
+                trailing_hit = (signal == "CALL" and ltp <= sl) or \
+                               (signal == "PUT"  and ltp >= sl)
 
-            if trailing_hit and not exit_done:
-                if not sl_expanded:
-                    # ── Tier 1 touched: expand SL to 45%, do NOT exit ────────
-                    sl_expanded = True
-                    risk = entry * SL_TIER2   # widen risk to 45%
-                    if signal == "CALL":
-                        sl = entry - risk     # new SL = entry - 45%
+                if trailing_hit and not exit_done:
+                    if not sl_expanded:
+                        # Tier 1 touched: widen SL to 45%, stay in trade
+                        sl_expanded = True
+                        risk = entry * SL_TIER2
+                        if signal == "CALL":
+                            sl = entry - risk
+                        else:
+                            sl = entry + risk
+                        print(f"⚠️ SL TIER-1 TOUCHED (25%) — expanding to 45% | new SL=₹{sl:.1f}  LTP=₹{ltp:.1f}", flush=True)
+                        send_message(
+                            f"⚠️ SL SPIKE BUFFER — {instrument} {signal}\n"
+                            f"📌 {symbol}\n"
+                            f"📉 LTP: ₹{ltp:.1f} touched 25% SL\n"
+                            f"🛡️ Expanding SL to 45% → ₹{sl:.1f}\n"
+                            f"💔 P&L so far: ₹{current_pnl:.0f}"
+                        )
+                        # Do NOT break — continue monitoring at 45% SL
                     else:
-                        sl = entry + risk     # new SL = entry + 45%
-                    print(f"⚠️ SL TIER-1 TOUCHED (25%) — expanding to 45% | new SL=₹{sl:.1f}  LTP=₹{ltp:.1f}", flush=True)
+                        # Tier 2 (45%) confirmed: exit now
+                        last_exit_reason = "TRAILING_SL"
+                        print(f"🛑 TRAILING SL HIT (45%) | LTP={ltp:.1f}  SL={sl:.1f}", flush=True)
+                        send_message(
+                            f"🛑 TRAILING SL HIT — EXITING\n"
+                            f"📌 {instrument} {signal} → {symbol}\n"
+                            f"📉 LTP: ₹{ltp:.1f}  |  SL (45%): ₹{sl:.1f}\n"
+                            f"💔 P&L: ₹{current_pnl:.0f}\n"
+                            f"📊 Entry: ₹{entry:.1f}  |  Peak: ₹{peak:.1f}"
+                        )
+                        exit_position(symbol, remaining_qty, exchange)
+                        exit_done = True
+                        pnl = current_pnl
+                        break
+
+                # ── 2. Hard SL safety net ────────────────────────────────────
+                # Fires if trailing SL misses (e.g. gap-down open).
+                max_loss = risk * remaining_qty
+                if current_pnl <= -max_loss and not exit_done:
+                    last_exit_reason = "HARD_SL"
+                    sl_pct_lbl = "45%" if sl_expanded else "25%"
+                    print(f"🛑 HARD SL HIT ({sl_pct_lbl}) | Loss: ₹{current_pnl:.0f} / Limit: ₹{-max_loss:.0f}", flush=True)
                     send_message(
-                        f"⚠️ SL SPIKE BUFFER — {instrument} {signal}\n"
-                        f"📌 {symbol}\n"
-                        f"📉 LTP: ₹{ltp:.1f} touched 25% SL\n"
-                        f"🛡️ Expanding SL to 45% → ₹{sl:.1f}\n"
-                        f"💔 P&L so far: ₹{current_pnl:.0f}"
-                    )
-                    # Do NOT break — continue monitoring at new 45% SL
-                else:
-                    # ── Tier 2 (45%) hit: confirmed loss — exit now ──────────
-                    last_exit_reason = "TRAILING_SL"
-                    print(f"🛑 TRAILING SL HIT (45%) | LTP={ltp:.1f}  SL={sl:.1f}", flush=True)
-                    send_message(
-                        f"🛑 TRAILING SL HIT — EXITING\n"
+                        f"🛑 HARD STOP LOSS HIT — EXITING\n"
                         f"📌 {instrument} {signal} → {symbol}\n"
-                        f"📉 LTP: ₹{ltp:.1f}  |  SL (45%): ₹{sl:.1f}\n"
-                        f"💔 P&L: ₹{current_pnl:.0f}\n"
-                        f"📊 Entry: ₹{entry:.1f}  |  Peak: ₹{peak:.1f}"
+                        f"💔 Loss: ₹{current_pnl:.0f}  |  SL limit: ₹{-max_loss:.0f}\n"
+                        f"📉 Entry: ₹{entry:.1f}  |  Exit LTP: ₹{ltp:.1f}\n"
+                        f"📊 Hard SL = {sl_pct_lbl} of option premium × qty"
                     )
                     exit_position(symbol, remaining_qty, exchange)
                     exit_done = True
                     pnl = current_pnl
                     break
-
-            # ── 2. Hard SL (absolute % of option premium) ────────────────────
-            # Safety net in case trailing SL fails to fire (e.g. gap-down open).
-            # Respects tier expansion: 25% normally, 45% if already expanded.
-            max_loss = risk * remaining_qty   # risk is entry*0.25 or entry*0.45
-
-            if current_pnl <= -max_loss and not exit_done:
-                last_exit_reason = "HARD_SL"
-                sl_pct_lbl = "45%" if sl_expanded else "25%"
-                print(f"🛑 HARD SL HIT ({sl_pct_lbl}) | Loss: ₹{current_pnl:.0f} / Limit: ₹{-max_loss:.0f}", flush=True)
-                send_message(
-                    f"🛑 HARD STOP LOSS HIT — EXITING\n"
-                    f"📌 {instrument} {signal} → {symbol}\n"
-                    f"💔 Loss: ₹{current_pnl:.0f}  |  SL limit: ₹{-max_loss:.0f}\n"
-                    f"📉 Entry: ₹{entry:.1f}  |  Exit LTP: ₹{ltp:.1f}\n"
-                    f"📊 Hard SL = {sl_pct_lbl} of option premium × qty"
-                )
-                exit_position(symbol, remaining_qty, exchange)
-                exit_done = True
-                pnl = current_pnl
-                break
 
             # 🚀 Smart time exit (only if NO momentum)
             #if time.time() - entry_time > 900:
@@ -3298,6 +3311,16 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
+            # ── Daily trade limit check ───────────────────────────────────────
+            if nifty_trade_count >= MAX_NIFTY_TRADES_PER_DAY:
+                _msg = f"🔒 NIFTY daily limit reached ({nifty_trade_count}/{MAX_NIFTY_TRADES_PER_DAY} trades) — no more trades today"
+                if last_status != "NIFTY_LIMIT":
+                    print(_msg, flush=True)
+                    send_message(f"🔒 NIFTY: {MAX_NIFTY_TRADES_PER_DAY} trades done for today. Resuming tomorrow.")
+                    last_status = "NIFTY_LIMIT"
+                time.sleep(60)
+                continue
+
             # ── Signal detected — log only, no Telegram ──────────────────────
             if signal is not None and arrow_idx is not None:
                 arrow_bar = ht_df.iloc[arrow_idx]
@@ -3588,6 +3611,16 @@ def crude_loop():
                 if getattr(crude_loop, "_carryover_done", None) == carryover_key:
                     time.sleep(10)
                     continue
+
+            # ── Daily trade limit check ───────────────────────────────────────
+            if crude_trade_count >= MAX_CRUDE_TRADES_PER_DAY:
+                _msg = f"🔒 CRUDE daily limit reached ({crude_trade_count}/{MAX_CRUDE_TRADES_PER_DAY} trades) — no more trades today"
+                if last_status != "CRUDE_LIMIT":
+                    print(_msg, flush=True)
+                    send_message(f"🔒 CRUDE: {MAX_CRUDE_TRADES_PER_DAY} trades done for today. Resuming tomorrow.")
+                    last_status = "CRUDE_LIMIT"
+                time.sleep(60)
+                continue
 
             # ── Signal detected — log only, no Telegram ──────────────────────
             if signal is not None and arrow_idx is not None:

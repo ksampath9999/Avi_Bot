@@ -345,7 +345,8 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
 USE_ADX_FILTER     = True   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
-ADX_MIN_VALUE      = 22     # Below 22 = choppy/ranging market = skip entry
+ADX_MIN_VALUE      = 15     # Below 15 = choppy/ranging market = skip entry
+                            # (TradingView ADX on slow grinds = 15-20; 22 was too strict)
 
 # ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
 # Both HalfTrend AND 9/15 EMA must agree before an order is placed.
@@ -663,14 +664,15 @@ def ADX(df, period=14):
         np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
         index=df.index)
 
-    # Wilder smoothing (RMA = EWM with alpha=1/period)
+    # Wilder smoothing — matches TradingView's rma() exactly:
+    # rma seeds from bar 1 (no min_periods gap), alpha = 1/period
     alpha  = 1.0 / period
-    atr_s  = tr.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
-    pdi    = 100 * plus_dm.ewm(alpha=alpha,  min_periods=period, adjust=False).mean() / atr_s
-    mdi    = 100 * minus_dm.ewm(alpha=alpha, min_periods=period, adjust=False).mean() / atr_s
+    atr_s  = tr.ewm(alpha=alpha, adjust=False).mean()
+    pdi    = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_s
+    mdi    = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_s
 
     dx     = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    adx    = dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    adx    = dx.ewm(alpha=alpha, adjust=False).mean()
     return adx
 
 

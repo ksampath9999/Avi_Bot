@@ -253,6 +253,84 @@ try:
 except Exception as e:
     print("❌ IP fetch failed:", e)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🌐 AUTO IP WHITELIST — updates Kite developer app IP on every deploy
+#
+# Required Railway env vars:
+#   KITE_DEV_USER_ID  — your Zerodha user ID (same as trading login)
+#   KITE_DEV_PASSWORD — your Zerodha password
+#   KITE_APP_ID       — numeric app ID from developers.kite.trade URL
+#                       e.g. https://developers.kite.trade/apps/12345 → 12345
+# ─────────────────────────────────────────────────────────────────────────────
+def update_kite_ip_whitelist():
+    """
+    Fetch Railway's current public IP and whitelist it in the Kite Connect
+    developer app settings. Safe to call on every startup — if IP hasn't
+    changed, Kite simply accepts the same value.
+    """
+    dev_user = os.environ.get("KITE_DEV_USER_ID")
+    dev_pass = os.environ.get("KITE_DEV_PASSWORD")
+    app_id   = os.environ.get("KITE_APP_ID")
+
+    if not all([dev_user, dev_pass, app_id]):
+        print("⚠️ IP whitelist auto-update skipped — set KITE_DEV_USER_ID / "
+              "KITE_DEV_PASSWORD / KITE_APP_ID in Railway env vars", flush=True)
+        return False
+
+    try:
+        # ── Step 1: Get current Railway public IP ─────────────────────────────
+        current_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        print(f"🌐 Railway IP for whitelist: {current_ip}", flush=True)
+
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+
+        # ── Step 2: Login to Kite developer portal ───────────────────────────
+        r1 = sess.post(
+            "https://developers.kite.trade/api/users/signin",
+            json={"user_id": dev_user, "password": dev_pass},
+            timeout=10
+        )
+        d1 = r1.json()
+        if d1.get("status") != "success":
+            print(f"❌ Kite dev portal login failed: {d1.get('message')}", flush=True)
+            return False
+
+        print(f"✅ Kite dev portal logged in", flush=True)
+
+        # ── Step 3: Update IP whitelist for the app ──────────────────────────
+        r2 = sess.put(
+            f"https://developers.kite.trade/api/apps/{app_id}",
+            json={"ip_whitelist": [current_ip]},
+            timeout=10
+        )
+        d2 = r2.json()
+        if d2.get("status") == "success":
+            print(f"✅ Kite IP whitelist updated → {current_ip}", flush=True)
+            try:
+                send_message(f"🌐 Railway IP auto-whitelisted\n{current_ip}")
+            except Exception:
+                pass
+            return True
+        else:
+            print(f"❌ IP whitelist update failed: {d2}", flush=True)
+            try:
+                send_message(f"❌ IP whitelist update failed\n{d2.get('message', str(d2))}")
+            except Exception:
+                pass
+            return False
+
+    except Exception as e:
+        import traceback
+        print(f"❌ IP whitelist error: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return False
+
+
+# Run at startup — updates IP immediately when Railway redeploys
+threading.Thread(target=update_kite_ip_whitelist, daemon=True).start()
+
 SIGNAL_URL = "https://avi-bot-1.onrender.com/signal"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5094,6 +5172,9 @@ if __name__ == "__main__":
                 print("🔑 Daily access token refresh starting (8:00 AM)...", flush=True)
                 _refresh_error = [None]
                 _orig_except = None
+
+                # Update IP whitelist before login (Railway may assign new IP after restart)
+                threading.Thread(target=update_kite_ip_whitelist, daemon=True).start()
 
                 # Patch zerodha_auto_login to capture the error message
                 try:

@@ -3245,20 +3245,6 @@ def nifty_loop():
             current_trend = int(ht_df.iloc[-2]["trend"])
             print("🧠 Current Trend:", "CALL" if current_trend == 0 else "PUT")
 
-            # ── DEBUG: last 6 bars of HalfTrend with real timestamps ─────────
-            # Print actual candle times from raw data
-            _raw_tail = cached_nifty_df.tail(7)
-            print(f"   📊 Raw data last 7 candle times:", flush=True)
-            for _ti in _raw_tail.index:
-                print(f"      {_ti}", flush=True)
-            print(f"   📊 ht_df length={len(ht_df)}  iloc[-2] index={ht_df.index[-2]}  iloc[-1] index={ht_df.index[-1]}", flush=True)
-            # HalfTrend last 6 bars
-            for _off in range(7, 1, -1):
-                _row = ht_df.iloc[-_off]
-                # Get matching raw candle time
-                _raw_idx = cached_nifty_df.index[-_off] if len(cached_nifty_df) >= _off else "?"
-                _arr = "🟢BUY" if _row["buy"] else ("🔴SELL" if _row["sell"] else "·")
-                print(f"   {_raw_idx}  trend={'CALL' if _row['trend']==0 else 'PUT'}  {_arr}  ht={_row['ht']:.2f}  close={cached_nifty_df['close'].iloc[-_off]:.1f}", flush=True)
 
             # ── Signal Detection (fresh arrow + carry-over) ───────────────────
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)

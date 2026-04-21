@@ -1744,13 +1744,13 @@ def find_option(signal, instrument):
 
     if instrument == "CRUDE":
         if balance <= 5000:
-            strike_shift = 5
+            strike_shift = 7
             max_price = 50
         elif balance <= 10000:
-            strike_shift = 3
+            strike_shift = 5
             max_price = 80
         elif balance <= 20000:
-            strike_shift = 2
+            strike_shift = 3
             max_price = 100
         else:
             strike_shift = 1
@@ -5024,38 +5024,79 @@ def send_daily_report():
         send_message(f"❌ Daily report error: {e}")
 
 
-def send_nifty_eod_report():
-    """Sent at 3:31 PM after Nifty session ends (before Crude evening session)."""
-    global nifty_daily_pnl, nifty_trade_count, nifty_daily_wins, nifty_daily_losses
+def _read_today_csv(instrument):
+    """
+    Read today's closed trades for the given instrument from trade_log.csv.
+    Returns (pnl, wins, losses, trade_count).
+    Uses CSV as source of truth — survives Railway restarts mid-day.
+    """
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    try:
+        if not os.path.exists(TRADE_LOG_FILE):
+            return 0, 0, 0, 0
+        df = pd.read_csv(TRADE_LOG_FILE)
+        if df.empty or "time" not in df.columns:
+            return 0, 0, 0, 0
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df[df["time"].dt.strftime("%Y-%m-%d") == today_str]
+        if "instrument" in df.columns:
+            df = df[df["instrument"].str.upper() == instrument.upper()]
+        if df.empty:
+            return 0, 0, 0, 0
+        pnl    = float(df["pnl"].sum())
+        wins   = int((df["pnl"] > 0).sum())
+        losses = int((df["pnl"] <= 0).sum())
+        count  = len(df)
+        return pnl, wins, losses, count
+    except Exception as e:
+        print(f"⚠️ _read_today_csv({instrument}): {e}", flush=True)
+        return 0, 0, 0, 0
 
-    total = nifty_daily_wins + nifty_daily_losses
-    wr = (nifty_daily_wins / total * 100) if total > 0 else 0
+
+def send_nifty_eod_report():
+    """Sent at 3:31 PM. Reads from CSV so restarts don't wipe the numbers."""
+    csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv("NIFTY")
+
+    # Merge CSV data with in-memory counters — take whichever is larger
+    # (covers edge case where a trade closed after CSV flush but before report)
+    pnl    = max(csv_pnl,    nifty_daily_pnl,    key=abs) if csv_count or nifty_trade_count else 0
+    wins   = max(csv_wins,   nifty_daily_wins)
+    losses = max(csv_losses, nifty_daily_losses)
+    count  = max(csv_count,  nifty_trade_count)
+
+    total = wins + losses
+    wr = (wins / total * 100) if total > 0 else 0
 
     send_message(
         f"🔔 NIFTY SESSION CLOSED\n"
         f"{'='*28}\n"
-        f"💰 Net P&L    : ₹{nifty_daily_pnl:,.0f}\n"
-        f"📈 Trades     : {total}  (✅ {nifty_daily_wins} wins  ❌ {nifty_daily_losses} losses)\n"
+        f"💰 Net P&L    : ₹{pnl:,.0f}\n"
+        f"📈 Trades     : {total}  (✅ {wins} wins  ❌ {losses} losses)\n"
         f"🎯 Win Rate   : {wr:.1f}%\n"
-        f"📊 Trade count: {nifty_trade_count}\n"
+        f"📊 Trade count: {count}\n"
         f"⏰ Nifty session ended 3:30 PM IST"
     )
 
 
 def send_crude_eod_report():
-    """Sent after Crude MCX session (~11 PM)."""
-    global crude_daily_pnl, crude_trade_count, crude_daily_wins, crude_daily_losses
+    """Sent at 11:31 PM. Reads from CSV so restarts don't wipe the numbers."""
+    csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv("CRUDE")
 
-    total = crude_daily_wins + crude_daily_losses
-    wr = (crude_daily_wins / total * 100) if total > 0 else 0
+    pnl    = max(csv_pnl,    crude_daily_pnl,    key=abs) if csv_count or crude_trade_count else 0
+    wins   = max(csv_wins,   crude_daily_wins)
+    losses = max(csv_losses, crude_daily_losses)
+    count  = max(csv_count,  crude_trade_count)
+
+    total = wins + losses
+    wr = (wins / total * 100) if total > 0 else 0
 
     send_message(
         f"🔔 CRUDE OIL SESSION CLOSED\n"
         f"{'='*28}\n"
-        f"💰 Net P&L    : ₹{crude_daily_pnl:,.0f}\n"
-        f"📈 Trades     : {total}  (✅ {crude_daily_wins} wins  ❌ {crude_daily_losses} losses)\n"
+        f"💰 Net P&L    : ₹{pnl:,.0f}\n"
+        f"📈 Trades     : {total}  (✅ {wins} wins  ❌ {losses} losses)\n"
         f"🎯 Win Rate   : {wr:.1f}%\n"
-        f"📊 Trade count: {crude_trade_count}\n"
+        f"📊 Trade count: {count}\n"
         f"⏰ Crude session ended 11:30 PM IST"
     )
         

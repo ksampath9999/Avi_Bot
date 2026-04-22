@@ -1766,7 +1766,7 @@ def find_option(signal, instrument):
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
         if balance <= 5000:
-            strike_shift = 6
+            strike_shift = 7
             max_price = 50
         elif balance <= 10000:
             strike_shift = 5      # deep OTM — cheap premium
@@ -2229,19 +2229,20 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     risk = entry * SL_TIER1
     sl_expanded = False   # True once tier-1 fires and we widen to tier-2
 
-    if signal == "CALL":
-        sl = entry - risk
-        peak = entry
-    else:
-        sl = entry + risk
-        peak = entry
+    # Bot always BUYS options (CE or PE).
+    # P&L = option_price_now - entry_price (same formula for both CE and PE).
+    # SL fires when option premium drops below entry - risk (same for both).
+    sl   = entry - risk   # exit if option premium drops by risk %
+    peak = entry          # track highest option premium reached
 
+    # sl and spike_sl are always below entry (buying options → loss = premium drop)
+    _spike_sl = entry * (1 - SL_TIER2)   # entry - 45%
     send_message(
         f"🚀 NEW TRADE ENTERED\n"
         f"📌 {instrument} {signal} → {symbol}\n"
         f"💰 Entry: ₹{entry:.1f}  |  Qty: {actual_qty}\n"
-        f"🛑 Initial SL: ₹{sl:.1f}  (25% of premium)\n"
-        f"🛡️ Spike buffer SL: ₹{(entry*(1-SL_TIER2) if signal=='CALL' else entry*(1+SL_TIER2)):.1f}  (45% if wick hits 25%)\n"
+        f"🛑 Initial SL : ₹{sl:.1f}  (entry − 25%)\n"
+        f"🛡️ Spike SL   : ₹{_spike_sl:.1f}  (entry − 45%, only if 25% wicked)\n"
         f"📊 Deployed: ₹{entry * actual_qty:,.0f}"
     )
 
@@ -2306,13 +2307,10 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🔥 ULTRA PRO EXIT SYSTEM
             # ===============================
 
-            # 📊 PROFIT
-            if signal == "CALL":
-                profit = ltp - entry
-                peak = max(peak, ltp)
-            else:
-                profit = entry - ltp
-                peak = min(peak, ltp)
+            # 📊 PROFIT — buying options: P&L = (current premium - entry premium)
+            # Same formula for both CE and PE — the bot always BUYS, never sells.
+            profit = ltp - entry
+            peak   = max(peak, ltp)   # track highest premium reached (for profit lock)
 
             current_pnl = profit * remaining_qty
 
@@ -2393,26 +2391,25 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # ===============================
             # 🚀 ATR TRAILING (ADAPTIVE)
             # ===============================
+            # IMPORTANT: freeze trailing when sl_expanded=True.
+            # After tier-1 SL fires we widen to 45% (entry - 45%).
+            # Without this guard, the ATR trail immediately recalculates
+            # sl from peak (~entry level) and overwrites the 45% expansion,
+            # causing a tier-2 exit 1.5 s later instead of giving real room.
             trail_multiplier = 1.2
             old_sl = sl
 
-            if signal == "CALL":
+            if not sl_expanded:
+                # Normal trailing: SL rises as option premium rises
                 sl = max(sl, peak - (atr_value * trail_multiplier))
-            else:
-                sl = min(sl, peak + (atr_value * trail_multiplier))
-
-            # Trailing SL update logged to console only
-            if abs(sl - old_sl) > entry * 0.005:
-                print(f"📈 {instrument} trailing SL: ₹{old_sl:.1f} → ₹{sl:.1f}  P&L: ₹{current_pnl:.0f}", flush=True)
+                if abs(sl - old_sl) > entry * 0.005:
+                    print(f"📈 {instrument} trailing SL: ₹{old_sl:.1f} → ₹{sl:.1f}  P&L: ₹{current_pnl:.0f}", flush=True)
 
             # ===============================
             # 🔥 STRONG TREND MODE (LET PROFITS RUN)
             # ===============================
-            if current_pnl >= 3000:
-                if signal == "CALL":
-                    sl = max(sl, peak - (atr_value * 0.8))
-                else:
-                    sl = min(sl, peak + (atr_value * 0.8))
+            if current_pnl >= 3000 and not sl_expanded:
+                sl = max(sl, peak - (atr_value * 0.8))
 
             # 🔥 HALF TREND EXIT — Pine-accurate: exit when opposite arrow fires on closed candle
             # NOTE: nifty_loop / crude_loop is the PRIMARY flip handler (runs every 10s).
@@ -2486,18 +2483,15 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 # ── 1. Trailing SL — Two-tier spike protection ───────────────
                 # Tier 1 (25%): first touch → expand to 45% (don't exit)
                 # Tier 2 (45%): confirmed move → exit immediately
-                trailing_hit = (signal == "CALL" and ltp <= sl) or \
-                               (signal == "PUT"  and ltp >= sl)
+                # Always buying options → SL fires when premium drops below sl level
+                trailing_hit = ltp <= sl
 
                 if trailing_hit and not exit_done:
                     if not sl_expanded:
                         # Tier 1 touched: widen SL to 45%, stay in trade
                         sl_expanded = True
                         risk = entry * SL_TIER2
-                        if signal == "CALL":
-                            sl = entry - risk
-                        else:
-                            sl = entry + risk
+                        sl = entry - risk   # new SL = entry - 45%
                         print(f"⚠️ SL TIER-1 TOUCHED (25%) — expanding to 45% | new SL=₹{sl:.1f}  LTP=₹{ltp:.1f}", flush=True)
                         send_message(
                             f"⚠️ SL SPIKE BUFFER — {instrument} {signal}\n"

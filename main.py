@@ -374,7 +374,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
 ENABLE_SENSEX     = False    # ✅ SENSEX trading active
-ENABLE_CRUDE      = True    # ✅ CRUDE trading active
+ENABLE_CRUDE      = False    # ✅ CRUDE trading active
 
 # ── Daily Trade Limits ────────────────────────────────────────────────────────
 MAX_NIFTY_TRADES_PER_DAY      = 4   # NIFTY:     max 4 trades/day

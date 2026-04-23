@@ -373,14 +373,34 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Flip back to True to resume immediately on next cycle.
 ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
-ENABLE_SENSEX     = False    # ✅ SENSEX trading active
-ENABLE_CRUDE      = False    # ✅ CRUDE trading active
+ENABLE_SENSEX     = False   # ✅ SENSEX trading active
+ENABLE_CRUDE      = False   # ✅ CRUDE trading active
+ENABLE_SWING      = False    # ✅ Swing stock trading active
 
 # ── Daily Trade Limits ────────────────────────────────────────────────────────
 MAX_NIFTY_TRADES_PER_DAY      = 4   # NIFTY:     max 4 trades/day
 MAX_BANKNIFTY_TRADES_PER_DAY  = 4   # BANKNIFTY: max 4 trades/day
 MAX_SENSEX_TRADES_PER_DAY     = 4   # SENSEX:    max 4 trades/day
 MAX_CRUDE_TRADES_PER_DAY      = 3   # CRUDE:     max 3 trades/day
+
+# ── Swing Trade Settings ──────────────────────────────────────────────────────
+SWING_STOCKS_FILE        = "stocks.txt"  # one NSE symbol per line (e.g. RELIANCE)
+SWING_SL_PCT             = 0.05          # 5%  hard stop-loss below entry
+SWING_TARGET_PCT         = 0.10          # 10% profit target above entry
+SWING_CAPITAL_PER_STOCK  = 10000         # ₹10,000 deployed per stock position
+MAX_SWING_POSITIONS      = 5             # max concurrent open swing positions
+
+# ── Stock Options Settings ────────────────────────────────────────────────────
+# Signal: last closed daily candle HalfTrend → buy CE (CALL) or PE (PUT)
+# Execution: MIS (intraday), force-close at 3:15 PM
+ENABLE_STOCK_OPTIONS         = False
+STOCK_OPTIONS_FILE           = "stock_options.txt"  # one NSE symbol per line
+STOCK_OPTIONS_SL_PCT         = 0.30   # 30% SL on option premium
+STOCK_OPTIONS_TARGET_PCT     = 0.50   # 50% profit target on premium
+STOCK_OPTIONS_CAPITAL        = 5000   # ₹5,000 max deployed per stock option
+MAX_STOCK_OPTIONS_POSITIONS  = 5      # max concurrent stock option positions
+STOCK_OPT_FORCE_CLOSE_HOUR   = 15     # force-close hour (IST)
+STOCK_OPT_FORCE_CLOSE_MIN    = 15     # force-close minute (IST) → 3:15 PM
 
 # ── Stop Loss ─────────────────────────────────────────────────────────────────
 # Set False to disable ALL SL logic (trailing + hard SL).
@@ -571,6 +591,28 @@ cached_banknifty_ht  = None
 last_fetch_sensex    = 0
 cached_sensex_df     = None
 cached_sensex_ht     = None
+
+# ── Swing trade state ─────────────────────────────────────────────────────────
+# { symbol: {"entry": float, "qty": int, "sl": float, "target": float,
+#            "signal": "CALL", "entry_time": datetime} }
+swing_positions      = {}
+swing_positions_lock = threading.Lock()
+swing_daily_pnl      = 0
+swing_daily_wins     = 0
+swing_daily_losses   = 0
+swing_trade_count    = 0
+_swing_token_cache   = {}   # {symbol: token_int}
+_swing_data_cache    = {}   # {symbol: (timestamp, df)}  — 4-hour TTL
+
+# ── Stock Options state ───────────────────────────────────────────────────────
+# { underlying_symbol: {"option_symbol": str, "entry": float, "qty": int,
+#                        "sl": float, "target": float, "signal": str, "exchange": "NFO"} }
+stock_options_positions      = {}
+stock_options_positions_lock = threading.Lock()
+stock_options_daily_pnl      = 0
+stock_options_daily_wins     = 0
+stock_options_daily_losses   = 0
+stock_options_trade_count    = 0
 
 # Telegram alert rate-limiting (avoid flooding on same state)
 _last_no_signal_alert_nifty     = 0
@@ -3400,6 +3442,19 @@ def nifty_loop():
                 print("♻️ NIFTY loss streak reset — resuming trading", flush=True)
                 continue
 
+            # ══════════════════════════════════════════════════════════════
+            # 🔒  HARD SAME-DIRECTION GUARD
+            # If a NIFTY trade is already active (any signal type), skip
+            # entry completely. Only a full exit clears nifty_position.
+            # This prevents duplicate orders on carry-over after a fresh entry.
+            # ══════════════════════════════════════════════════════════════
+            with lock:
+                _trade_active  = nifty_trade_active or nifty_position["active"]
+                _active_signal = nifty_position.get("signal")
+            if _trade_active:
+                time.sleep(10)
+                continue
+
             # Refresh data cache every 30 seconds
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
                 cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 600)
@@ -3611,8 +3666,11 @@ def nifty_loop():
 
                 _kite_pos_cache.pop("NIFTY", None)   # invalidate position cache
 
+                # Always mark carryover_key so any future carry-over of the
+                # same direction today is blocked — even if this was a FRESH entry.
+                nifty_loop._carryover_done = carryover_key
+
                 if not is_fresh:
-                    nifty_loop._carryover_done = carryover_key
                     send_message(
                         f"♻️ NIFTY carry-over entry\n"
                         f"Signal: {signal} (trend continuing)\n"
@@ -3705,6 +3763,13 @@ def crude_loop():
                 time.sleep(900)   # 15-minute cooldown
                 loss_streak = 0   # reset so trading can resume after cooldown
                 print("♻️ CRUDE loss streak reset — resuming trading", flush=True)
+                continue
+
+            # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
+            with lock:
+                _trade_active = crude_trade_active or crude_position["active"]
+            if _trade_active:
+                time.sleep(10)
                 continue
 
             # Refresh data cache every 20 seconds
@@ -3930,8 +3995,10 @@ def crude_loop():
 
                     _kite_pos_cache.pop("CRUDE", None)   # invalidate position cache
 
+                    # Always mark carryover_done so carry-over re-entry is blocked
+                    crude_loop._carryover_done = carryover_key
+
                     if not is_fresh:
-                        crude_loop._carryover_done = carryover_key
                         send_message(
                             f"♻️ CRUDE carry-over entry\n"
                             f"Signal: {signal} (trend continuing)\n"
@@ -4027,6 +4094,13 @@ def banknifty_loop():
                 time.sleep(900)
                 loss_streak = 0
                 print("♻️ BANKNIFTY loss streak reset — resuming trading", flush=True)
+                continue
+
+            # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
+            with lock:
+                _trade_active = banknifty_trade_active or banknifty_position["active"]
+            if _trade_active:
+                time.sleep(10)
                 continue
 
             # Refresh data cache every 30 seconds
@@ -4231,8 +4305,10 @@ def banknifty_loop():
 
                 _kite_pos_cache.pop("BANKNIFTY", None)
 
+                # Always mark carryover_done so carry-over re-entry is blocked
+                banknifty_loop._carryover_done = carryover_key
+
                 if not is_fresh:
-                    banknifty_loop._carryover_done = carryover_key
                     send_message(
                         f"♻️ BANKNIFTY carry-over entry\n"
                         f"Signal: {signal} (trend continuing)\n"
@@ -4325,6 +4401,13 @@ def sensex_loop():
                 time.sleep(900)
                 loss_streak = 0
                 print("♻️ SENSEX loss streak reset — resuming trading", flush=True)
+                continue
+
+            # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
+            with lock:
+                _trade_active = sensex_trade_active or sensex_position["active"]
+            if _trade_active:
+                time.sleep(10)
                 continue
 
             # Refresh data cache every 30 seconds
@@ -4529,8 +4612,9 @@ def sensex_loop():
 
                 _kite_pos_cache.pop("SENSEX", None)
 
+                # Always mark carryover_done — blocks carry-over re-entry even after fresh entry
+                sensex_loop._carryover_done = carryover_key
                 if not is_fresh:
-                    sensex_loop._carryover_done = carryover_key
                     send_message(
                         f"♻️ SENSEX carry-over entry\n"
                         f"Signal: {signal} (trend continuing)\n"
@@ -4957,6 +5041,8 @@ def reset_daily_pnl():
         global crude_daily_wins, crude_daily_losses
         global _last_no_signal_alert_nifty, _last_no_signal_alert_banknifty
         global _last_no_signal_alert_sensex, _last_no_signal_alert_crude
+        # NOTE: swing_daily_pnl is NOT reset here — swing trades carry across days.
+        # It resets only when we explicitly call swing reset (end of month / manual).
 
         nifty_daily_pnl = 0
         banknifty_daily_pnl = 0
@@ -5838,6 +5924,1077 @@ def send_crude_eod_report():
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📈  SWING TRADE MODULE  — NSE Equity CNC, Daily HalfTrend
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_swing_stocks():
+    """
+    Read stock symbols from stocks.txt.
+    Format: one NSE symbol per line, e.g.:
+        RELIANCE
+        TCS
+        # commented lines are ignored
+    Returns a list of uppercase symbols.
+    """
+    if not os.path.exists(SWING_STOCKS_FILE):
+        print(f"⚠️ {SWING_STOCKS_FILE} not found — create it with one NSE symbol per line")
+        return []
+    with open(SWING_STOCKS_FILE) as f:
+        stocks = [
+            line.strip().upper()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
+    return stocks
+
+
+def get_stock_token(symbol):
+    """Return the NSE instrument token for an equity symbol (cached)."""
+    global _swing_token_cache
+    if symbol in _swing_token_cache:
+        return _swing_token_cache[symbol]
+    try:
+        instruments = kite.instruments("NSE")
+        for inst in instruments:
+            if inst["tradingsymbol"] == symbol and inst["instrument_type"] == "EQ":
+                _swing_token_cache[symbol] = inst["instrument_token"]
+                return inst["instrument_token"]
+        print(f"⚠️ Token not found for {symbol}")
+    except Exception as e:
+        print(f"❌ get_stock_token({symbol}): {e}")
+    return None
+
+
+def get_swing_daily_data(symbol, token):
+    """
+    Fetch 200 daily candles for a stock.
+    Cached for 4 hours so we don't hammer the Kite API on every loop tick.
+    Returns a DataFrame or None.
+    """
+    global _swing_data_cache
+    now_ts = time.time()
+    if symbol in _swing_data_cache:
+        cached_ts, cached_df = _swing_data_cache[symbol]
+        if now_ts - cached_ts < 14400:   # 4-hour TTL
+            return cached_df
+    try:
+        to_date   = datetime.now(IST).replace(tzinfo=None)
+        from_date = to_date - timedelta(days=300)   # 300 days → ~200 trading days
+        data = kite.historical_data(token, from_date, to_date, "day")
+        if not data:
+            return None
+        df = pd.DataFrame(data)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.rename(columns={"date": "time"})
+        df = df.sort_values("time").reset_index(drop=True)
+        _swing_data_cache[symbol] = (now_ts, df)
+        return df
+    except Exception as e:
+        print(f"❌ get_swing_daily_data({symbol}): {e}")
+        return None
+
+
+def place_swing_buy_order(symbol, qty):
+    """
+    Place a CNC BUY order on NSE for swing entry.
+    Returns filled price or None.
+    """
+    try:
+        ltp = safe_ltp(f"NSE:{symbol}")
+        if ltp is None or ltp <= 0:
+            print(f"❌ swing buy: invalid LTP for {symbol}")
+            return None
+
+        price = round(ltp * 1.002, 2)   # 0.2% above LTP for fast fill
+
+        # Balance check
+        balance = get_balance("NIFTY")   # equity segment
+        total_cost = price * qty
+        if balance < total_cost * 1.02:
+            msg = f"🚫 Swing: Insufficient balance for {symbol}\nNeed ₹{total_cost:,.0f}, have ₹{balance:,.0f}"
+            print(msg)
+            send_message(msg)
+            return None
+
+        order_id = kite.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol=symbol,
+            transaction_type="BUY",
+            quantity=qty,
+            order_type="LIMIT",
+            price=price,
+            product="CNC"
+        )
+        print(f"📥 Swing BUY placed: {symbol}  qty={qty}  price={price}  order={order_id}")
+
+        # Wait for fill (up to 15s, 5 attempts)
+        filled_price = None
+        for attempt in range(5):
+            time.sleep(3)
+            try:
+                orders = kite.orders()
+                for o in orders:
+                    if o["order_id"] == order_id:
+                        if o["status"] == "COMPLETE":
+                            filled_price = o["average_price"]
+                            break
+                        elif o["status"] in ["CANCELLED", "REJECTED"]:
+                            print(f"❌ Swing BUY {symbol} rejected/cancelled")
+                            return None
+            except Exception as e:
+                print(f"⚠️ Swing order poll error: {e}")
+            if filled_price:
+                break
+            # Nudge price slightly higher
+            try:
+                new_price = round(price * 1.001, 2)
+                kite.modify_order(variety="regular", order_id=order_id, price=new_price)
+                price = new_price
+            except Exception:
+                pass
+
+        if not filled_price:
+            try:
+                kite.cancel_order(variety="regular", order_id=order_id)
+            except Exception:
+                pass
+            print(f"❌ Swing BUY {symbol} not filled — cancelled")
+            return None
+
+        print(f"✅ Swing BUY filled: {symbol} @ ₹{filled_price}  qty={qty}")
+        return filled_price
+
+    except Exception as e:
+        print(f"❌ place_swing_buy_order({symbol}): {e}")
+        return None
+
+
+def place_swing_sell_order(symbol, qty, reason="EXIT"):
+    """
+    Place a CNC SELL order on NSE to exit a swing position.
+    Returns filled price or None.
+    """
+    try:
+        ltp = safe_ltp(f"NSE:{symbol}")
+        if ltp is None or ltp <= 0:
+            # Fallback — use market order if LTP unavailable
+            print(f"⚠️ Swing sell: LTP unavailable for {symbol} — using MARKET order")
+            order_id = kite.place_order(
+                variety="regular", exchange="NSE", tradingsymbol=symbol,
+                transaction_type="SELL", quantity=qty,
+                order_type="MARKET", product="CNC"
+            )
+        else:
+            price = round(ltp * 0.998, 2)   # 0.2% below LTP for fast fill
+            order_id = kite.place_order(
+                variety="regular", exchange="NSE", tradingsymbol=symbol,
+                transaction_type="SELL", quantity=qty,
+                order_type="LIMIT", price=price, product="CNC"
+            )
+            print(f"📤 Swing SELL placed: {symbol}  qty={qty}  price={price}  reason={reason}")
+
+        # Wait for fill (up to 30s, 6 attempts)
+        filled_price = None
+        for attempt in range(6):
+            time.sleep(5)
+            try:
+                orders = kite.orders()
+                for o in orders:
+                    if o["order_id"] == order_id:
+                        if o["status"] == "COMPLETE":
+                            filled_price = o["average_price"]
+                            break
+                        elif o["status"] in ["CANCELLED", "REJECTED"]:
+                            print(f"❌ Swing SELL {symbol} rejected/cancelled")
+                            return None
+            except Exception as e:
+                print(f"⚠️ Swing sell poll error: {e}")
+            if filled_price:
+                break
+            # Nudge price slightly lower to fill faster
+            try:
+                new_price = round(ltp * (0.998 - attempt * 0.003), 2) if ltp else None
+                if new_price and new_price > 0:
+                    kite.modify_order(variety="regular", order_id=order_id, price=new_price)
+            except Exception:
+                pass
+
+        if not filled_price:
+            # Last resort: convert to MARKET
+            try:
+                kite.modify_order(variety="regular", order_id=order_id,
+                                  order_type="MARKET", price=0)
+                time.sleep(3)
+                orders = kite.orders()
+                for o in orders:
+                    if o["order_id"] == order_id and o["status"] == "COMPLETE":
+                        filled_price = o["average_price"]
+            except Exception as e:
+                print(f"⚠️ Market conversion failed: {e}")
+
+        if filled_price:
+            print(f"✅ Swing SELL filled: {symbol} @ ₹{filled_price}  qty={qty}")
+        else:
+            print(f"❌ Swing SELL {symbol} not filled after retries")
+        return filled_price
+
+    except Exception as e:
+        print(f"❌ place_swing_sell_order({symbol}): {e}")
+        return None
+
+
+def manage_swing_position(symbol, entry_price, qty, sl_price, target_price):
+    """
+    Monitor an open swing position in its own thread.
+    Exit on:  (1) SL hit   (2) Target hit   (3) HalfTrend daily flip to PUT
+    Pauses monitoring outside market hours (resumes next morning).
+    """
+    global swing_daily_pnl, swing_daily_wins, swing_daily_losses, swing_trade_count
+
+    token = get_stock_token(symbol)
+    print(f"👁️ Monitoring swing: {symbol}  entry={entry_price:.2f}  SL={sl_price:.2f}  target={target_price:.2f}")
+
+    while True:
+        try:
+            now_ist = datetime.now(IST)
+
+            # ── Outside market hours — sleep and wait ─────────────────────────
+            in_market_hours = (
+                (now_ist.weekday() < 5) and
+                (
+                    (now_ist.hour == 9 and now_ist.minute >= 15) or
+                    (9 < now_ist.hour < 15) or
+                    (now_ist.hour == 15 and now_ist.minute <= 25)
+                )
+            )
+            if not in_market_hours:
+                time.sleep(60)
+                continue
+
+            # ── Get current LTP ───────────────────────────────────────────────
+            ltp = safe_ltp(f"NSE:{symbol}")
+            if ltp is None or ltp <= 0:
+                time.sleep(30)
+                continue
+
+            pnl_per_share = ltp - entry_price
+            pnl_total     = pnl_per_share * qty
+            pnl_pct       = (pnl_per_share / entry_price) * 100
+
+            exit_reason = None
+
+            # ── (1) Hard SL ───────────────────────────────────────────────────
+            if ltp <= sl_price:
+                exit_reason = f"🛑 SL HIT ({pnl_pct:.1f}%)"
+
+            # ── (2) Profit Target ─────────────────────────────────────────────
+            elif ltp >= target_price:
+                exit_reason = f"🎯 TARGET HIT (+{pnl_pct:.1f}%)"
+
+            # ── (3) HalfTrend daily flip to PUT ───────────────────────────────
+            else:
+                if token:
+                    df_daily = get_swing_daily_data(symbol, token)
+                    if df_daily is not None and len(df_daily) >= 50:
+                        ht = halftrend_tv(df_daily, amplitude=2, channel_deviation=2)
+                        if ht is not None and len(ht) >= 2:
+                            # iloc[-2] = last closed daily candle (anti-repaint)
+                            trend = int(ht.iloc[-2]["trend"])
+                            if trend == 1:   # 1 = bearish/PUT
+                                exit_reason = f"🔴 HALFTREND FLIP (daily PUT signal)"
+
+            # ── Exit ─────────────────────────────────────────────────────────
+            if exit_reason:
+                print(f"📤 Swing exit triggered: {symbol}  reason={exit_reason}  LTP={ltp:.2f}")
+                filled_exit = place_swing_sell_order(symbol, qty, reason=exit_reason)
+
+                if filled_exit:
+                    actual_pnl = (filled_exit - entry_price) * qty
+                    pnl_pct_f  = ((filled_exit - entry_price) / entry_price) * 100
+                    emoji      = "✅" if actual_pnl > 0 else "❌"
+
+                    with swing_positions_lock:
+                        swing_positions.pop(symbol, None)
+
+                    swing_daily_pnl    += actual_pnl
+                    swing_trade_count  += 1
+                    if actual_pnl > 0:
+                        swing_daily_wins   += 1
+                    else:
+                        swing_daily_losses += 1
+
+                    log_trade_full(symbol, entry_price, filled_exit, actual_pnl,
+                                   f"SWING:{symbol}", "CALL", 0)
+
+                    send_message(
+                        f"{emoji} SWING TRADE CLOSED — {symbol}\n"
+                        f"{'='*28}\n"
+                        f"📌 Reason  : {exit_reason}\n"
+                        f"💰 P&L     : ₹{actual_pnl:+,.0f}  ({pnl_pct_f:+.1f}%)\n"
+                        f"📊 Entry   : ₹{entry_price:.2f}  |  Exit: ₹{filled_exit:.2f}\n"
+                        f"📦 Qty     : {qty} shares\n"
+                        f"📅 Swing P&L today: ₹{swing_daily_pnl:+,.0f}"
+                    )
+                    print(f"✅ Swing {symbol} closed — P&L ₹{actual_pnl:+,.0f}")
+                else:
+                    send_message(
+                        f"⚠️ SWING EXIT FAILED: {symbol}\n"
+                        f"Reason: {exit_reason}\n"
+                        f"❗ Manual exit required — check Kite app"
+                    )
+                return   # exit thread
+
+            # ── Periodic status log ───────────────────────────────────────────
+            print(f"📊 Swing {symbol}: LTP={ltp:.2f}  P&L={pnl_pct:+.1f}%  "
+                  f"SL={sl_price:.2f}  Target={target_price:.2f}")
+
+        except Exception as e:
+            print(f"❌ manage_swing_position({symbol}): {e}")
+
+        time.sleep(120)   # check every 2 minutes
+
+
+def swing_loop():
+    """
+    Master swing loop.
+    - Reads stocks.txt every cycle
+    - Enters new positions when HalfTrend daily gives a CALL signal
+    - manage_swing_position() threads handle exits
+    - Runs 24/7; only scans for entries during market hours
+    """
+    print("🚀 Swing loop started")
+    _last_scan_log = 0
+
+    while True:
+        try:
+            if not ENABLE_SWING:
+                time.sleep(60)
+                continue
+
+            now_ist = datetime.now(IST)
+
+            # ── Only scan for NEW entries during market hours ─────────────────
+            in_market_hours = (
+                (now_ist.weekday() < 5) and
+                (
+                    (now_ist.hour == 9 and now_ist.minute >= 15) or
+                    (9 < now_ist.hour < 15) or
+                    (now_ist.hour == 15 and now_ist.minute <= 20)
+                )
+            )
+            if not in_market_hours:
+                time.sleep(120)
+                continue
+
+            stocks = load_swing_stocks()
+            if not stocks:
+                time.sleep(300)
+                continue
+
+            with swing_positions_lock:
+                current_positions = len(swing_positions)
+
+            if current_positions >= MAX_SWING_POSITIONS:
+                if time.time() - _last_scan_log > 600:
+                    print(f"📊 Swing: max positions ({MAX_SWING_POSITIONS}) reached — not scanning for new entries")
+                    _last_scan_log = time.time()
+                time.sleep(120)
+                continue
+
+            # ── Scan each stock ───────────────────────────────────────────────
+            for symbol in stocks:
+                with swing_positions_lock:
+                    if symbol in swing_positions:
+                        continue   # already have an open position
+
+                    if len(swing_positions) >= MAX_SWING_POSITIONS:
+                        break
+
+                token = get_stock_token(symbol)
+                if token is None:
+                    continue
+
+                df_daily = get_swing_daily_data(symbol, token)
+                if df_daily is None or len(df_daily) < 50:
+                    print(f"⚠️ Swing {symbol}: insufficient daily data")
+                    continue
+
+                ht = halftrend_tv(df_daily, amplitude=2, channel_deviation=2)
+                if ht is None or len(ht) < 2:
+                    continue
+
+                # Use last CLOSED daily candle (iloc[-2]) — anti-repaint rule
+                last_closed = ht.iloc[-2]
+                trend       = int(last_closed["trend"])   # 0=bullish 1=bearish
+
+                # Entry condition: HalfTrend is bullish (CALL) AND a buy arrow
+                # appeared on the last closed candle or recent candles
+                signal, arrow_idx, is_fresh = get_last_active_signal(ht)
+
+                if signal != "CALL":
+                    print(f"   {symbol}: no CALL signal (trend={'BULL' if trend==0 else 'BEAR'})")
+                    continue
+
+                # ── Check LTP and calculate position ─────────────────────────
+                ltp = safe_ltp(f"NSE:{symbol}")
+                if ltp is None or ltp <= 0:
+                    print(f"⚠️ Swing {symbol}: invalid LTP")
+                    continue
+
+                qty = max(1, int(SWING_CAPITAL_PER_STOCK / ltp))
+                sl_price     = round(ltp * (1 - SWING_SL_PCT),     2)
+                target_price = round(ltp * (1 + SWING_TARGET_PCT),  2)
+
+                bars_ago = len(ht) - arrow_idx - 2 if arrow_idx is not None else "?"
+                freshness = "FRESH" if is_fresh else f"CARRY-OVER ({bars_ago} days ago)"
+                print(f"🔔 Swing entry signal: {symbol}  LTP={ltp:.2f}  signal={freshness}")
+                print(f"   Qty={qty}  SL={sl_price:.2f}  Target={target_price:.2f}"
+                      f"  Deploy=₹{ltp*qty:,.0f}")
+
+                # ── Place CNC buy order ───────────────────────────────────────
+                filled_price = place_swing_buy_order(symbol, qty)
+                if not filled_price:
+                    print(f"⚠️ Swing {symbol}: buy order not filled")
+                    continue
+
+                # Recalculate SL/target from actual fill price
+                sl_price     = round(filled_price * (1 - SWING_SL_PCT),    2)
+                target_price = round(filled_price * (1 + SWING_TARGET_PCT), 2)
+
+                with swing_positions_lock:
+                    swing_positions[symbol] = {
+                        "entry":      filled_price,
+                        "qty":        qty,
+                        "sl":         sl_price,
+                        "target":     target_price,
+                        "signal":     "CALL",
+                        "entry_time": datetime.now(IST),
+                    }
+
+                send_message(
+                    f"🆕 SWING ENTRY — {symbol}\n"
+                    f"{'='*28}\n"
+                    f"📈 Signal  : {freshness}\n"
+                    f"💰 Entry   : ₹{filled_price:.2f}  |  Qty: {qty} shares\n"
+                    f"🛑 SL      : ₹{sl_price:.2f}  (-{SWING_SL_PCT*100:.0f}%)\n"
+                    f"🎯 Target  : ₹{target_price:.2f}  (+{SWING_TARGET_PCT*100:.0f}%)\n"
+                    f"💼 Deployed: ₹{filled_price*qty:,.0f}"
+                )
+
+                # Start monitor thread for this position
+                threading.Thread(
+                    target=manage_swing_position,
+                    args=(symbol, filled_price, qty, sl_price, target_price),
+                    daemon=True,
+                    name=f"Swing-{symbol}"
+                ).start()
+                print(f"🎯 Swing {symbol} entered @ ₹{filled_price}  SL={sl_price}  Target={target_price}")
+
+                time.sleep(2)   # small gap between orders
+
+        except Exception as e:
+            print(f"❌ swing_loop error: {e}")
+
+        time.sleep(300)   # scan every 5 minutes
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📊  STOCK OPTIONS MODULE  — NFO CE/PE, Daily HalfTrend, MIS Intraday
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_stock_options_list():
+    """
+    Read stock symbols from stock_options.txt.
+    Format: one NSE symbol per line (e.g. RELIANCE, TCS).
+    Lines starting with # are ignored.
+    """
+    if not os.path.exists(STOCK_OPTIONS_FILE):
+        print(f"⚠️ {STOCK_OPTIONS_FILE} not found — create it with one NSE F&O stock per line")
+        return []
+    with open(STOCK_OPTIONS_FILE) as f:
+        return [
+            line.strip().upper()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+
+def find_stock_option(signal, stock_symbol):
+    """
+    Find the best CE or PE option for a stock on NFO.
+
+    Logic:
+      1. Get underlying LTP from NSE:{stock_symbol}
+      2. Load NFO instruments filtered by stock name
+      3. Nearest expiry, compute ATM strike and step
+      4. Try ATM → 1 OTM; pick first option within capital budget
+      5. Return (tradingsymbol, premium, actual_qty, "NFO", lot_size)
+
+    Returns (None, None, None, None, None) on failure.
+    """
+    try:
+        opt_type = "CE" if signal == "CALL" else "PE"
+
+        # ── Underlying LTP ────────────────────────────────────────────────────
+        ltp = safe_ltp(f"NSE:{stock_symbol}")
+        if ltp is None or ltp <= 0:
+            print(f"⚠️ find_stock_option: no LTP for {stock_symbol}")
+            return None, None, None, None, None
+
+        # ── Load NFO option chain for this stock ──────────────────────────────
+        nfo_instruments = get_instruments_cached("NFO")
+        today = datetime.now(IST).date()
+
+        opts = [
+            i for i in nfo_instruments
+            if i["name"] == stock_symbol
+            and i["instrument_type"] == opt_type
+            and i["expiry"] >= today
+        ]
+
+        if not opts:
+            print(f"⚠️ find_stock_option: no {opt_type} options found for {stock_symbol}")
+            return None, None, None, None, None
+
+        # Nearest expiry
+        expiry = sorted(set(i["expiry"] for i in opts))[0]
+        opts_exp = [i for i in opts if i["expiry"] == expiry]
+
+        # ── Compute strike step ───────────────────────────────────────────────
+        strikes_sorted = sorted(set(int(i["strike"]) for i in opts_exp))
+        if len(strikes_sorted) >= 2:
+            diffs = [strikes_sorted[j+1] - strikes_sorted[j]
+                     for j in range(len(strikes_sorted)-1)]
+            step = min(diffs)
+        else:
+            step = 50   # fallback
+
+        # ── ATM strike ────────────────────────────────────────────────────────
+        atm = round(ltp / step) * step
+
+        # Candidate strikes: ATM, then 1 OTM
+        if signal == "CALL":
+            candidates_strikes = [atm, atm + step]
+        else:
+            candidates_strikes = [atm, atm - step]
+
+        # ── Lot size from first matching instrument ───────────────────────────
+        lot_size = opts_exp[0].get("lot_size", 1) if opts_exp else 1
+        if lot_size <= 0:
+            lot_size = 1
+
+        # ── Find best affordable option ───────────────────────────────────────
+        for target_strike in candidates_strikes:
+            matching = [i for i in opts_exp if int(i["strike"]) == target_strike]
+            if not matching:
+                continue
+
+            inst  = matching[0]
+            sym   = f"NFO:{inst['tradingsymbol']}"
+            price = safe_ltp(sym)
+
+            if price is None or price <= 0:
+                continue
+
+            # How many lots can we buy within capital budget?
+            cost_per_lot = price * lot_size
+            lots = max(1, int(STOCK_OPTIONS_CAPITAL / cost_per_lot))
+            actual_qty = lots * lot_size
+
+            total_cost = price * actual_qty
+            if total_cost > STOCK_OPTIONS_CAPITAL * 1.5:
+                # Even 1 lot is too expensive — skip
+                print(f"   {inst['tradingsymbol']}: 1 lot = ₹{cost_per_lot:,.0f} exceeds capital budget")
+                continue
+
+            print(f"✅ Stock option found: {inst['tradingsymbol']}  "
+                  f"strike={target_strike}  premium={price:.2f}  "
+                  f"lots={lots}  qty={actual_qty}  lot_size={lot_size}")
+            return inst["tradingsymbol"], price, actual_qty, "NFO", lot_size
+
+        print(f"⚠️ find_stock_option({stock_symbol}): no affordable option within ATM/1-OTM")
+        return None, None, None, None, None
+
+    except Exception as e:
+        print(f"❌ find_stock_option({stock_symbol}, {signal}): {e}")
+        return None, None, None, None, None
+
+
+def place_stock_option_order(option_symbol, actual_qty):
+    """
+    Place a MIS BUY order for a stock option on NFO.
+    actual_qty is already in shares (lots × lot_size), bypasses get_quantity().
+    Returns filled price or None.
+    """
+    try:
+        full_sym = f"NFO:{option_symbol}"
+        ltp = safe_ltp(full_sym)
+        if ltp is None or ltp <= 0:
+            print(f"❌ place_stock_option_order: invalid LTP for {option_symbol}")
+            return None
+
+        price = round(ltp * 1.003, 2)   # 0.3% buffer for fast fill
+
+        # Balance check
+        balance = get_balance("NIFTY")   # equity segment
+        total_cost = price * actual_qty
+        if balance < total_cost * 1.02:
+            msg = (f"🚫 Insufficient balance for {option_symbol}\n"
+                   f"Need ₹{total_cost:,.0f}, have ₹{balance:,.0f}")
+            print(msg)
+            send_message(msg)
+            return None
+
+        order_id = kite.place_order(
+            variety="regular",
+            exchange="NFO",
+            tradingsymbol=option_symbol,
+            transaction_type="BUY",
+            quantity=actual_qty,
+            order_type="LIMIT",
+            price=price,
+            product="MIS"
+        )
+        print(f"📥 Stock option BUY: {option_symbol}  qty={actual_qty}  price={price}")
+
+        filled_price = None
+        for attempt in range(5):
+            time.sleep(2)
+            try:
+                for o in kite.orders():
+                    if o["order_id"] == order_id:
+                        if o["status"] == "COMPLETE":
+                            filled_price = o["average_price"]
+                            break
+                        elif o["status"] in ["CANCELLED", "REJECTED"]:
+                            print(f"❌ Stock option BUY {option_symbol} rejected")
+                            return None
+            except Exception as e:
+                print(f"⚠️ Order poll: {e}")
+            if filled_price:
+                break
+            try:
+                kite.modify_order(variety="regular", order_id=order_id,
+                                  price=round(price * 1.001, 2))
+            except Exception:
+                pass
+
+        if not filled_price:
+            try:
+                kite.cancel_order(variety="regular", order_id=order_id)
+            except Exception:
+                pass
+            print(f"❌ Stock option BUY {option_symbol} not filled — cancelled")
+            return None
+
+        print(f"✅ Stock option filled: {option_symbol} @ ₹{filled_price}  qty={actual_qty}")
+        return filled_price
+
+    except Exception as e:
+        print(f"❌ place_stock_option_order({option_symbol}): {e}")
+        return None
+
+
+def sell_stock_option(option_symbol, actual_qty, reason="EXIT"):
+    """
+    Place a MIS SELL order to exit a stock option position.
+    Returns filled price or None.
+    """
+    try:
+        full_sym = f"NFO:{option_symbol}"
+        ltp = safe_ltp(full_sym)
+
+        if ltp is None or ltp <= 0:
+            # Market order fallback
+            order_id = kite.place_order(
+                variety="regular", exchange="NFO", tradingsymbol=option_symbol,
+                transaction_type="SELL", quantity=actual_qty,
+                order_type="MARKET", product="MIS"
+            )
+        else:
+            price = round(ltp * 0.997, 2)
+            order_id = kite.place_order(
+                variety="regular", exchange="NFO", tradingsymbol=option_symbol,
+                transaction_type="SELL", quantity=actual_qty,
+                order_type="LIMIT", price=price, product="MIS"
+            )
+            print(f"📤 Stock option SELL: {option_symbol}  qty={actual_qty}  price={price}  ({reason})")
+
+        filled_price = None
+        for attempt in range(6):
+            time.sleep(3)
+            try:
+                for o in kite.orders():
+                    if o["order_id"] == order_id:
+                        if o["status"] == "COMPLETE":
+                            filled_price = o["average_price"]
+                            break
+                        elif o["status"] in ["CANCELLED", "REJECTED"]:
+                            return None
+            except Exception as e:
+                print(f"⚠️ Sell poll: {e}")
+            if filled_price:
+                break
+            try:
+                nudge = round(ltp * (0.995 - attempt * 0.003), 2) if ltp else None
+                if nudge and nudge > 0:
+                    kite.modify_order(variety="regular", order_id=order_id, price=nudge)
+            except Exception:
+                pass
+
+        if not filled_price:
+            try:
+                kite.modify_order(variety="regular", order_id=order_id,
+                                  order_type="MARKET", price=0)
+                time.sleep(3)
+                for o in kite.orders():
+                    if o["order_id"] == order_id and o["status"] == "COMPLETE":
+                        filled_price = o["average_price"]
+            except Exception as e:
+                print(f"⚠️ Market fallback: {e}")
+
+        return filled_price
+
+    except Exception as e:
+        print(f"❌ sell_stock_option({option_symbol}): {e}")
+        return None
+
+
+def manage_stock_option_position(stock_symbol, option_symbol, entry_price,
+                                  actual_qty, signal):
+    """
+    Monitor a stock option MIS position in its own thread.
+
+    Exit triggers:
+      (1) SL hit:       ltp <= entry * (1 - STOCK_OPTIONS_SL_PCT)
+      (2) Target hit:   ltp >= entry * (1 + STOCK_OPTIONS_TARGET_PCT)
+      (3) Force close:  time >= 3:15 PM IST  (before MIS auto square-off)
+    """
+    global stock_options_daily_pnl, stock_options_daily_wins
+    global stock_options_daily_losses, stock_options_trade_count
+
+    sl_price     = round(entry_price * (1 - STOCK_OPTIONS_SL_PCT),     2)
+    target_price = round(entry_price * (1 + STOCK_OPTIONS_TARGET_PCT),  2)
+
+    print(f"👁️ Monitoring stock option: {option_symbol}  "
+          f"entry={entry_price:.2f}  SL={sl_price:.2f}  target={target_price:.2f}")
+
+    while True:
+        try:
+            now_ist = datetime.now(IST)
+
+            # ── Force close at 3:15 PM ────────────────────────────────────────
+            force_close_time = (
+                now_ist.hour > STOCK_OPT_FORCE_CLOSE_HOUR or
+                (now_ist.hour == STOCK_OPT_FORCE_CLOSE_HOUR and
+                 now_ist.minute >= STOCK_OPT_FORCE_CLOSE_MIN)
+            )
+
+            # ── Get current LTP ───────────────────────────────────────────────
+            ltp = safe_ltp(f"NFO:{option_symbol}")
+            if ltp is None or ltp <= 0:
+                if force_close_time:
+                    # LTP unavailable at close time — still try to sell
+                    ltp = entry_price   # use entry as fallback for P&L calc
+                else:
+                    time.sleep(15)
+                    continue
+
+            pnl = (ltp - entry_price) * actual_qty
+            pnl_pct = ((ltp - entry_price) / entry_price) * 100
+
+            exit_reason = None
+
+            if force_close_time:
+                exit_reason = f"⏰ FORCE CLOSE 3:15 PM ({pnl_pct:+.1f}%)"
+            elif ltp <= sl_price:
+                exit_reason = f"🛑 SL HIT ({pnl_pct:.1f}%)"
+            elif ltp >= target_price:
+                exit_reason = f"🎯 TARGET HIT (+{pnl_pct:.1f}%)"
+
+            # ── Execute exit ──────────────────────────────────────────────────
+            if exit_reason:
+                print(f"📤 Stock option exit: {option_symbol}  {exit_reason}  LTP={ltp:.2f}")
+                filled_exit = sell_stock_option(option_symbol, actual_qty, reason=exit_reason)
+
+                actual_pnl = (filled_exit - entry_price) * actual_qty if filled_exit else pnl
+                exit_price = filled_exit or ltp
+                emoji = "✅" if actual_pnl > 0 else "❌"
+
+                with stock_options_positions_lock:
+                    stock_options_positions.pop(stock_symbol, None)
+
+                stock_options_daily_pnl    += actual_pnl
+                stock_options_trade_count  += 1
+                if actual_pnl > 0:
+                    stock_options_daily_wins   += 1
+                else:
+                    stock_options_daily_losses += 1
+
+                log_trade_full(option_symbol, entry_price, exit_price, actual_pnl,
+                               f"STOCKOPT:{stock_symbol}", signal, 0)
+
+                send_message(
+                    f"{emoji} STOCK OPTION CLOSED — {stock_symbol} {signal}\n"
+                    f"{'='*28}\n"
+                    f"📌 Option  : {option_symbol}\n"
+                    f"📌 Reason  : {exit_reason}\n"
+                    f"💰 P&L     : ₹{actual_pnl:+,.0f}  ({(actual_pnl/(entry_price*actual_qty))*100:+.1f}%)\n"
+                    f"📊 Entry   : ₹{entry_price:.2f}  |  Exit: ₹{exit_price:.2f}\n"
+                    f"📦 Qty     : {actual_qty}\n"
+                    f"📅 StockOpt P&L today: ₹{stock_options_daily_pnl:+,.0f}"
+                )
+
+                if not filled_exit:
+                    send_message(f"⚠️ STOCK OPTION EXIT FAILED: {option_symbol}\n"
+                                 f"❗ Check Kite — MIS auto square-off will handle it")
+                return   # exit thread
+
+            print(f"📊 StockOpt {option_symbol}: LTP={ltp:.2f}  P&L={pnl_pct:+.1f}%  "
+                  f"SL={sl_price:.2f}  Tgt={target_price:.2f}")
+
+        except Exception as e:
+            print(f"❌ manage_stock_option_position({option_symbol}): {e}")
+
+        time.sleep(60)   # check every 1 minute
+
+
+def stock_options_loop():
+    """
+    Main stock options loop.
+    - Reads stock_options.txt every morning
+    - At market open: checks last closed daily candle HalfTrend → CALL → buy CE, PUT → buy PE
+    - One entry per stock per day (daily signal doesn't change intraday)
+    - manage_stock_option_position() thread handles SL / target / 3:15 PM force-close
+    """
+    _entered_today  = set()   # symbols already entered today
+    _last_reset_day = [None]
+    print("🚀 Stock options loop started")
+
+    while True:
+        try:
+            if not ENABLE_STOCK_OPTIONS:
+                time.sleep(60)
+                continue
+
+            now_ist = datetime.now(IST)
+
+            # ── Reset daily entry guard at midnight ───────────────────────────
+            if _last_reset_day[0] != now_ist.date():
+                _entered_today.clear()
+                _last_reset_day[0] = now_ist.date()
+                print("🔄 Stock options: daily entry guard reset")
+
+            # ── Only trade during market hours ────────────────────────────────
+            in_window = (
+                now_ist.weekday() < 5 and
+                (
+                    (now_ist.hour == 9 and now_ist.minute >= 15) or
+                    (9 < now_ist.hour < STOCK_OPT_FORCE_CLOSE_HOUR) or
+                    (now_ist.hour == STOCK_OPT_FORCE_CLOSE_HOUR and
+                     now_ist.minute < STOCK_OPT_FORCE_CLOSE_MIN)
+                )
+            )
+            if not in_window:
+                time.sleep(60)
+                continue
+
+            stocks = load_stock_options_list()
+            if not stocks:
+                time.sleep(300)
+                continue
+
+            with stock_options_positions_lock:
+                open_count = len(stock_options_positions)
+
+            for stock_symbol in stocks:
+                # ── Guards ────────────────────────────────────────────────────
+                if stock_symbol in _entered_today:
+                    continue
+
+                with stock_options_positions_lock:
+                    if stock_symbol in stock_options_positions:
+                        continue
+                    if len(stock_options_positions) >= MAX_STOCK_OPTIONS_POSITIONS:
+                        break
+
+                # ── Daily HalfTrend signal ────────────────────────────────────
+                token = get_stock_token(stock_symbol)
+                if token is None:
+                    continue
+
+                df_daily = get_swing_daily_data(stock_symbol, token)
+                if df_daily is None or len(df_daily) < 50:
+                    print(f"⚠️ StockOpt {stock_symbol}: insufficient daily data")
+                    continue
+
+                ht = halftrend_tv(df_daily, amplitude=2, channel_deviation=2)
+                if ht is None or len(ht) < 2:
+                    continue
+
+                # Last CLOSED daily candle — anti-repaint rule
+                trend = int(ht.iloc[-2]["trend"])   # 0=CALL 1=PUT
+                signal = "CALL" if trend == 0 else "PUT"
+
+                # Check for an active signal (fresh arrow on last closed candle)
+                sig, arrow_idx, is_fresh = get_last_active_signal(ht)
+                if sig is None:
+                    print(f"   StockOpt {stock_symbol}: no active signal — skipping")
+                    continue
+
+                signal = sig   # use signal from get_last_active_signal
+                bars_ago = (len(ht) - arrow_idx - 2) if arrow_idx is not None else "?"
+                freshness = "FRESH" if is_fresh else f"CARRY-OVER ({bars_ago} days ago)"
+                print(f"🔔 StockOpt {stock_symbol}: {signal} signal ({freshness})")
+
+                # ── Find option ───────────────────────────────────────────────
+                opt_symbol, opt_price, actual_qty, exchange, lot_size = \
+                    find_stock_option(signal, stock_symbol)
+
+                if not opt_symbol or actual_qty is None:
+                    _noopt_key = f"STOCKOPT_{stock_symbol}_noopt_{now_ist.strftime('%Y-%m-%d')}"
+                    if getattr(stock_options_loop, "_noopt_alerted", None) != _noopt_key:
+                        send_message(
+                            f"⚠️ STOCK OPTION: No suitable {signal} option for {stock_symbol}\n"
+                            f"Check option chain — may be illiquid or strike out of range"
+                        )
+                        stock_options_loop._noopt_alerted = _noopt_key
+                    continue
+
+                # ── Place order ───────────────────────────────────────────────
+                filled_price = place_stock_option_order(opt_symbol, actual_qty)
+                if not filled_price:
+                    continue
+
+                sl_price     = round(filled_price * (1 - STOCK_OPTIONS_SL_PCT),    2)
+                target_price = round(filled_price * (1 + STOCK_OPTIONS_TARGET_PCT), 2)
+
+                with stock_options_positions_lock:
+                    stock_options_positions[stock_symbol] = {
+                        "option_symbol": opt_symbol,
+                        "entry":         filled_price,
+                        "qty":           actual_qty,
+                        "sl":            sl_price,
+                        "target":        target_price,
+                        "signal":        signal,
+                        "exchange":      "NFO",
+                    }
+
+                _entered_today.add(stock_symbol)
+
+                send_message(
+                    f"🆕 STOCK OPTION ENTRY — {stock_symbol} {signal}\n"
+                    f"{'='*28}\n"
+                    f"📌 Option   : {opt_symbol}\n"
+                    f"📈 Signal   : {freshness}\n"
+                    f"💰 Entry    : ₹{filled_price:.2f}  |  Qty: {actual_qty}\n"
+                    f"🛑 SL       : ₹{sl_price:.2f}  (-{STOCK_OPTIONS_SL_PCT*100:.0f}%)\n"
+                    f"🎯 Target   : ₹{target_price:.2f}  (+{STOCK_OPTIONS_TARGET_PCT*100:.0f}%)\n"
+                    f"⏰ Force close: 3:15 PM IST\n"
+                    f"💼 Deployed : ₹{filled_price*actual_qty:,.0f}"
+                )
+
+                threading.Thread(
+                    target=manage_stock_option_position,
+                    args=(stock_symbol, opt_symbol, filled_price, actual_qty, signal),
+                    daemon=True,
+                    name=f"StockOpt-{stock_symbol}"
+                ).start()
+                print(f"🎯 StockOpt {stock_symbol}: {opt_symbol} @ ₹{filled_price}")
+                time.sleep(2)
+
+        except Exception as e:
+            print(f"❌ stock_options_loop error: {e}")
+
+        time.sleep(120)   # scan every 2 minutes
+
+
+def send_stock_options_eod_report():
+    """Send stock options summary at 3:35 PM. Reads from CSV for restart safety."""
+    try:
+        df = pd.read_csv(TRADE_LOG_FILE)
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        df = df[df["time"].dt.strftime("%Y-%m-%d") == today_str]
+        df = df[df["instrument"].str.startswith("STOCKOPT:", na=False)]
+        csv_pnl    = float(df["pnl"].sum())   if not df.empty else 0
+        csv_wins   = int((df["pnl"] > 0).sum()) if not df.empty else 0
+        csv_losses = int((df["pnl"] <= 0).sum()) if not df.empty else 0
+        csv_count  = len(df)
+    except Exception:
+        csv_pnl, csv_wins, csv_losses, csv_count = 0, 0, 0, 0
+
+    pnl    = max(csv_pnl,    stock_options_daily_pnl,    key=abs) if csv_count or stock_options_trade_count else 0
+    wins   = max(csv_wins,   stock_options_daily_wins)
+    losses = max(csv_losses, stock_options_daily_losses)
+    count  = max(csv_count,  stock_options_trade_count)
+
+    with stock_options_positions_lock:
+        open_names = ", ".join(stock_options_positions.keys()) or "None"
+
+    total = wins + losses
+    wr = (wins / total * 100) if total > 0 else 0
+
+    send_message(
+        f"📊 STOCK OPTIONS SUMMARY\n"
+        f"{'='*28}\n"
+        f"💰 P&L today   : ₹{pnl:+,.0f}\n"
+        f"📈 Trades      : {total}  (✅ {wins}W  ❌ {losses}L)  WR={wr:.0f}%\n"
+        f"📦 Still open  : {open_names}\n"
+        f"⏰ Report time : 3:35 PM IST"
+    )
+
+
+def send_swing_eod_report():
+    """Send swing trade summary at 3:34 PM. Reads from CSV for restart safety."""
+    csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv_swing()
+
+    pnl    = max(csv_pnl,    swing_daily_pnl,    key=abs) if csv_count or swing_trade_count else swing_daily_pnl
+    wins   = max(csv_wins,   swing_daily_wins)
+    losses = max(csv_losses, swing_daily_losses)
+    count  = max(csv_count,  swing_trade_count)
+
+    with swing_positions_lock:
+        open_count = len(swing_positions)
+        open_names = ", ".join(swing_positions.keys()) if swing_positions else "None"
+
+    total = wins + losses
+    wr = (wins / total * 100) if total > 0 else 0
+
+    send_message(
+        f"📈 SWING TRADE SUMMARY\n"
+        f"{'='*28}\n"
+        f"💰 Closed P&L : ₹{pnl:+,.0f}\n"
+        f"📊 Closed      : {total}  (✅ {wins}W  ❌ {losses}L)  WR={wr:.0f}%\n"
+        f"📦 Open now    : {open_count} position(s) — {open_names}\n"
+        f"⏰ Report time : 3:34 PM IST"
+    )
+
+
+def _read_today_csv_swing():
+    """Read today's SWING trades from CSV for EOD report."""
+    try:
+        if not os.path.exists(TRADE_LOG_FILE):
+            return 0, 0, 0, 0
+        df = pd.read_csv(TRADE_LOG_FILE)
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        df = df[df["time"].dt.strftime("%Y-%m-%d") == today_str]
+        df = df[df["instrument"].str.startswith("SWING:", na=False)]
+        if df.empty:
+            return 0, 0, 0, 0
+        pnl    = float(df["pnl"].sum())
+        wins   = int((df["pnl"] > 0).sum())
+        losses = int((df["pnl"] <= 0).sum())
+        count  = len(df)
+        return pnl, wins, losses, count
+    except Exception as e:
+        print(f"⚠️ _read_today_csv_swing: {e}")
+        return 0, 0, 0, 0
+
+
 def send_sensex_eod_report():
     """Sent at 3:33 PM. Reads from CSV so restarts don't wipe the numbers."""
     csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv("SENSEX")
@@ -6007,11 +7164,13 @@ if __name__ == "__main__":
     restore_position_state_from_kite()
 
     # ── Daily report scheduler ──────────────────────────────────────────────
-    _nifty_eod_sent      = [False]   # mutable so inner function can write
-    _banknifty_eod_sent  = [False]
-    _sensex_eod_sent     = [False]
-    _crude_eod_sent      = [False]
-    _full_report_sent    = [False]
+    _nifty_eod_sent       = [False]   # mutable so inner function can write
+    _banknifty_eod_sent   = [False]
+    _sensex_eod_sent      = [False]
+    _swing_eod_sent       = [False]
+    _stockopt_eod_sent    = [False]
+    _crude_eod_sent       = [False]
+    _full_report_sent     = [False]
 
     def daily_report_scheduler():
         """
@@ -6019,6 +7178,7 @@ if __name__ == "__main__":
           3:31 PM IST  → Nifty session closed report
           3:32 PM IST  → BankNifty session closed report
           3:33 PM IST  → SENSEX session closed report
+          3:34 PM IST  → Swing trade summary (open positions + today's closed)
          11:31 PM IST  → Crude session closed report  (after 11:25 PM force-close)
          11:32 PM IST  → Combined NIFTY + BANKNIFTY + SENSEX + CRUDE daily report
         Resets sent-flags at midnight.
@@ -6032,6 +7192,8 @@ if __name__ == "__main__":
                     _nifty_eod_sent[0]      = False
                     _banknifty_eod_sent[0]  = False
                     _sensex_eod_sent[0]     = False
+                    _swing_eod_sent[0]      = False
+                    _stockopt_eod_sent[0]   = False
                     _crude_eod_sent[0]      = False
                     _full_report_sent[0]    = False
 
@@ -6049,6 +7211,16 @@ if __name__ == "__main__":
                 if now.hour == 15 and now.minute == 33 and not _sensex_eod_sent[0]:
                     send_sensex_eod_report()
                     _sensex_eod_sent[0] = True
+
+                # 3:34 PM — Swing trade summary
+                if now.hour == 15 and now.minute == 34 and not _swing_eod_sent[0]:
+                    send_swing_eod_report()
+                    _swing_eod_sent[0] = True
+
+                # 3:35 PM — Stock options summary
+                if now.hour == 15 and now.minute == 35 and not _stockopt_eod_sent[0]:
+                    send_stock_options_eod_report()
+                    _stockopt_eod_sent[0] = True
 
                 # 11:31 PM — Crude EOD report (after force-close at 11:25 PM, all trades done)
                 if now.hour == 23 and now.minute == 31 and not _crude_eod_sent[0]:
@@ -6078,6 +7250,16 @@ if __name__ == "__main__":
         threading.Thread(target=sensex_loop, daemon=True).start()
     else:
         print("⚠️ SENSEX LOOP SKIPPED — token not found")
+
+    if ENABLE_SWING:
+        threading.Thread(target=swing_loop, daemon=True, name="SwingLoop").start()
+    else:
+        print("⚠️ SWING LOOP SKIPPED (ENABLE_SWING=False)")
+
+    if ENABLE_STOCK_OPTIONS:
+        threading.Thread(target=stock_options_loop, daemon=True, name="StockOptionsLoop").start()
+    else:
+        print("⚠️ STOCK OPTIONS LOOP SKIPPED (ENABLE_STOCK_OPTIONS=False)")
 
     if CRUDE_TOKEN:
         threading.Thread(target=crude_loop, daemon=True).start()
@@ -6110,11 +7292,11 @@ if __name__ == "__main__":
             f"🛢️ CRUDE     : {crude_status}\n"
             f"   Hours     : 3:30 PM – 11 PM IST\n"
             f"\n"
-            f"⚙️ Signal : HalfTrend 15-min (all instruments)\n"
-            f"⚙️ SL     : 25% → 45% two-tier\n"
-            f"⚙️ Trail  : ATR-based adaptive trailing\n"
+            f"⚙️ Signal : HalfTrend 15-min (F&O) | Daily (Swing)\n"
+            f"⚙️ SL     : 25% → 45% two-tier (F&O) | {SWING_SL_PCT*100:.0f}% fixed (Swing)\n"
+            f"⚙️ Target : HalfTrend flip (F&O) | {SWING_TARGET_PCT*100:.0f}% fixed or flip (Swing)\n"
             f"⚙️ Flip   : Immediate exit + re-entry on arrow reversal\n"
-            f"📅 Reports: NIFTY@3:31 | BankNifty@3:32 | SENSEX@3:33 | Crude@11:31 | Combined@11:32"
+            f"📅 Reports: NIFTY@3:31 | BankNifty@3:32 | SENSEX@3:33 | Swing@3:34 | StockOpt@3:35 | Crude@11:31"
         )
     except Exception as e:
         print("Startup telegram failed:", e)
@@ -6206,4 +7388,4 @@ if __name__ == "__main__":
         time.sleep(60)
 
 
-    # end of __main__ block
+    # end of __main__ b

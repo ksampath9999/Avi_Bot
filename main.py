@@ -402,6 +402,15 @@ MAX_STOCK_OPTIONS_POSITIONS  = 5      # max concurrent stock option positions
 STOCK_OPT_FORCE_CLOSE_HOUR   = 15     # force-close hour (IST)
 STOCK_OPT_FORCE_CLOSE_MIN    = 15     # force-close minute (IST) → 3:15 PM
 
+# ── Screener.in Integration ───────────────────────────────────────────────────
+# Set USE_SCREENER = True and add credentials to config.py to auto-populate
+# stock lists each morning from your saved Screener.in screen.
+# Setup: 1) Create the screen on screener.in  2) Note the ID from URL
+#        e.g. https://www.screener.in/screens/123456/ → SCREENER_SCREEN_ID = "123456"
+USE_SCREENER              = getattr(config, "USE_SCREENER", False)
+SCREENER_SESSION_COOKIE   = getattr(config, "SCREENER_SESSION_COOKIE", "")   # 'sessionid' cookie value
+SCREENER_SCREEN_ID        = getattr(config, "SCREENER_SCREEN_ID", "")        # numeric ID from URL
+
 # ── Stop Loss ─────────────────────────────────────────────────────────────────
 # Set False to disable ALL SL logic (trailing + hard SL).
 # Profit-lock logic is NOT affected — it always stays active.
@@ -603,6 +612,12 @@ swing_daily_losses   = 0
 swing_trade_count    = 0
 _swing_token_cache   = {}   # {symbol: token_int}
 _swing_data_cache    = {}   # {symbol: (timestamp, df)}  — 4-hour TTL
+
+# ── Screener.in cache ─────────────────────────────────────────────────────────
+_screener_session         = None          # requests.Session (reused across calls)
+_screener_stocks_today    = []            # all NSE symbols from screen today
+_screener_fo_stocks_today = []            # F&O-eligible subset (have NFO options)
+_screener_refresh_date    = None          # date object — re-fetches once per day
 
 # ── Stock Options state ───────────────────────────────────────────────────────
 # { underlying_symbol: {"option_symbol": str, "entry": float, "qty": int,
@@ -1203,23 +1218,12 @@ def evaluate_strategies():
             print(f"🚀 Increasing weight for {strat}")
 
 def log_trade_full(symbol, entry, exit_price, pnl, instrument, signal, probability):
-
     import csv
-    from datetime import datetime
-
+    # Always write IST timestamp so CSV date filter matches IST EOD report date
+    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     with open(TRADE_LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
-
-        writer.writerow([
-            datetime.now(),
-            instrument,
-            symbol,
-            signal,
-            entry,
-            exit_price,
-            pnl,
-            probability
-        ])
+        writer.writerow([ts, instrument, symbol, signal, entry, exit_price, pnl, probability])
 
 
 def get_nifty_fut_token():
@@ -5847,11 +5851,55 @@ def send_daily_report():
         send_message(f"❌ Daily report error: {e}")
 
 
+def _kite_day_pnl(instrument):
+    """
+    Fetch today's realized P&L directly from Kite's positions API.
+    This is the ground truth — survives Railway restarts and always matches
+    what the user sees in Kite dashboard.
+
+    Returns (pnl, wins, losses, trade_count).
+    Wins/losses counted per distinct option symbol traded.
+    """
+    exchange_map = {"NIFTY": "NFO", "BANKNIFTY": "NFO", "SENSEX": "BFO", "CRUDE": "MCX"}
+    prefix_map   = {"NIFTY": "NIFTY", "BANKNIFTY": "BANKNIFTY", "SENSEX": "SENSEX", "CRUDE": None}
+
+    try:
+        positions    = kite.positions()
+        day_pos      = positions.get("day", [])
+        target_exch  = exchange_map.get(instrument.upper(), "NFO")
+        sym_prefix   = prefix_map.get(instrument.upper())
+
+        filtered = []
+        for p in day_pos:
+            if p.get("exchange") != target_exch:
+                continue
+            sym = p.get("tradingsymbol", "")
+            # Distinguish NIFTY vs BANKNIFTY (both on NFO)
+            if instrument.upper() == "NIFTY" and sym.startswith("BANKNIFTY"):
+                continue
+            if sym_prefix and not sym.startswith(sym_prefix):
+                continue
+            filtered.append(p)
+
+        if not filtered:
+            return 0.0, 0, 0, 0
+
+        pnl    = sum(float(p.get("pnl", 0)) for p in filtered)
+        wins   = sum(1 for p in filtered if float(p.get("pnl", 0)) > 0)
+        losses = sum(1 for p in filtered if float(p.get("pnl", 0)) <= 0)
+        count  = len(filtered)
+        return pnl, wins, losses, count
+
+    except Exception as e:
+        print(f"⚠️ _kite_day_pnl({instrument}): {e}", flush=True)
+        return 0.0, 0, 0, 0
+
+
 def _read_today_csv(instrument):
     """
-    Read today's closed trades for the given instrument from trade_log.csv.
+    Fallback: read today's closed trades for the given instrument from trade_log.csv.
+    Used only when Kite API is unavailable.
     Returns (pnl, wins, losses, trade_count).
-    Uses CSV as source of truth — survives Railway restarts mid-day.
     """
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     try:
@@ -5861,6 +5909,8 @@ def _read_today_csv(instrument):
         if df.empty or "time" not in df.columns:
             return 0, 0, 0, 0
         df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        # Localise to IST so date comparison is always correct regardless of server TZ
+        df["time"] = df["time"].dt.tz_localize("UTC", ambiguous="NaT", nonexistent="NaT").dt.tz_convert(IST)
         df = df[df["time"].dt.strftime("%Y-%m-%d") == today_str]
         if "instrument" in df.columns:
             df = df[df["instrument"].str.upper() == instrument.upper()]
@@ -5876,17 +5926,31 @@ def _read_today_csv(instrument):
         return 0, 0, 0, 0
 
 
+def _best_day_pnl(instrument, mem_pnl, mem_wins, mem_losses, mem_count):
+    """
+    Priority order for EOD P&L data:
+      1. Kite positions API  — ground truth, survives restarts
+      2. CSV trade log       — fallback if Kite unavailable
+      3. In-memory counters  — last resort (lost on restart)
+    Returns (pnl, wins, losses, count).
+    """
+    kite_pnl, kite_wins, kite_losses, kite_count = _kite_day_pnl(instrument)
+    if kite_count > 0:
+        return kite_pnl, kite_wins, kite_losses, kite_count
+
+    csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv(instrument)
+    if csv_count > 0:
+        return csv_pnl, csv_wins, csv_losses, csv_count
+
+    # In-memory fallback
+    return mem_pnl, mem_wins, mem_losses, mem_count
+
+
 def send_nifty_eod_report():
-    """Sent at 3:31 PM. Reads from CSV so restarts don't wipe the numbers."""
-    csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv("NIFTY")
-
-    # Merge CSV data with in-memory counters — take whichever is larger
-    # (covers edge case where a trade closed after CSV flush but before report)
-    pnl    = max(csv_pnl,    nifty_daily_pnl,    key=abs) if csv_count or nifty_trade_count else 0
-    wins   = max(csv_wins,   nifty_daily_wins)
-    losses = max(csv_losses, nifty_daily_losses)
-    count  = max(csv_count,  nifty_trade_count)
-
+    """Sent at 3:31 PM. Uses Kite positions API as primary source (restart-safe)."""
+    pnl, wins, losses, count = _best_day_pnl(
+        "NIFTY", nifty_daily_pnl, nifty_daily_wins, nifty_daily_losses, nifty_trade_count
+    )
     total = wins + losses
     wr = (wins / total * 100) if total > 0 else 0
 
@@ -5902,13 +5966,10 @@ def send_nifty_eod_report():
 
 
 def send_crude_eod_report():
-    """Sent at 11:31 PM. Reads from CSV so restarts don't wipe the numbers."""
-    csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv("CRUDE")
-
-    pnl    = max(csv_pnl,    crude_daily_pnl,    key=abs) if csv_count or crude_trade_count else 0
-    wins   = max(csv_wins,   crude_daily_wins)
-    losses = max(csv_losses, crude_daily_losses)
-    count  = max(csv_count,  crude_trade_count)
+    """Sent at 11:31 PM. Uses Kite positions API as primary source (restart-safe)."""
+    pnl, wins, losses, count = _best_day_pnl(
+        "CRUDE", crude_daily_pnl, crude_daily_wins, crude_daily_losses, crude_trade_count
+    )
 
     total = wins + losses
     wr = (wins / total * 100) if total > 0 else 0
@@ -5922,6 +5983,235 @@ def send_crude_eod_report():
         f"📊 Trade count: {count}\n"
         f"⏰ Crude session ended 11:30 PM IST"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔍  SCREENER.IN INTEGRATION  — Auto stock selection via saved screen
+# ═══════════════════════════════════════════════════════════════════════════════
+# Screen query to save on screener.in:
+#   Sales growth 3Years > 20
+#   AND Profit growth 3Years > 20
+#   AND Return on capital employed > 18
+#   AND Return on equity > 18
+#   AND Debt to equity < 0.5
+#   AND Promoter holding > 50
+#   AND Market capitalization > 500
+#   AND Current price > DMA 200
+#   AND Down from 52w high > 25
+#
+# Setup steps (Google / Gmail login — session cookie method):
+#   1. Go to https://www.screener.in/screens/new/
+#   2. Paste the query above → Run → Save with a name
+#   3. Note the screen ID from URL (e.g. screener.in/screens/123456/ → ID=123456)
+#   4. Open screener.in in Chrome → F12 → Application → Cookies → www.screener.in
+#      Copy the value of the cookie named  "sessionid"
+#   5. Add to config.py:
+#        USE_SCREENER             = True
+#        SCREENER_SESSION_COOKIE  = "abc123xyz..."   ← paste sessionid value here
+#        SCREENER_SCREEN_ID       = "123456"
+#
+#   The sessionid cookie lasts weeks/months. When it expires the bot sends a
+#   Telegram alert — just copy a fresh one from your browser and update config.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import re as _re
+try:
+    import requests as _requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
+    print("⚠️ 'requests' library not found — Screener.in integration disabled. Run: pip install requests")
+
+
+def _screener_build_session():
+    """
+    Build a requests.Session pre-loaded with the user's Screener.in sessionid cookie.
+    No login flow needed — works with Google / Gmail OAuth accounts.
+    Raises RuntimeError if session cookie is not configured or appears invalid.
+    """
+    if not _REQUESTS_AVAILABLE:
+        raise RuntimeError("requests library not installed")
+    if not SCREENER_SESSION_COOKIE:
+        raise RuntimeError(
+            "SCREENER_SESSION_COOKIE not set in config.py. "
+            "Open screener.in → F12 → Application → Cookies → copy 'sessionid' value."
+        )
+
+    session = _requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+    })
+    # Inject the browser session cookie directly — no login POST needed
+    session.cookies.set("sessionid", SCREENER_SESSION_COOKIE, domain="www.screener.in")
+
+    # Quick validation: hit the dashboard and check we're actually logged in
+    check = session.get("https://www.screener.in/", timeout=15)
+    # If cookie is expired/invalid, Screener redirects to /login/
+    if "/login/" in check.url:
+        raise RuntimeError(
+            "Screener.in session cookie has expired. "
+            "Open screener.in in your browser (log in via Google), then:\n"
+            "F12 → Application → Cookies → www.screener.in → copy 'sessionid' value → update SCREENER_SESSION_COOKIE in config.py"
+        )
+
+    print("✅ Screener.in session cookie valid", flush=True)
+    return session
+
+
+def _screener_parse_nse_symbols(csv_text):
+    """
+    Parse NSE stock symbols from Screener.in CSV export.
+    Screener.in exports include an 'NSE' or 'NSE Code' column.
+    Returns list of uppercase NSE symbols, skipping blank / BSE-only rows.
+    """
+    import csv, io
+    symbols = []
+
+    try:
+        reader = csv.DictReader(io.StringIO(csv_text.strip()))
+        if reader.fieldnames is None:
+            print("⚠️ Screener CSV has no headers", flush=True)
+            return []
+
+        # Normalise header names for robust matching
+        headers = [h.strip() for h in reader.fieldnames]
+        # Candidates in priority order
+        nse_col = None
+        for candidate in ("NSE Code", "NSE", "NSE Symbol", "Ticker", "Symbol"):
+            for h in headers:
+                if h.strip().upper() == candidate.upper():
+                    nse_col = h
+                    break
+            if nse_col:
+                break
+
+        if not nse_col:
+            print(f"⚠️ Screener CSV: could not find NSE symbol column. Headers: {headers}", flush=True)
+            # Last resort: try first non-numeric column that looks like a symbol
+            for h in headers:
+                if h.strip().upper() not in ("S.NO.", "S.NO", "CMP", "PRICE", "P/E", "NAME"):
+                    nse_col = h
+                    break
+
+        if not nse_col:
+            return []
+
+        for row in reader:
+            sym = row.get(nse_col, "").strip().upper()
+            # Skip blanks, dashes, or purely numeric entries
+            if sym and sym != "-" and not sym.isdigit():
+                symbols.append(sym)
+
+    except Exception as e:
+        print(f"⚠️ Screener CSV parse error: {e}", flush=True)
+
+    return symbols
+
+
+def _get_fo_symbols():
+    """
+    Return a set of NSE stock symbols that have options traded on NFO.
+    Queries the live Kite instruments list once per call (cached per refresh cycle).
+    """
+    try:
+        nfo = kite.instruments("NFO")
+        # Stock options have instrument_type "CE" or "PE" and a name that is the stock symbol
+        fo_set = set()
+        for inst in nfo:
+            if inst.get("instrument_type") in ("CE", "PE"):
+                name = inst.get("name", "").strip().upper()
+                if name:
+                    fo_set.add(name)
+        return fo_set
+    except Exception as e:
+        print(f"⚠️ F&O symbol fetch error: {e}", flush=True)
+        return set()
+
+
+def refresh_screener_daily(force=False):
+    """
+    Fetch today's Screener.in screen results and populate:
+      _screener_stocks_today    — all NSE symbols passing the screen
+      _screener_fo_stocks_today — subset that are F&O eligible (have NFO options)
+
+    Called automatically at 8:55 AM IST every weekday.
+    Set force=True to trigger a manual refresh (e.g. from Telegram command).
+    Skips if already refreshed today (unless force=True).
+    """
+    global _screener_session, _screener_stocks_today, _screener_fo_stocks_today, _screener_refresh_date
+
+    if not USE_SCREENER:
+        return
+    if not SCREENER_SCREEN_ID:
+        print("⚠️ SCREENER_SCREEN_ID not set in config.py — skipping Screener refresh", flush=True)
+        return
+
+    today = datetime.now(IST).date()
+    if not force and _screener_refresh_date == today:
+        return  # already refreshed today
+
+    print(f"🔍 Fetching Screener.in screen {SCREENER_SCREEN_ID}...", flush=True)
+    try:
+        # Build session from stored cookie if not yet created
+        if _screener_session is None:
+            _screener_session = _screener_build_session()
+
+        export_url = f"https://www.screener.in/screens/{SCREENER_SCREEN_ID}/?export=1"
+        resp = _screener_session.get(export_url, timeout=20)
+
+        # Cookie expired mid-session — rebuild once and retry
+        if "/login/" in resp.url or resp.status_code in (401, 403):
+            print("🔄 Screener cookie expired — rebuilding session", flush=True)
+            _screener_session = _screener_build_session()
+            resp = _screener_session.get(export_url, timeout=20)
+
+        resp.raise_for_status()
+
+        symbols = _screener_parse_nse_symbols(resp.text)
+        if not symbols:
+            print("⚠️ Screener returned 0 symbols — check screen ID or login", flush=True)
+            return
+
+        # Cross-reference with Kite NFO for F&O eligibility
+        fo_set = _get_fo_symbols()
+        fo_symbols = [s for s in symbols if s in fo_set]
+
+        _screener_stocks_today    = symbols
+        _screener_fo_stocks_today = fo_symbols
+        _screener_refresh_date    = today
+
+        print(
+            f"✅ Screener refresh done: {len(symbols)} stocks, "
+            f"{len(fo_symbols)} F&O eligible: {fo_symbols[:10]}",
+            flush=True
+        )
+        send_message(
+            f"🔍 SCREENER REFRESH — {today.strftime('%d %b %Y')}\n"
+            f"📋 Screen ID : {SCREENER_SCREEN_ID}\n"
+            f"📈 Stocks    : {len(symbols)} qualify the filter\n"
+            f"🎯 F&O stocks: {len(fo_symbols)}\n"
+            f"   {', '.join(fo_symbols) if fo_symbols else 'None'}\n"
+            f"\n"
+            f"🛒 Swing universe  : {', '.join(symbols[:15])}{'…' if len(symbols)>15 else ''}\n"
+            f"📊 F&O options list: {', '.join(fo_symbols[:15])}{'…' if len(fo_symbols)>15 else ''}"
+        )
+
+    except Exception as e:
+        print(f"❌ Screener refresh failed: {e}", flush=True)
+        send_message(
+            f"❌ SCREENER REFRESH FAILED\n"
+            f"Error: {e}\n"
+            f"\n"
+            f"If cookie expired:\n"
+            f"1. Open screener.in in Chrome (log in via Google)\n"
+            f"2. F12 → Application → Cookies → www.screener.in\n"
+            f"3. Copy 'sessionid' value\n"
+            f"4. Update SCREENER_SESSION_COOKIE in config.py & redeploy\n"
+            f"\n"
+            f"Falling back to stocks.txt / stock_options.txt today"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6288,7 +6578,11 @@ def swing_loop():
                 time.sleep(120)
                 continue
 
-            stocks = load_swing_stocks()
+            # Use Screener results if enabled and populated; else fall back to stocks.txt
+            if USE_SCREENER and _screener_stocks_today:
+                stocks = _screener_stocks_today
+            else:
+                stocks = load_swing_stocks()
             if not stocks:
                 time.sleep(300)
                 continue
@@ -6801,7 +7095,11 @@ def stock_options_loop():
                 time.sleep(60)
                 continue
 
-            stocks = load_stock_options_list()
+            # Use Screener F&O list if enabled and populated; else fall back to stock_options.txt
+            if USE_SCREENER and _screener_fo_stocks_today:
+                stocks = _screener_fo_stocks_today
+            else:
+                stocks = load_stock_options_list()
             if not stocks:
                 time.sleep(300)
                 continue
@@ -6996,13 +7294,10 @@ def _read_today_csv_swing():
 
 
 def send_sensex_eod_report():
-    """Sent at 3:33 PM. Reads from CSV so restarts don't wipe the numbers."""
-    csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv("SENSEX")
-
-    pnl    = max(csv_pnl,    sensex_daily_pnl,    key=abs) if csv_count or sensex_trade_count else 0
-    wins   = max(csv_wins,   sensex_daily_wins)
-    losses = max(csv_losses, sensex_daily_losses)
-    count  = max(csv_count,  sensex_trade_count)
+    """Sent at 3:33 PM. Uses Kite positions API as primary source (restart-safe)."""
+    pnl, wins, losses, count = _best_day_pnl(
+        "SENSEX", sensex_daily_pnl, sensex_daily_wins, sensex_daily_losses, sensex_trade_count
+    )
 
     total = wins + losses
     wr = (wins / total * 100) if total > 0 else 0
@@ -7019,13 +7314,10 @@ def send_sensex_eod_report():
 
 
 def send_banknifty_eod_report():
-    """Sent at 3:31 PM alongside Nifty report. Reads from CSV so restarts don't wipe the numbers."""
-    csv_pnl, csv_wins, csv_losses, csv_count = _read_today_csv("BANKNIFTY")
-
-    pnl    = max(csv_pnl,    banknifty_daily_pnl,    key=abs) if csv_count or banknifty_trade_count else 0
-    wins   = max(csv_wins,   banknifty_daily_wins)
-    losses = max(csv_losses, banknifty_daily_losses)
-    count  = max(csv_count,  banknifty_trade_count)
+    """Sent at 3:32 PM. Uses Kite positions API as primary source (restart-safe)."""
+    pnl, wins, losses, count = _best_day_pnl(
+        "BANKNIFTY", banknifty_daily_pnl, banknifty_daily_wins, banknifty_daily_losses, banknifty_trade_count
+    )
 
     total = wins + losses
     wr = (wins / total * 100) if total > 0 else 0
@@ -7171,10 +7463,12 @@ if __name__ == "__main__":
     _stockopt_eod_sent    = [False]
     _crude_eod_sent       = [False]
     _full_report_sent     = [False]
+    _screener_refresh_sent = [False]    # daily 8:55 AM Screener fetch flag
 
     def daily_report_scheduler():
         """
         Sends end-of-day reports at precise times:
+          8:55 AM IST  → Screener.in screen fetch (stock universe refresh)
           3:31 PM IST  → Nifty session closed report
           3:32 PM IST  → BankNifty session closed report
           3:33 PM IST  → SENSEX session closed report
@@ -7189,13 +7483,26 @@ if __name__ == "__main__":
 
                 # Reset flags at midnight
                 if now.hour == 0 and now.minute < 2:
-                    _nifty_eod_sent[0]      = False
-                    _banknifty_eod_sent[0]  = False
-                    _sensex_eod_sent[0]     = False
-                    _swing_eod_sent[0]      = False
-                    _stockopt_eod_sent[0]   = False
-                    _crude_eod_sent[0]      = False
-                    _full_report_sent[0]    = False
+                    _nifty_eod_sent[0]       = False
+                    _banknifty_eod_sent[0]   = False
+                    _sensex_eod_sent[0]      = False
+                    _swing_eod_sent[0]       = False
+                    _stockopt_eod_sent[0]    = False
+                    _crude_eod_sent[0]       = False
+                    _full_report_sent[0]     = False
+                    _screener_refresh_sent[0]= False
+
+                # 8:55 AM weekdays — Screener.in stock universe refresh (only when enabled)
+                if (USE_SCREENER
+                        and now.hour == 8 and now.minute == 55
+                        and now.weekday() < 5
+                        and not _screener_refresh_sent[0]):
+                    threading.Thread(
+                        target=refresh_screener_daily,
+                        daemon=True,
+                        name="ScreenerRefresh"
+                    ).start()
+                    _screener_refresh_sent[0] = True
 
                 # 3:31 PM — Nifty EOD report
                 if now.hour == 15 and now.minute == 31 and not _nifty_eod_sent[0]:
@@ -7296,6 +7603,8 @@ if __name__ == "__main__":
             f"⚙️ SL     : 25% → 45% two-tier (F&O) | {SWING_SL_PCT*100:.0f}% fixed (Swing)\n"
             f"⚙️ Target : HalfTrend flip (F&O) | {SWING_TARGET_PCT*100:.0f}% fixed or flip (Swing)\n"
             f"⚙️ Flip   : Immediate exit + re-entry on arrow reversal\n"
+            f"\n"
+            f"🔍 Screener : {'✅ ENABLED — screen ' + str(SCREENER_SCREEN_ID) + ' | refresh 8:55 AM' if USE_SCREENER else '⚠️ DISABLED — using stocks.txt / stock_options.txt'}\n"
             f"📅 Reports: NIFTY@3:31 | BankNifty@3:32 | SENSEX@3:33 | Swing@3:34 | StockOpt@3:35 | Crude@11:31"
         )
     except Exception as e:

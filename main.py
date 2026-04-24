@@ -411,6 +411,12 @@ USE_SCREENER              = getattr(config, "USE_SCREENER", False)
 SCREENER_SESSION_COOKIE   = getattr(config, "SCREENER_SESSION_COOKIE", "")   # 'sessionid' cookie value
 SCREENER_SCREEN_ID        = getattr(config, "SCREENER_SCREEN_ID", "")        # numeric ID from URL
 
+# ── Higher Timeframe (30-min) Trend Filter ────────────────────────────────────
+# When True, a 15-min signal is only taken if the 30-min HalfTrend trend
+# direction AGREES.  Filters out counter-trend entries on 15-min.
+# Set False to trade all 15-min signals regardless of 30-min trend.
+USE_HTF_FILTER = True           # ✅ 30-min direction filter enabled
+
 # ── Stop Loss ─────────────────────────────────────────────────────────────────
 # Set False to disable ALL SL logic (trailing + hard SL).
 # Profit-lock logic is NOT affected — it always stays active.
@@ -821,6 +827,10 @@ _last_fetch_crude_1h = [0]
 _cached_nifty_ht_1h  = [None]
 _cached_crude_ht_1h  = [None]
 
+# 30-min HalfTrend cache for HTF direction filter
+# { token: {"ht": DataFrame, "ts": float} }  — refreshed every 5 min
+_htf_30m_cache = {}
+
 def get_mtf_trend(token, instrument):
     """
     Fetches 1-hour HalfTrend and returns the trend direction of the last
@@ -852,6 +862,61 @@ def get_mtf_trend(token, instrument):
     except Exception as _e:
         print(f"⚠️ MTF error ({instrument}): {_e}")
         return None   # return None → MTF filter skipped gracefully
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 📐 check_htf_filter(signal, token)
+# 30-minute HalfTrend direction filter.
+# Only allows entry when the 30-min trend agrees with the 15-min signal.
+# ──────────────────────────────────────────────────────────────────────────────
+def check_htf_filter(signal, token):
+    """
+    Returns (allowed: bool, reason: str).
+
+    Rule:
+      30-min trend == 0 (bullish) → only CALL entries allowed
+      30-min trend == 1 (bearish) → only PUT entries allowed
+
+    Caches the 30-min HalfTrend DataFrame for 5 minutes to avoid
+    recomputing on every loop iteration (30-min candles barely change
+    within a 5-min window).
+
+    If disabled (USE_HTF_FILTER=False) or data unavailable → always passes.
+    """
+    if not USE_HTF_FILTER:
+        return True, "HTF filter off"
+
+    now_ts = time.time()
+    cached = _htf_30m_cache.get(token)
+
+    try:
+        # Refresh cache if missing or older than 5 minutes
+        if cached is None or (now_ts - cached["ts"]) > 300:
+            df_30m = get_cached_data(token, "30minute", 200)
+            if df_30m is None or len(df_30m) < 50:
+                return True, "HTF: not enough 30-min bars — filter skipped"
+            ht_30m = halftrend_tv(df_30m, amplitude=2, channel_deviation=2)
+            _htf_30m_cache[token] = {"ht": ht_30m, "ts": now_ts}
+        else:
+            ht_30m = cached["ht"]
+
+        # Use last CLOSED 30-min candle (anti-repaint, same rule as 15-min)
+        last_30m        = ht_30m.iloc[-2]
+        trend_30m       = int(last_30m["trend"])   # 0 = bullish, 1 = bearish
+        htf_direction   = "CALL" if trend_30m == 0 else "PUT"
+        htf_ht_val      = last_30m["ht"]
+
+        if htf_direction == signal:
+            return True, f"✅ 30-min HT: {htf_direction} (HT={htf_ht_val:.1f}) — agrees with {signal}"
+        else:
+            return False, (
+                f"🚫 HTF BLOCK: 30-min trend is {htf_direction} "
+                f"(HT={htf_ht_val:.1f}) — counter-trend {signal} entry skipped"
+            )
+
+    except Exception as e:
+        print(f"⚠️ HTF filter error: {e}", flush=True)
+        return True, f"HTF filter error ({e}) — skipped"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -887,13 +952,23 @@ def get_ml_signal():
 # ──────────────────────────────────────────────────────────────────────────────
 def apply_entry_filters(signal, instrument, df_15m, token):
     """
-    Runs ADX, MTF, VIX, and Session filters.
-    Returns True if ALL enabled filters pass, False if any blocks entry.
-    Also returns a human-readable reason string for logging / Telegram.
+    All entry filters — each independently controlled by a True/False flag in config.
+
+    Filters (in order):
+      1. Session dead zone   — USE_SESSION_FILTER   (11:30 AM–1:30 PM block)
+      2. ADX trend strength  — USE_ADX_FILTER        (ADX >= ADX_MIN_VALUE)
+      3. MTF 1-hour          — USE_MTF_FILTER        (1h HalfTrend agrees)
+      4. India VIX           — USE_VIX_FILTER        (VIX between VIX_MIN/VIX_MAX)
+      5. EMA 9/15 stack      — USE_EMA_FILTER        (9 EMA above/below 15 EMA)
+      6. ML signal           — USE_ML_FILTER         (ML model agrees, NIFTY only)
+      7. HTF 30-min          — USE_HTF_FILTER        (handled separately before this call)
+
+    Set any flag to False to skip that filter entirely.
+    Returns (passed: bool, reason: str).
     """
     now_ist = datetime.now(IST)
 
-    # ── 1. Session timing filter (NIFTY + BANKNIFTY — same session hours) ────────
+    # ── 1. Session dead zone ──────────────────────────────────────────────────
     if USE_SESSION_FILTER and instrument in ("NIFTY", "BANKNIFTY", "SENSEX"):
         _dead = (
             (now_ist.hour == 11 and now_ist.minute >= 30) or
@@ -903,30 +978,27 @@ def apply_entry_filters(signal, instrument, df_15m, token):
         if _dead:
             return False, "⏸️ Session filter: 11:30 AM–1:30 PM dead zone (low momentum)"
 
-    # ── 2. ADX filter (trend strength) ────────────────────────────────────────
+    # ── 2. ADX trend strength ─────────────────────────────────────────────────
+    _adx_str = "ADX=off"
     if USE_ADX_FILTER and df_15m is not None:
         try:
-            adx_s   = ADX(df_15m, period=14)
-            adx_val = adx_s.iloc[-2]   # last CLOSED candle
+            adx_val = ADX(df_15m, period=14).iloc[-2]
             if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
-                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} below {ADX_MIN_VALUE} (choppy market)"
+                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} < {ADX_MIN_VALUE} (choppy market)"
             _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
         except Exception as _e:
-            _adx_str = f"ADX=err({_e})"
-    else:
-        _adx_str = "ADX=off"
+            _adx_str = f"ADX=err"
 
-    # ── 3. MTF 1-hour confirmation ─────────────────────────────────────────────
+    # ── 3. MTF 1-hour confirmation ────────────────────────────────────────────
+    _mtf_str = "MTF=off"
     if USE_MTF_FILTER:
         trend_1h = get_mtf_trend(token, instrument)
         if trend_1h is not None and trend_1h != signal:
-            return False, (f"⏸️ MTF filter: 1h trend={trend_1h} ≠ 15m signal={signal} "
-                           f"(counter-trend — skip)")
+            return False, f"⏸️ MTF filter: 1h={trend_1h} disagrees with 15m={signal}"
         _mtf_str = f"1h={trend_1h or 'N/A'}"
-    else:
-        _mtf_str = "MTF=off"
 
-    # ── 4. India VIX filter ───────────────────────────────────────────────────
+    # ── 4. India VIX ──────────────────────────────────────────────────────────
+    _vix_str = "VIX=off"
     if USE_VIX_FILTER:
         vix = get_india_vix()
         if vix is not None:
@@ -935,52 +1007,35 @@ def apply_entry_filters(signal, instrument, df_15m, token):
             if vix > VIX_MAX:
                 return False, f"⏸️ VIX filter: VIX={vix:.1f} > {VIX_MAX} (too volatile)"
             _vix_str = f"VIX={vix:.1f}"
-        else:
-            _vix_str = "VIX=N/A"
-    else:
-        _vix_str = "VIX=off"
 
-    # ── 5. 9/15 EMA second signal source (NIFTY + CRUDE) ─────────────────────
-    # 9 EMA must be on the correct side of 15 EMA to confirm HalfTrend direction.
-    # Uses last CLOSED candle (-2) — same anti-repaint rule as HalfTrend.
+    # ── 5. EMA 9/15 stack confirmation ────────────────────────────────────────
     _ema_str = "EMA=off"
-    if USE_EMA_FILTER and df_15m is not None:
+    if USE_EMA_FILTER and df_15m is not None and len(df_15m) >= 20:
         try:
-            ema9  = df_15m["close"].ewm(span=9,  adjust=False).mean()
-            ema15 = df_15m["close"].ewm(span=15, adjust=False).mean()
-            e9    = round(float(ema9.iloc[-2]),  2)
-            e15   = round(float(ema15.iloc[-2]), 2)
-
+            e9  = round(float(df_15m["close"].ewm(span=9,  adjust=False).mean().iloc[-2]), 2)
+            e15 = round(float(df_15m["close"].ewm(span=15, adjust=False).mean().iloc[-2]), 2)
             if signal == "CALL" and e9 < e15:
-                return False, (f"⏸️ EMA filter: 9 EMA ({e9:.1f}) below 15 EMA ({e15:.1f}) "
-                               f"— bearish EMA, HalfTrend says CALL (disagreement)")
+                return False, f"⏸️ EMA filter: 9 EMA ({e9:.1f}) < 15 EMA ({e15:.1f}) — bearish stack vs CALL"
             if signal == "PUT" and e9 > e15:
-                return False, (f"⏸️ EMA filter: 9 EMA ({e9:.1f}) above 15 EMA ({e15:.1f}) "
-                               f"— bullish EMA, HalfTrend says PUT (disagreement)")
-
-            _ema_str = f"EMA9={e9:.1f} {'>' if e9 > e15 else '<'} EMA15={e15:.1f}"
+                return False, f"⏸️ EMA filter: 9 EMA ({e9:.1f}) > 15 EMA ({e15:.1f}) — bullish stack vs PUT"
+            _ema_str = f"EMA9={e9:.1f} {'>' if e9>e15 else '<'} EMA15={e15:.1f}"
         except Exception as _e:
-            _ema_str = f"EMA=err({_e})"
+            _ema_str = "EMA=err"
 
-    # ── 6. ML Signal filter (NIFTY only) ─────────────────────────────────────
+    # ── 6. ML signal (NIFTY only) ─────────────────────────────────────────────
     _ml_str = "ML=off"
     if USE_ML_FILTER and instrument == "NIFTY":
         ml_sig, ml_conf, ml_reason = get_ml_signal()
-
         if ml_sig is None:
-            # Server unreachable and ML_REQUIRED=False → allow trade, log it
             _ml_str = "ML=skipped(server down)"
         elif ml_sig == "HOLD":
-            return False, f"🤖 ML filter: HOLD — {ml_reason} (confidence: {ml_conf:.0f}%)"
+            return False, f"🤖 ML filter: HOLD — {ml_reason} ({ml_conf:.0f}%)"
         elif ml_sig != signal:
-            return False, (f"🤖 ML filter: disagreement — ML={ml_sig} vs HalfTrend={signal} "
-                           f"(confidence: {ml_conf:.0f}%)")
+            return False, f"🤖 ML filter: ML={ml_sig} vs HT={signal} ({ml_conf:.0f}%)"
         elif ml_conf < ML_MIN_CONFIDENCE:
-            return False, (f"🤖 ML filter: low confidence — {ml_conf:.0f}% below {ML_MIN_CONFIDENCE}% "
-                           f"({ml_reason})")
+            return False, f"🤖 ML filter: low confidence {ml_conf:.0f}% < {ML_MIN_CONFIDENCE}%"
         else:
             _ml_str = f"ML={ml_sig}({ml_conf:.0f}%)"
-            print(f"🤖 ML confirmed: {ml_sig} | confidence={ml_conf:.1f}% | {ml_reason}", flush=True)
 
     return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str}"
 
@@ -3526,6 +3581,20 @@ def nifty_loop():
                     continue
 
             # ══════════════════════════════════════════════════════════════
+            # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)
+            # ══════════════════════════════════════════════════════════════
+            _htf_ok, _htf_reason = check_htf_filter(signal, config.NIFTY_TOKEN)
+            if not _htf_ok:
+                print(f"📐 NIFTY HTF block — {_htf_reason}", flush=True)
+                _hkey = f"NIFTY_htf_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(nifty_loop, "_htf_alerted", None) != _hkey:
+                    send_message(f"📐 NIFTY HTF BLOCK\n{_htf_reason}")
+                    nifty_loop._htf_alerted = _hkey
+                time.sleep(30)
+                continue
+            print(f"   {_htf_reason}", flush=True)
+
+            # ══════════════════════════════════════════════════════════════
             # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session)
             # All filters must pass before order placement.
             # ══════════════════════════════════════════════════════════════
@@ -3835,6 +3904,20 @@ def crude_loop():
                 _bars_ago_c = len(ht_df) - arrow_idx - 2
                 _freshness_c = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago_c * 15} min ago)"
                 print(f"🔔 CRUDE {signal} {_freshness_c} @ ₹{_level_c:.2f}", flush=True)
+
+            # ══════════════════════════════════════════════════════════════
+            # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)
+            # ══════════════════════════════════════════════════════════════
+            _htf_ok, _htf_reason = check_htf_filter(signal, CRUDE_TOKEN)
+            if not _htf_ok:
+                print(f"📐 CRUDE HTF block — {_htf_reason}", flush=True)
+                _hkey = f"CRUDE_htf_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(crude_loop, "_htf_alerted", None) != _hkey:
+                    send_message(f"📐 CRUDE HTF BLOCK\n{_htf_reason}")
+                    crude_loop._htf_alerted = _hkey
+                time.sleep(30)
+                continue
+            print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
             # 📊  STRATEGY FILTERS  (ADX / MTF / VIX)
@@ -4174,6 +4257,20 @@ def banknifty_loop():
                     continue
 
             # ══════════════════════════════════════════════════════════════
+            # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)
+            # ══════════════════════════════════════════════════════════════
+            _htf_ok, _htf_reason = check_htf_filter(signal, BANKNIFTY_TOKEN)
+            if not _htf_ok:
+                print(f"📐 BANKNIFTY HTF block — {_htf_reason}", flush=True)
+                _hkey = f"BANKNIFTY_htf_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(banknifty_loop, "_htf_alerted", None) != _hkey:
+                    send_message(f"📐 BANKNIFTY HTF BLOCK\n{_htf_reason}")
+                    banknifty_loop._htf_alerted = _hkey
+                time.sleep(30)
+                continue
+            print(f"   {_htf_reason}", flush=True)
+
+            # ══════════════════════════════════════════════════════════════
             # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session)
             # ══════════════════════════════════════════════════════════════
             _filter_ok, _filter_reason = apply_entry_filters(
@@ -4479,6 +4576,20 @@ def sensex_loop():
                 if getattr(sensex_loop, "_carryover_done", None) == carryover_key:
                     time.sleep(10)
                     continue
+
+            # ══════════════════════════════════════════════════════════════
+            # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)
+            # ══════════════════════════════════════════════════════════════
+            _htf_ok, _htf_reason = check_htf_filter(signal, SENSEX_TOKEN)
+            if not _htf_ok:
+                print(f"📐 SENSEX HTF block — {_htf_reason}", flush=True)
+                _hkey = f"SENSEX_htf_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(sensex_loop, "_htf_alerted", None) != _hkey:
+                    send_message(f"📐 SENSEX HTF BLOCK\n{_htf_reason}")
+                    sensex_loop._htf_alerted = _hkey
+                time.sleep(30)
+                continue
+            print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
             # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session)

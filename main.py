@@ -2521,7 +2521,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         remaining_qty -= half_qty
                         partial_booked = True
 
-                        print(f"💰 Partial booked: {symbol}", flush=True)
+                        # Reset profit lock baseline to current half-qty P&L.
+                        # Without this, local_max_profit stays at full-qty peak,
+                        # so lock_level is unreachable with half qty → exits immediately.
+                        local_max_profit = profit * remaining_qty
+
+                        print(f"💰 Partial booked: {symbol} | Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
 
             # ===============================
             # 💰 GLOBAL PROFIT PROTECTION

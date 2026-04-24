@@ -42,7 +42,7 @@ BANKNIFTY_TOKEN = 260105
 SENSEX_TOKEN = 265
 
 
-USE_SCREENER             = True
+USE_SCREENER             = False
 SCREENER_SESSION_COOKIE  = "tg3e1qszm56un498a6xvu0738zwhztbq"   # paste sessionid here
 SCREENER_SCREEN_ID       = "3617311"           # from your screen's URL
 # -----------------------------

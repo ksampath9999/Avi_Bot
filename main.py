@@ -1910,13 +1910,13 @@ def find_option(signal, instrument):
         # BankNifty lot = 15. Strikes move in ₹100 steps.
         # ATM BankNifty option ~₹100-400. Lot value = premium × 15.
         if balance <= 5000:
-            strike_shift = 2       # ₹300 OTM
+            strike_shift = 1       # ₹300 OTM
             max_price = 120        # ₹120 × 15 = ₹1,800 per lot
         elif balance <= 10000:
-            strike_shift = 2
+            strike_shift = 1
             max_price = 200        # ₹200 × 15 = ₹3,000 per lot
         elif balance <= 20000:
-            strike_shift = 2
+            strike_shift = 1
             max_price = 300        # ₹300 × 15 = ₹4,500 per lot
         elif balance <= 35000:
             strike_shift = 1
@@ -5908,62 +5908,63 @@ def _instrument_report_section(today_df_inst, instrument_name, daily_pnl_val):
 
 def send_daily_report():
     """
-    Per-instrument daily report sent after market close.
-    Nifty section  → sent at 3:31 PM (end of equity session).
-    Crude section  → included when called after 11 PM (end of MCX session).
-    The report scheduler calls this function; it handles both instruments.
+    Combined end-of-day report sent at 11:32 PM covering all instruments.
+    Uses Kite positions API as primary source (same as individual EOD reports)
+    so it survives Railway restarts and always matches Kite dashboard.
     """
     global report_sent_today
-    global portfolio_pnl, max_drawdown
-    global nifty_daily_pnl, crude_daily_pnl
-
     report_sent_today = True
 
-    if not os.path.exists(TRADE_LOG_FILE):
-        send_message("📊 Daily Report: No trades recorded today")
-        return
+    today = datetime.now(IST).strftime("%d %b %Y")
 
     try:
-        df = pd.read_csv(TRADE_LOG_FILE)
+        # ── Fetch P&L for every instrument from Kite (ground truth) ──────────
+        n_pnl,  n_wins,  n_losses,  n_count  = _best_day_pnl(
+            "NIFTY",     nifty_daily_pnl,     nifty_daily_wins,     nifty_daily_losses,     nifty_trade_count)
+        bn_pnl, bn_wins, bn_losses, bn_count = _best_day_pnl(
+            "BANKNIFTY", banknifty_daily_pnl, banknifty_daily_wins, banknifty_daily_losses, banknifty_trade_count)
+        sx_pnl, sx_wins, sx_losses, sx_count = _best_day_pnl(
+            "SENSEX",    sensex_daily_pnl,    sensex_daily_wins,    sensex_daily_losses,    sensex_trade_count)
+        c_pnl,  c_wins,  c_losses,  c_count  = _best_day_pnl(
+            "CRUDE",     crude_daily_pnl,     crude_daily_wins,     crude_daily_losses,     crude_trade_count)
 
-        # Ensure correct column names (8-column format)
-        expected_cols = ["time", "instrument", "symbol", "signal", "entry", "exit", "pnl", "probability"]
-        if list(df.columns) != expected_cols:
-            # Legacy 5-column file — rebuild header gracefully
-            df.columns = expected_cols[:len(df.columns)]
+        total_pnl    = n_pnl + bn_pnl + sx_pnl + c_pnl
+        total_trades = n_count + bn_count + sx_count + c_count
+        total_wins   = n_wins  + bn_wins  + sx_wins  + c_wins
+        total_losses = n_losses + bn_losses + sx_losses + c_losses
+        win_rate     = (total_wins / total_trades * 100) if total_trades > 0 else 0
 
-        df["time"] = pd.to_datetime(df["time"])
-        from datetime import date
-        today = date.today()
-        today_df = df[df["time"].dt.date == today]
-
-        # ── Per-instrument split ───────────────────────────────────────────
-        nifty_df = today_df[today_df["instrument"].str.upper() == "NIFTY"] if "instrument" in today_df.columns else pd.DataFrame()
-        crude_df = today_df[today_df["instrument"].str.upper() == "CRUDE"] if "instrument" in today_df.columns else pd.DataFrame()
-
-        nifty_section = _instrument_report_section(nifty_df, "NIFTY", nifty_daily_pnl)
-        crude_section = _instrument_report_section(crude_df, "CRUDE OIL", crude_daily_pnl)
-
-        total_pnl  = nifty_daily_pnl + crude_daily_pnl
-        total_trades = len(today_df)
+        def _section(label, pnl, wins, losses, count):
+            if count == 0:
+                return f"\n{label}: No trades today"
+            wr = (wins / count * 100) if count > 0 else 0
+            sign = "✅" if pnl >= 0 else "❌"
+            return (
+                f"\n{sign} {label}\n"
+                f"   P&L: ₹{pnl:,.0f}  |  {count} trades  |  WR: {wr:.0f}%"
+            )
 
         report = (
-            f"📅 DAILY TRADING REPORT — {today.strftime('%d %b %Y')}\n"
+            f"📅 DAILY TRADING REPORT — {today}\n"
             f"{'='*30}\n"
             f"🏦 Combined Net P&L : ₹{total_pnl:,.0f}\n"
-            f"📊 Total Trades     : {total_trades}\n"
-            f"📉 Max Drawdown     : ₹{max_drawdown:,.0f}\n"
-            + nifty_section
-            + crude_section +
+            f"📊 Total Trades     : {total_trades}  "
+            f"(✅ {total_wins} wins  ❌ {total_losses} losses)\n"
+            f"🎯 Overall Win Rate : {win_rate:.1f}%\n"
+            f"{'='*30}"
+            + _section("NIFTY",     n_pnl,  n_wins,  n_losses,  n_count)
+            + _section("BANKNIFTY", bn_pnl, bn_wins, bn_losses, bn_count)
+            + _section("SENSEX",    sx_pnl, sx_wins, sx_losses, sx_count)
+            + _section("CRUDE OIL", c_pnl,  c_wins,  c_losses,  c_count) +
             f"\n{'='*30}\n"
             f"⏰ Report time: {datetime.now(IST).strftime('%H:%M:%S IST')}"
         )
 
         send_message(report)
-        print("📊 Daily report sent")
+        print("📊 Daily report sent", flush=True)
 
     except Exception as e:
-        print("Report error:", e)
+        print(f"Report error: {e}", flush=True)
         send_message(f"❌ Daily report error: {e}")
 
 

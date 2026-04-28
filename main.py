@@ -1910,7 +1910,7 @@ def find_option(signal, instrument):
         # BankNifty lot = 15. Strikes move in ₹100 steps.
         # ATM BankNifty option ~₹100-400. Lot value = premium × 15.
         if balance <= 5000:
-            strike_shift = 3       # ₹300 OTM
+            strike_shift = 2       # ₹300 OTM
             max_price = 120        # ₹120 × 15 = ₹1,800 per lot
         elif balance <= 10000:
             strike_shift = 2

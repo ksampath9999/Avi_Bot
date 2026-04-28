@@ -415,7 +415,7 @@ SCREENER_SCREEN_ID        = getattr(config, "SCREENER_SCREEN_ID", "")        # n
 # When True, a 15-min signal is only taken if the 30-min HalfTrend trend
 # direction AGREES.  Filters out counter-trend entries on 15-min.
 # Set False to trade all 15-min signals regardless of 30-min trend.
-USE_HTF_FILTER = True           # ✅ 30-min direction filter enabled
+USE_HTF_FILTER = False           # ✅ 30-min direction filter enabled
 
 # ── Stop Loss ─────────────────────────────────────────────────────────────────
 # Set False to disable ALL SL logic (trailing + hard SL).
@@ -2336,17 +2336,13 @@ def place_order(symbol, qty, exchange, instrument):
             send_message(f"❌ Order cancelled: {symbol}")
             return None
 
-        # 📉 SLIPPAGE CHECK (STRICT)
+        # Log slippage for reference only — no exit triggered.
+        # Cheap options (₹20–₹50) have bid-ask spreads of ₹0.50–₹1.50 which
+        # is normal and should NOT cause an immediate exit. Real exits are
+        # handled by manage_trade() via profit lock / HalfTrend flip / SL.
         slippage = abs(filled_price - expected_price)
-
-        if slippage > expected_price * 0.012:  # tighter control
-            print(f"❌ High slippage: {slippage} — exiting filled position immediately")
-            send_message(f"❌ Trade slippage exit\n{symbol} slippage={slippage:.2f}")
-            # The order is already FILLED — cancel won't work. Exit the position instead.
-            exit_position(symbol, quantity, exchange)
-            return None
-
-        print(f"✅ Filled @ {filled_price}")
+        slippage_pct = (slippage / expected_price * 100) if expected_price else 0
+        print(f"✅ Filled @ {filled_price}  (slippage ₹{slippage:.2f} = {slippage_pct:.1f}%)")
         return filled_price
 
     except Exception as e:

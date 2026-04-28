@@ -356,7 +356,7 @@ ADX_MIN_VALUE      = 22     # Kite API data gives ~3 pts lower ADX than TradingV
 # Applies to both NIFTY and CRUDE on 15-min chart.
 # Set False to disable and trade on HalfTrend signal alone.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_EMA_FILTER     = True   # ✅ ACTIVE — 9/15 EMA must confirm HalfTrend signal
+USE_EMA_FILTER     = False   # ✅ ACTIVE — 9/15 EMA must confirm HalfTrend signal
 
 USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
                             # handles direction; ADX handles the real failure mode)

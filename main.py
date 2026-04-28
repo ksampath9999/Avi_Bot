@@ -625,6 +625,12 @@ _screener_stocks_today    = []            # all NSE symbols from screen today
 _screener_fo_stocks_today = []            # F&O-eligible subset (have NFO options)
 _screener_refresh_date    = None          # date object — re-fetches once per day
 
+# ── Disabled-instrument log suppression ──────────────────────────────────────
+# Each flag flips to True after the first "disabled" print — never prints again.
+_crude_disabled_logged    = False
+_banknifty_disabled_logged = False
+_sensex_disabled_logged   = False
+
 # ── Stock Options state ───────────────────────────────────────────────────────
 # { underlying_symbol: {"option_symbol": str, "entry": float, "qty": int,
 #                        "sl": float, "target": float, "signal": str, "exchange": "NFO"} }
@@ -3795,10 +3801,11 @@ def crude_loop():
         try:
             # ── Instrument kill-switch ────────────────────────────────────────
             if not ENABLE_CRUDE:
-                if last_status != "CRUDE_DISABLED":
+                global _crude_disabled_logged
+                if not _crude_disabled_logged:
                     print("⛔ CRUDE trading disabled (ENABLE_CRUDE=False)", flush=True)
-                    last_status = "CRUDE_DISABLED"
-                time.sleep(30)
+                    _crude_disabled_logged = True
+                time.sleep(60)
                 continue
 
             now_dt = datetime.now(IST)
@@ -4140,10 +4147,11 @@ def banknifty_loop():
         try:
             # ── Instrument kill-switch ────────────────────────────────────────
             if not ENABLE_BANKNIFTY:
-                if last_status != "BANKNIFTY_DISABLED":
+                global _banknifty_disabled_logged
+                if not _banknifty_disabled_logged:
                     print("⛔ BANKNIFTY trading disabled (ENABLE_BANKNIFTY=False)", flush=True)
-                    last_status = "BANKNIFTY_DISABLED"
-                time.sleep(30)
+                    _banknifty_disabled_logged = True
+                time.sleep(60)
                 continue
 
             now_dt = datetime.now(IST)
@@ -4461,10 +4469,11 @@ def sensex_loop():
         try:
             # ── Instrument kill-switch ────────────────────────────────────────
             if not ENABLE_SENSEX:
-                if last_status != "SENSEX_DISABLED":
+                global _sensex_disabled_logged
+                if not _sensex_disabled_logged:
                     print("⛔ SENSEX trading disabled (ENABLE_SENSEX=False)", flush=True)
-                    last_status = "SENSEX_DISABLED"
-                time.sleep(30)
+                    _sensex_disabled_logged = True
+                time.sleep(60)
                 continue
 
             now_dt = datetime.now(IST)
@@ -7810,4 +7819,4 @@ if __name__ == "__main__":
         time.sleep(60)
 
 
-    # end of __main__ b
+    # end of __main__ 

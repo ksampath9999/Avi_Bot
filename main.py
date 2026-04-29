@@ -2973,6 +2973,65 @@ def restore_position_state_from_kite():
             global_trade_active = True
 
 
+def restore_daily_state():
+    """
+    Called once at startup/redeploy.
+    Reads today's closed trades from Kite positions API and restores
+    in-memory counters so that:
+      • Daily trade limits work correctly (bot doesn't bypass MAX_X_TRADES_PER_DAY)
+      • Trade-closed Telegram messages show the correct running daily P&L
+      • Loss streak detection continues from the right count
+    """
+    global nifty_trade_count,     nifty_daily_pnl,     nifty_daily_wins,     nifty_daily_losses
+    global banknifty_trade_count, banknifty_daily_pnl, banknifty_daily_wins, banknifty_daily_losses
+    global sensex_trade_count,    sensex_daily_pnl,    sensex_daily_wins,    sensex_daily_losses
+    global crude_trade_count,     crude_daily_pnl,     crude_daily_wins,     crude_daily_losses
+    global daily_pnl, portfolio_pnl
+
+    print("🔄 Restoring today's trade counters from Kite...", flush=True)
+    restored_any = False
+
+    for instrument, prefix in [
+        ("NIFTY",     "nifty"),
+        ("BANKNIFTY", "banknifty"),
+        ("SENSEX",    "sensex"),
+        ("CRUDE",     "crude"),
+    ]:
+        try:
+            pnl, wins, losses, count = _kite_day_pnl(instrument)
+            if count > 0:
+                globals()[f"{prefix}_trade_count"]  = count
+                globals()[f"{prefix}_daily_pnl"]    = pnl
+                globals()[f"{prefix}_daily_wins"]   = wins
+                globals()[f"{prefix}_daily_losses"] = losses
+                print(
+                    f"  ✅ {instrument}: {count} trade(s) restored — "
+                    f"P&L=₹{pnl:.0f}  W{wins}/L{losses}",
+                    flush=True
+                )
+                restored_any = True
+        except Exception as e:
+            print(f"  ⚠️ {instrument} restore failed: {e}", flush=True)
+
+    if restored_any:
+        # Sync combined daily P&L with restored per-instrument totals
+        daily_pnl = nifty_daily_pnl + banknifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl
+        portfolio_pnl = daily_pnl
+        print(f"✅ Daily state restored — combined P&L today: ₹{daily_pnl:.0f}", flush=True)
+        send_message(
+            f"🔄 BOT REDEPLOYED — STATE RESTORED\n"
+            f"{'='*28}\n"
+            f"📌 NIFTY     : {nifty_trade_count} trades  ₹{nifty_daily_pnl:,.0f}\n"
+            f"📌 BANKNIFTY : {banknifty_trade_count} trades  ₹{banknifty_daily_pnl:,.0f}\n"
+            f"📌 SENSEX    : {sensex_trade_count} trades  ₹{sensex_daily_pnl:,.0f}\n"
+            f"📌 CRUDE     : {crude_trade_count} trades  ₹{crude_daily_pnl:,.0f}\n"
+            f"{'='*28}\n"
+            f"🏦 Combined  : ₹{daily_pnl:,.0f}"
+        )
+    else:
+        print("✅ No prior trades today — counters start from zero", flush=True)
+
+
 #exit sell orders
 def exit_position(symbol, qty, exchange):
     """
@@ -7576,6 +7635,9 @@ if __name__ == "__main__":
     # ── Restore any open positions from previous session ────────────────────
     print("🔍 Checking Kite for existing open positions...")
     restore_position_state_from_kite()
+
+    # ── Restore today's trade counters (survives mid-day redeploy) ───────────
+    restore_daily_state()
 
     # ── Daily report scheduler ──────────────────────────────────────────────
     _nifty_eod_sent       = [False]   # mutable so inner function can write

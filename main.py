@@ -1955,13 +1955,13 @@ def find_option(signal, instrument):
         # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
         # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
         if balance <= 5000:
-            strike_shift = 3      # 3 strikes OTM — affordable but tradeable
+            strike_shift = 2      # 3 strikes OTM — affordable but tradeable
             max_price = 60        # ₹60 × 65 = ₹3,900 per lot
         elif balance <= 10000:
-            strike_shift = 2      # 2 strikes OTM — better delta
+            strike_shift = 1      # 2 strikes OTM — better delta
             max_price = 100       # ₹100 × 65 = ₹6,500 per lot
         elif balance <= 20000:
-            strike_shift = 2      # 2 strikes OTM
+            strike_shift = 21     # 2 strikes OTM
             max_price = 130       # ₹130 × 65 = ₹8,450 per lot
         elif balance <= 35000:
             strike_shift = 1      # 1 strike OTM

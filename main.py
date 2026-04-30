@@ -67,17 +67,52 @@ def zerodha_auto_login():
         "X-Kite-Version" : "3",
     })
 
+    def _safe_json(response, step_name):
+        """Parse JSON safely — raise a clear error if body is empty or not JSON."""
+        body = response.text.strip() if response.text else ""
+        if not body:
+            raise Exception(
+                f"{step_name} returned empty response body "
+                f"(HTTP {response.status_code}). "
+                f"Possible causes: rate-limit, IP block, or Zerodha server issue. "
+                f"Headers: {dict(response.headers)}"
+            )
+        try:
+            return response.json()
+        except Exception:
+            raise Exception(
+                f"{step_name} returned non-JSON (HTTP {response.status_code}). "
+                f"Body preview: {body[:300]}"
+            )
+
     try:
-        # ── Step 1: POST login credentials ──────────────────────────────────
+        # ── Step 1: POST login credentials (with retry) ──────────────────────
         print("🔐 Auto-login: posting credentials...")
-        resp = session.post(
-            "https://kite.zerodha.com/api/login",
-            data={"user_id": user_id, "password": password},
-            timeout=15,
-        )
-        data = resp.json()
+        data = None
+        for _login_attempt in range(1, 4):
+            try:
+                resp = session.post(
+                    "https://kite.zerodha.com/api/login",
+                    data={"user_id": user_id, "password": password},
+                    timeout=20,
+                )
+                print(f"   [login attempt {_login_attempt}] HTTP {resp.status_code} | "
+                      f"body_len={len(resp.text)} | body_preview={resp.text[:120]}", flush=True)
+                data = _safe_json(resp, "Step-1 /api/login")
+                break   # success — stop retrying
+            except Exception as _step1_err:
+                print(f"   ⚠️ Login attempt {_login_attempt}/3 failed: {_step1_err}", flush=True)
+                if _login_attempt < 3:
+                    _wait = 30 * _login_attempt        # 30s, then 60s
+                    print(f"   ⏳ Retrying in {_wait}s...", flush=True)
+                    time.sleep(_wait)
+                else:
+                    raise   # re-raise on final attempt
+
+        if data is None:
+            raise Exception("Step-1 /api/login: no data after 3 attempts")
         if data.get("status") != "success":
-            raise Exception(f"Credential login failed: {data.get('message')}")
+            raise Exception(f"Credential login failed: {data.get('message')} | full: {data}")
 
         request_id = data["data"]["request_id"]
         twofa_type = data["data"].get("twofa_type", "totp")
@@ -106,12 +141,20 @@ def zerodha_auto_login():
                     "twofa_type"   : twofa_type,
                     "skip_session" : "",
                 },
-                timeout=15,
+                timeout=20,
             )
-            data2 = resp2.json()
-            print(f"   2FA attempt {attempt}: {data2.get('status')} | code: {totp_obj.now()}")
-            if data2.get("status") == "success":
+            print(f"   [2FA attempt {attempt}] HTTP {resp2.status_code} | "
+                  f"body_preview={resp2.text[:120]}", flush=True)
+            try:
+                data2 = _safe_json(resp2, f"Step-2 /api/twofa attempt {attempt}")
+            except Exception as _2fa_parse_err:
+                print(f"   ⚠️ 2FA parse error: {_2fa_parse_err}", flush=True)
+                data2 = None
+            if data2 and data2.get("status") == "success":
+                print(f"   2FA attempt {attempt}: success | code: {totp_obj.now()}")
                 break
+            print(f"   2FA attempt {attempt}: {data2.get('status') if data2 else 'NO_DATA'} | "
+                  f"msg: {data2.get('message') if data2 else 'N/A'}")
             # Wait for the next 30-second window and retry with a fresh code
             wait_secs = 30 - (int(time.time()) % 30) + 1
             print(f"   ⏳ Waiting {wait_secs}s for next TOTP window (attempt {attempt}/3)...")
@@ -7819,25 +7862,39 @@ if __name__ == "__main__":
 
             # ── 8:00 AM weekdays — refresh Kite access token (before market opens) ──
             # weekday() 0=Mon … 4=Fri, 5=Sat, 6=Sun — skip weekends
-            if now.hour == 8 and now.minute < 5 and now.weekday() < 5 and not _access_token_refreshed_today[0]:
-                print("🔑 Daily access token refresh starting (8:00 AM)...", flush=True)
+            # Also retry at 8:10 AM if the 8:00 AM attempt failed (_access_token_refreshed_today
+            # stores True only on success, so 8:10 AM retry fires automatically if needed).
+            _in_refresh_window = (
+                now.weekday() < 5
+                and not _access_token_refreshed_today[0]
+                and (
+                    (now.hour == 8 and now.minute < 5)          # primary: 8:00–8:04
+                    or (now.hour == 8 and 10 <= now.minute < 15) # retry-1: 8:10–8:14
+                    or (now.hour == 8 and 20 <= now.minute < 25) # retry-2: 8:20–8:24
+                )
+            )
+            if _in_refresh_window:
+                _attempt_label = (
+                    "primary (8:00 AM)"   if now.minute < 5  else
+                    "retry-1 (8:10 AM)"   if now.minute < 15 else
+                    "retry-2 (8:20 AM)"
+                )
+                print(f"🔑 Daily access token refresh — {_attempt_label}...", flush=True)
                 _refresh_error = [None]
-                _orig_except = None
 
                 # Update IP whitelist before login (Railway may assign new IP after restart)
                 threading.Thread(target=update_kite_ip_whitelist, daemon=True).start()
 
-                # Patch zerodha_auto_login to capture the error message
+                # zerodha_auto_login() already retries 3× internally with backoff
                 try:
                     new_token = zerodha_auto_login()
                 except Exception as _ex:
                     new_token = None
                     _refresh_error[0] = str(_ex)
 
-                # Also try to read the last printed error from the function
-                _access_token_refreshed_today[0] = True
                 ist_str = now.strftime("%d %b %Y %H:%M IST")
                 if new_token:
+                    _access_token_refreshed_today[0] = True  # mark success → stop retrying
                     print(f"✅ Kite token refreshed at {ist_str}", flush=True)
                     try:
                         send_message(
@@ -7849,16 +7906,21 @@ if __name__ == "__main__":
                         pass
                 else:
                     err_detail = _refresh_error[0] or "Check Railway logs for details"
-                    try:
-                        send_message(
-                            f"❌ KITE TOKEN REFRESH FAILED\n"
-                            f"{'='*28}\n"
-                            f"🕐 Time  : {ist_str}\n"
-                            f"❗ Error : {err_detail[:200]}\n"
-                            f"⚠️ Please refresh token manually!"
-                        )
-                    except Exception:
-                        pass
+                    # Only spam Telegram on the last retry window, not every attempt
+                    is_last_retry = (now.hour == 8 and 20 <= now.minute < 25)
+                    print(f"❌ Token refresh failed [{_attempt_label}]: {err_detail}", flush=True)
+                    if is_last_retry:
+                        try:
+                            send_message(
+                                f"❌ KITE TOKEN REFRESH FAILED (all retries exhausted)\n"
+                                f"{'='*28}\n"
+                                f"🕐 Time  : {ist_str}\n"
+                                f"❗ Error : {err_detail[:300]}\n"
+                                f"⚠️ Please refresh token manually via Kite!\n"
+                                f"💡 Tip: Check Railway logs for HTTP status / body details"
+                            )
+                        except Exception:
+                            pass
 
             # ── 9:00–9:05 AM — refresh instrument tokens ────────────────────
             if now.hour == 9 and now.minute < 5:

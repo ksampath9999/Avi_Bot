@@ -674,6 +674,15 @@ _crude_disabled_logged    = False
 _banknifty_disabled_logged = False
 _sensex_disabled_logged   = False
 
+# ── Insufficient balance alert rate-limiter ───────────────────────────────────
+# Stores last alert timestamp per instrument — alerts at most once per 30 min.
+_insufficient_balance_alerted = {}   # instrument -> float (time.time())
+
+# ── Last exited symbol per instrument — same-strike re-entry guard ────────────
+# After exiting, the symbol is stored here.  The loop blocks re-entry of the
+# exact same symbol until a NEW arrow fires (is_fresh=True) or trend flips.
+_last_exited_symbol = {}   # instrument -> str e.g. "NIFTY2650523900PE"
+
 # ── Stock Options state ───────────────────────────────────────────────────────
 # { underlying_symbol: {"option_symbol": str, "entry": float, "qty": int,
 #                        "sl": float, "target": float, "signal": str, "exchange": "NFO"} }
@@ -2262,7 +2271,7 @@ def place_order(symbol, qty, exchange, instrument):
     
     now = datetime.now(IST)
 
-    if exchange == "NFO" and not (
+    if exchange in ("NFO", "BFO") and not (
         (now.hour == 9 and now.minute >= 15) or
         (9 < now.hour < 15) or
         (now.hour == 15 and now.minute <= 30)
@@ -2294,21 +2303,29 @@ def place_order(symbol, qty, exchange, instrument):
             print(f"❌ Invalid price {price}")
             return None
 
-        quantity = get_quantity(qty, exchange)
+        # ✅ Pass instrument so SENSEX gets lot_size=20, not 1
+        quantity = get_quantity(qty, exchange, instrument)
 
         # ✅ LIVE BALANCE SUFFICIENCY CHECK — block order if balance too low
+        # Alert is rate-limited to once per 30 min per instrument to avoid Telegram spam.
         try:
             live_balance = get_balance(instrument)
             total_cost   = price * quantity          # total ₹ this order will deploy
-            min_required = total_cost * 1.02        # 10% buffer for margin/charges
+            min_required = total_cost * 1.02         # 2% buffer for margin/charges
 
             print(f"💰 Balance check → Available: ₹{live_balance:,.0f}  |  Order cost: ₹{total_cost:,.0f}  |  Required (with buffer): ₹{min_required:,.0f}")
 
             if live_balance < min_required:
-                msg = (f"🚫 Insufficient balance for {symbol}\n"
-                       f"Need ₹{min_required:,.0f}, have ₹{live_balance:,.0f}")
-                print(msg)
-                send_message(msg)
+                print(f"🚫 Insufficient balance: need ₹{min_required:,.0f}, have ₹{live_balance:,.0f}")
+                _now_ts = time.time()
+                _last_alert = _insufficient_balance_alerted.get(instrument, 0)
+                if _now_ts - _last_alert > 1800:   # alert at most once per 30 min
+                    send_message(
+                        f"🚫 Insufficient balance for {symbol}\n"
+                        f"Need ₹{min_required:,.0f}, have ₹{live_balance:,.0f}\n"
+                        f"(Alerts suppressed for 30 min)"
+                    )
+                    _insufficient_balance_alerted[instrument] = _now_ts
                 return None
 
         except Exception as e:
@@ -2325,7 +2342,7 @@ def place_order(symbol, qty, exchange, instrument):
             quantity=quantity,
             order_type="LIMIT",
             price=price,
-            product="MIS" if exchange == "NFO" else "NRML"
+            product="MIS" if exchange in ("NFO", "BFO") else "NRML"
         )
 
         send_message(
@@ -2659,9 +2676,15 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # exit_position() is idempotent — it checks Kite positions before placing the
             # sell order, so double-exit is impossible even if both paths fire.
             try:
+                # CRUDE stays on 15-min; NIFTY/BANKNIFTY/SENSEX use 5-min (matches entry TF)
+                _exit_tf = "15minute" if instrument == "CRUDE" else "5minute"
+                _exit_token = (CRUDE_TOKEN      if instrument == "CRUDE"
+                               else BANKNIFTY_TOKEN if instrument == "BANKNIFTY"
+                               else SENSEX_TOKEN    if instrument == "SENSEX"
+                               else config.NIFTY_TOKEN)
                 df_ht_exit = get_cached_data(
-                    CRUDE_TOKEN if instrument == "CRUDE" else (BANKNIFTY_TOKEN if instrument == "BANKNIFTY" else config.NIFTY_TOKEN),
-                    "15minute",
+                    _exit_token,
+                    _exit_tf,
                     120
                 )
 
@@ -3316,6 +3339,9 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
 
             # Only clear state when this trade's symbol is still the active one.
             if pos_dict.get("symbol") == symbol:
+                # ── Record exited symbol for same-strike guard ────────────────
+                _last_exited_symbol[instrument] = symbol
+
                 pos_dict.update({"symbol": None, "qty": 0, "exchange": None,
                                  "signal": None, "active": False})
 
@@ -3625,9 +3651,9 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
-            # Refresh data cache every 30 seconds
+            # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
-                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 600)
+                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "5minute", 600)
                 if cached_nifty_df is not None and len(cached_nifty_df) >= 120:
                     cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=2, channel_deviation=2)
                 last_fetch_nifty = time.time()
@@ -3824,6 +3850,16 @@ def nifty_loop():
                     nifty_trade_active = False
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(10)
+                continue
+
+            # ── Same-strike guard: block re-entry of the just-exited symbol ──
+            # Only fresh arrows (is_fresh=True) override this block.
+            if symbol == _last_exited_symbol.get("NIFTY") and not is_fresh:
+                print(f"🚫 NIFTY same-strike block: {symbol} was just exited — waiting for new arrow")
+                with lock:
+                    nifty_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(30)
                 continue
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
@@ -4303,9 +4339,9 @@ def banknifty_loop():
                 time.sleep(10)
                 continue
 
-            # Refresh data cache every 30 seconds
+            # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_banknifty > 30 or cached_banknifty_df is None:
-                cached_banknifty_df = get_cached_data(BANKNIFTY_TOKEN, "15minute", 600)
+                cached_banknifty_df = get_cached_data(BANKNIFTY_TOKEN, "5minute", 600)
                 if cached_banknifty_df is not None and len(cached_banknifty_df) >= 120:
                     cached_banknifty_ht = halftrend_tv(cached_banknifty_df, amplitude=2, channel_deviation=2)
                 last_fetch_banknifty = time.time()
@@ -4502,6 +4538,15 @@ def banknifty_loop():
                 time.sleep(10)
                 continue
 
+            # ── Same-strike guard ─────────────────────────────────────────────
+            if symbol == _last_exited_symbol.get("BANKNIFTY") and not is_fresh:
+                print(f"🚫 BANKNIFTY same-strike block: {symbol} was just exited — waiting for new arrow")
+                with lock:
+                    banknifty_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(30)
+                continue
+
             filled_price = place_order(symbol, lot, exchange, "BANKNIFTY")
 
             if filled_price:
@@ -4625,9 +4670,9 @@ def sensex_loop():
                 time.sleep(10)
                 continue
 
-            # Refresh data cache every 30 seconds
+            # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_sensex > 30 or cached_sensex_df is None:
-                cached_sensex_df = get_cached_data(SENSEX_TOKEN, "15minute", 600)
+                cached_sensex_df = get_cached_data(SENSEX_TOKEN, "5minute", 600)
                 if cached_sensex_df is not None and len(cached_sensex_df) >= 120:
                     cached_sensex_ht = halftrend_tv(cached_sensex_df, amplitude=2, channel_deviation=2)
                 last_fetch_sensex = time.time()
@@ -4822,6 +4867,15 @@ def sensex_loop():
                     sensex_trade_active = False
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(10)
+                continue
+
+            # ── Same-strike guard ─────────────────────────────────────────────
+            if symbol == _last_exited_symbol.get("SENSEX") and not is_fresh:
+                print(f"🚫 SENSEX same-strike block: {symbol} was just exited — waiting for new arrow")
+                with lock:
+                    sensex_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(30)
                 continue
 
             filled_price = place_order(symbol, lot, exchange, "SENSEX")

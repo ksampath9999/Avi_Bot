@@ -311,6 +311,10 @@ def update_kite_ip_whitelist():
     Fetch Railway's current public IP and whitelist it in the Kite Connect
     developer app settings. Safe to call on every startup — if IP hasn't
     changed, Kite simply accepts the same value.
+
+    Railway Hobby plan uses a STATIC IP — set RAILWAY_STATIC_IP env var to skip
+    the ipify.org lookup and always use the known fixed IP (faster + more reliable).
+    Your current static IP: 35.236.200.109
     """
     dev_user = os.environ.get("KITE_DEV_USER_ID")
     dev_pass = os.environ.get("KITE_DEV_PASSWORD")
@@ -323,11 +327,22 @@ def update_kite_ip_whitelist():
 
     try:
         # ── Step 1: Get current Railway public IP ─────────────────────────────
-        current_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
-        print(f"🌐 Railway IP for whitelist: {current_ip}", flush=True)
+        # Railway Hobby plan has a STATIC IP — use it directly if configured.
+        _static_ip = os.environ.get("RAILWAY_STATIC_IP", "").strip()
+        if _static_ip:
+            current_ip = _static_ip
+            print(f"🌐 Using static Railway IP: {current_ip}", flush=True)
+        else:
+            current_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+            print(f"🌐 Railway dynamic IP: {current_ip}", flush=True)
 
         sess = requests.Session()
-        sess.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        })
 
         # ── Step 2: Login to Kite developer portal ───────────────────────────
         r1 = sess.post(
@@ -335,9 +350,29 @@ def update_kite_ip_whitelist():
             json={"user_id": dev_user, "password": dev_pass},
             timeout=10
         )
-        d1 = r1.json()
+
+        # Kite dev portal sometimes returns empty body (HTML redirect, CSRF block,
+        # or invalid credentials) — handle gracefully so the bot doesn't crash.
+        if not r1.text.strip():
+            print(f"❌ IP whitelist: Kite dev portal returned empty response "
+                  f"(HTTP {r1.status_code}). "
+                  f"Check KITE_DEV_USER_ID / KITE_DEV_PASSWORD env vars. "
+                  f"Bot will continue without IP whitelisting.", flush=True)
+            print(f"   ℹ️  Manually whitelist {current_ip} at: "
+                  f"https://developers.kite.trade/apps/{app_id}", flush=True)
+            return False
+
+        try:
+            d1 = r1.json()
+        except Exception:
+            print(f"❌ IP whitelist: Kite dev portal login response is not JSON. "
+                  f"HTTP {r1.status_code} | Body: {r1.text[:200]!r}", flush=True)
+            print(f"   ℹ️  Manually whitelist {current_ip} at: "
+                  f"https://developers.kite.trade/apps/{app_id}", flush=True)
+            return False
+
         if d1.get("status") != "success":
-            print(f"❌ Kite dev portal login failed: {d1.get('message')}", flush=True)
+            print(f"❌ Kite dev portal login failed: {d1.get('message', d1)}", flush=True)
             return False
 
         print(f"✅ Kite dev portal logged in", flush=True)
@@ -348,7 +383,20 @@ def update_kite_ip_whitelist():
             json={"ip_whitelist": [current_ip]},
             timeout=10
         )
-        d2 = r2.json()
+
+        if not r2.text.strip():
+            print(f"❌ IP whitelist update: empty response from Kite (HTTP {r2.status_code}). "
+                  f"Manually add {current_ip} at: "
+                  f"https://developers.kite.trade/apps/{app_id}", flush=True)
+            return False
+
+        try:
+            d2 = r2.json()
+        except Exception:
+            print(f"❌ IP whitelist update response is not JSON. "
+                  f"HTTP {r2.status_code} | Body: {r2.text[:200]!r}", flush=True)
+            return False
+
         if d2.get("status") == "success":
             print(f"✅ Kite IP whitelist updated → {current_ip}", flush=True)
             try:
@@ -678,10 +726,25 @@ _sensex_disabled_logged   = False
 # Stores last alert timestamp per instrument — alerts at most once per 30 min.
 _insufficient_balance_alerted = {}   # instrument -> float (time.time())
 
+# ── Progressive daily profit lock ────────────────────────────────────────────
+# Tracks the highest daily P&L reached so far and the active lock floor.
+# Tiers:  ₹1000 → lock 80%  (floor = ₹800)
+#         ₹2000 → lock 85%  (floor = ₹1700)
+#         ₹3000 → lock 90%  (floor = ₹2700)
+# Once a tier is activated the floor only ever rises — never drops back.
+_peak_daily_pnl   = 0.0   # highest daily_pnl seen today
+_profit_lock_floor = 0.0  # minimum P&L we must stay above to keep trading
+_profit_lock_tier  = 0    # 0 = none, 1 = 80%, 2 = 85%, 3 = 90%
+
 # ── Last exited symbol per instrument — same-strike re-entry guard ────────────
 # After exiting, the symbol is stored here.  The loop blocks re-entry of the
 # exact same symbol until a NEW arrow fires (is_fresh=True) or trend flips.
 _last_exited_symbol = {}   # instrument -> str e.g. "NIFTY2650523900PE"
+
+# ── Profit-lock exit cooldown ─────────────────────────────────────────────────
+# After a per-trade profit lock exit, block new entries for 15 minutes to avoid
+# immediately jumping back into the same move and giving gains back.
+_profit_lock_exit_time = {}   # instrument -> float (time.time())
 
 # ── Stock Options state ───────────────────────────────────────────────────────
 # { underlying_symbol: {"option_symbol": str, "entry": float, "qty": int,
@@ -733,7 +796,7 @@ def is_nifty_trading_time():
     now = datetime.now(IST)
 
     return (
-        (now.hour == 9 and now.minute >= 15) or
+        (now.hour == 9 and now.minute >= 30) or   # entries only from 9:30 AM
         (9 < now.hour < 15) or
         (now.hour == 15 and now.minute <= 30)
     )
@@ -1501,6 +1564,7 @@ def can_trade():
 
     global daily_pnl, trade_count, last_loss_time, trade_alert_sent
     global loss_streak
+    global _peak_daily_pnl, _profit_lock_floor, _profit_lock_tier
 
     # 🛑 Portfolio protection FIRST
     if not portfolio_safe():
@@ -1514,10 +1578,54 @@ def can_trade():
     if daily_pnl < config.MAX_DAILY_LOSS:
         return False
 
-    # 🎯 Profit lock
-    # 🎯 DAILY PROFIT LOCK
-    if daily_pnl >= 10000:
-        print("🎯 Target reached — stopping trading")
+    # ─────────────────────────────────────────────────────────────────────────
+    # 🎯 PROGRESSIVE DAILY PROFIT LOCK
+    # Tiers:  ₹1000 peak → lock 80%  (floor = ₹800)
+    #         ₹2000 peak → lock 85%  (floor = ₹1700)
+    #         ₹3000 peak → lock 90%  (floor = ₹2700)
+    # The peak and floor only ever move up — never down.
+    # ─────────────────────────────────────────────────────────────────────────
+    if daily_pnl > _peak_daily_pnl:
+        _peak_daily_pnl = daily_pnl   # update running peak
+
+        # Activate / upgrade tier based on new peak
+        if _peak_daily_pnl >= 3000 and _profit_lock_tier < 3:
+            _profit_lock_tier  = 3
+            _profit_lock_floor = round(_peak_daily_pnl * 0.90, 2)
+            print(f"🔒 Profit lock TIER-3 (90%): peak=₹{_peak_daily_pnl:.0f}  floor=₹{_profit_lock_floor:.0f}", flush=True)
+            send_message(f"🔒 Profit lock activated: 90% of ₹{_peak_daily_pnl:.0f}\nFloor = ₹{_profit_lock_floor:.0f} — trading stops if P&L drops below this")
+        elif _peak_daily_pnl >= 2000 and _profit_lock_tier < 2:
+            _profit_lock_tier  = 2
+            _profit_lock_floor = round(_peak_daily_pnl * 0.85, 2)
+            print(f"🔒 Profit lock TIER-2 (85%): peak=₹{_peak_daily_pnl:.0f}  floor=₹{_profit_lock_floor:.0f}", flush=True)
+            send_message(f"🔒 Profit lock activated: 85% of ₹{_peak_daily_pnl:.0f}\nFloor = ₹{_profit_lock_floor:.0f} — trading stops if P&L drops below this")
+        elif _peak_daily_pnl >= 1000 and _profit_lock_tier < 1:
+            _profit_lock_tier  = 1
+            _profit_lock_floor = round(_peak_daily_pnl * 0.80, 2)
+            print(f"🔒 Profit lock TIER-1 (80%): peak=₹{_peak_daily_pnl:.0f}  floor=₹{_profit_lock_floor:.0f}", flush=True)
+            send_message(f"🔒 Profit lock activated: 80% of ₹{_peak_daily_pnl:.0f}\nFloor = ₹{_profit_lock_floor:.0f} — trading stops if P&L drops below this")
+
+        # When peak grows within the same tier, raise the floor proportionally
+        elif _profit_lock_tier == 3:
+            new_floor = round(_peak_daily_pnl * 0.90, 2)
+            if new_floor > _profit_lock_floor:
+                _profit_lock_floor = new_floor
+                print(f"🔒 Profit lock floor raised → ₹{_profit_lock_floor:.0f} (90% of ₹{_peak_daily_pnl:.0f})", flush=True)
+        elif _profit_lock_tier == 2:
+            new_floor = round(_peak_daily_pnl * 0.85, 2)
+            if new_floor > _profit_lock_floor:
+                _profit_lock_floor = new_floor
+                print(f"🔒 Profit lock floor raised → ₹{_profit_lock_floor:.0f} (85% of ₹{_peak_daily_pnl:.0f})", flush=True)
+        elif _profit_lock_tier == 1:
+            new_floor = round(_peak_daily_pnl * 0.80, 2)
+            if new_floor > _profit_lock_floor:
+                _profit_lock_floor = new_floor
+                print(f"🔒 Profit lock floor raised → ₹{_profit_lock_floor:.0f} (80% of ₹{_peak_daily_pnl:.0f})", flush=True)
+
+    # Enforce the floor — stop new entries if P&L has given back too much
+    if _profit_lock_tier > 0 and daily_pnl < _profit_lock_floor:
+        _pct = {1: "80%", 2: "85%", 3: "90%"}.get(_profit_lock_tier, "?")
+        print(f"🔒 Profit lock HIT: daily_pnl=₹{daily_pnl:.0f} < floor=₹{_profit_lock_floor:.0f} ({_pct} of peak ₹{_peak_daily_pnl:.0f}) — no new entries", flush=True)
         return False
 
     # 🚫 Max trades
@@ -2272,11 +2380,11 @@ def place_order(symbol, qty, exchange, instrument):
     now = datetime.now(IST)
 
     if exchange in ("NFO", "BFO") and not (
-        (now.hour == 9 and now.minute >= 15) or
+        (now.hour == 9 and now.minute >= 30) or   # no orders before 9:30 AM
         (9 < now.hour < 15) or
         (now.hour == 15 and now.minute <= 30)
     ):
-        print("🚫 Market closed — skipping order")
+        print("🚫 Market closed or before 9:30 AM — skipping order")
         return None
 
     # 🚫 STRICT OPTION ONLY (REPLACE THIS BLOCK)
@@ -2617,9 +2725,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"💰 PROFIT LOCK EXIT\n"
                         f"📌 {instrument} {signal} → {symbol}\n"
                         f"📈 Peak P&L: ₹{local_max_profit:.0f}  |  Current: ₹{current_pnl:.0f}\n"
-                        f"🔒 Lock level ({int(lock_pct*100)}%): ₹{lock_level:.0f} — exiting to protect gains"
+                        f"🔒 Lock level ({int(lock_pct*100)}%): ₹{lock_level:.0f} — exiting to protect gains\n"
+                        f"⏳ Next entry in 15 min"
                     )
                     print("💰 Profit lock triggered — exit")
+                    # Record timestamp — loop will wait 15 min before next entry
+                    _profit_lock_exit_time[instrument] = time.time()
 
                     if not exit_done:
                         exit_position(symbol, remaining_qty, exchange)
@@ -3842,6 +3953,17 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
+            # ── Profit-lock exit cooldown (15 min) ────────────────────────────
+            _pl_exit_ts = _profit_lock_exit_time.get("NIFTY", 0)
+            _pl_wait = 900 - (time.time() - _pl_exit_ts)   # 900s = 15 min
+            if _pl_wait > 0:
+                print(f"⏳ NIFTY profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
+                with lock:
+                    nifty_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(min(_pl_wait, 60))
+                continue
+
             print(f"🧠 NIFTY entering: {signal}")
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
@@ -4528,6 +4650,17 @@ def banknifty_loop():
                 time.sleep(10)
                 continue
 
+            # ── Profit-lock exit cooldown (15 min) ────────────────────────────
+            _pl_exit_ts = _profit_lock_exit_time.get("BANKNIFTY", 0)
+            _pl_wait = 900 - (time.time() - _pl_exit_ts)
+            if _pl_wait > 0:
+                print(f"⏳ BANKNIFTY profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
+                with lock:
+                    banknifty_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(min(_pl_wait, 60))
+                continue
+
             print(f"🧠 BANKNIFTY entering: {signal}")
             symbol, price, lot, exchange = find_option(signal, "BANKNIFTY")
 
@@ -4859,6 +4992,17 @@ def sensex_loop():
                 time.sleep(10)
                 continue
 
+            # ── Profit-lock exit cooldown (15 min) ────────────────────────────
+            _pl_exit_ts = _profit_lock_exit_time.get("SENSEX", 0)
+            _pl_wait = 900 - (time.time() - _pl_exit_ts)
+            if _pl_wait > 0:
+                print(f"⏳ SENSEX profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
+                with lock:
+                    sensex_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(min(_pl_wait, 60))
+                continue
+
             print(f"🧠 SENSEX entering: {signal}")
             symbol, price, lot, exchange = find_option(signal, "SENSEX")
 
@@ -5172,6 +5316,20 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     lots = max(1, lots)
     lots = min(lots, max_lots)
 
+    # ── 10. Daily profit risk cap — protect locked-in gains ──────────────
+    # If we've already made profit today, cap the max loss on THIS trade at
+    # ₹800 so we never give back more than ₹800 of today's gains in one hit.
+    # Max loss per trade = price * SL_PCT * lot_size * lots = risk_per_lot * lots
+    # → lots_allowed = floor(MAX_TRADE_RISK / risk_per_lot), min 1
+    MAX_TRADE_RISK = 800   # ₹ — max allowed loss on a single trade
+    if daily_pnl >= 2000 and risk_per_lot > 0:
+        lots_by_risk_cap = max(1, int(MAX_TRADE_RISK / risk_per_lot))
+        if lots_by_risk_cap < lots:
+            print(f"🛡️ Daily profit risk cap: daily_pnl=₹{daily_pnl:.0f} → "
+                  f"max risk ₹{MAX_TRADE_RISK} → capping {lots}→{lots_by_risk_cap} lots "
+                  f"(max loss ₹{lots_by_risk_cap * risk_per_lot:.0f})", flush=True)
+            lots = lots_by_risk_cap
+
     print(f"✅ Final lots: {lots}  |  Total deployed: ₹{lots * trade_value_1:,.0f}  |  Max risk: ₹{lots * risk_per_lot:,.0f}")
     return lots
 
@@ -5351,6 +5509,17 @@ def reset_daily_pnl():
         # Clear stale option chain cache from prior trading day
         instrument_cache.clear()
         _data_cache_store.clear()   # also flush historical data cache
+
+        # ── Reset progressive profit lock for new day ─────────────────────
+        global _peak_daily_pnl, _profit_lock_floor, _profit_lock_tier
+        _peak_daily_pnl    = 0.0
+        _profit_lock_floor = 0.0
+        _profit_lock_tier  = 0
+        print("🔓 Profit lock reset for new trading day", flush=True)
+
+        # ── Reset same-strike guard for new day ───────────────────────────
+        global _last_exited_symbol
+        _last_exited_symbol.clear()
 
         last_reset_date = today
         
@@ -6734,7 +6903,7 @@ def manage_swing_position(symbol, entry_price, qty, sl_price, target_price):
             in_market_hours = (
                 (now_ist.weekday() < 5) and
                 (
-                    (now_ist.hour == 9 and now_ist.minute >= 15) or
+                    (now_ist.hour == 9 and now_ist.minute >= 30) or
                     (9 < now_ist.hour < 15) or
                     (now_ist.hour == 15 and now_ist.minute <= 25)
                 )
@@ -6849,7 +7018,7 @@ def swing_loop():
             in_market_hours = (
                 (now_ist.weekday() < 5) and
                 (
-                    (now_ist.hour == 9 and now_ist.minute >= 15) or
+                    (now_ist.hour == 9 and now_ist.minute >= 30) or
                     (9 < now_ist.hour < 15) or
                     (now_ist.hour == 15 and now_ist.minute <= 20)
                 )
@@ -7365,7 +7534,7 @@ def stock_options_loop():
             in_window = (
                 now_ist.weekday() < 5 and
                 (
-                    (now_ist.hour == 9 and now_ist.minute >= 15) or
+                    (now_ist.hour == 9 and now_ist.minute >= 30) or
                     (9 < now_ist.hour < STOCK_OPT_FORCE_CLOSE_HOUR) or
                     (now_ist.hour == STOCK_OPT_FORCE_CLOSE_HOUR and
                      now_ist.minute < STOCK_OPT_FORCE_CLOSE_MIN)

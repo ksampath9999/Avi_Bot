@@ -416,7 +416,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Flip back to True to resume immediately on next cycle.
 ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
-ENABLE_SENSEX     = False   # ✅ SENSEX trading active
+ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
 ENABLE_SWING      = False    # ✅ Swing stock trading active
 
@@ -2493,6 +2493,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             if gen_id is not None:
                 _cur_gen = (_nifty_trade_gen[0]     if instrument == "NIFTY"
                             else _banknifty_trade_gen[0] if instrument == "BANKNIFTY"
+                            else _sensex_trade_gen[0]    if instrument == "SENSEX"
                             else _crude_trade_gen[0])
                 if gen_id != _cur_gen:
                     print(f"ℹ️ manage_trade [{instrument} {signal} {symbol}]: "
@@ -3591,10 +3592,11 @@ def nifty_loop():
                 time.sleep(60)
                 continue
 
-            # ── After market close: sleep until next day ──────────────────────
-            # DO NOT break — just sleep so the thread survives to trade tomorrow.
-            if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
-                print("🛑 NIFTY market closed — sleeping until tomorrow 9:00 AM")
+            # ── After 3:20 PM: block all NEW entries (force-close time) ─────────
+            # Force close fires at 3:20 PM. Don't allow a fresh/carry-over entry
+            # in the 3:20–3:30 PM window — it would get immediately force-closed.
+            if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute >= 20):
+                print("🛑 NIFTY past 3:20 PM — no new entries, sleeping until tomorrow 9:00 AM")
                 time.sleep(60)   # check every minute, loop will skip until morning
                 continue
 
@@ -4276,9 +4278,9 @@ def banknifty_loop():
                 time.sleep(60)
                 continue
 
-            # ── After market close: sleep until next day ──────────────────────
-            if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
-                print("🛑 BANKNIFTY market closed — sleeping until tomorrow 9:00 AM")
+            # ── After 3:20 PM: block all NEW entries (force-close time) ─────────
+            if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute >= 20):
+                print("🛑 BANKNIFTY past 3:20 PM — no new entries, sleeping until tomorrow 9:00 AM")
                 time.sleep(60)
                 continue
 
@@ -4598,9 +4600,9 @@ def sensex_loop():
                 time.sleep(60)
                 continue
 
-            # ── After market close: sleep until next day ──────────────────────
-            if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute > 30):
-                print("🛑 SENSEX market closed — sleeping until tomorrow 9:00 AM")
+            # ── After 3:20 PM: block all NEW entries (force-close time) ─────────
+            if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute >= 20):
+                print("🛑 SENSEX past 3:20 PM — no new entries, sleeping until tomorrow 9:00 AM")
                 time.sleep(60)
                 continue
 

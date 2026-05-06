@@ -2675,36 +2675,66 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             current_pnl = profit * remaining_qty
 
+            # ── Update local_max_profit ONLY when NOT in a partial-just-booked tick ──
+            # After partial booking we reset local_max_profit to post-partial P&L.
+            # We must NOT let the line below overwrite that reset on the same tick
+            # (current_pnl here still reflects the OLD remaining_qty P&L).
+            # The flag _partial_just_booked guards this for exactly one tick.
+            if not getattr(manage_trade, "_partial_just_booked", False):
+                local_max_profit = max(local_max_profit, current_pnl)
+            manage_trade._partial_just_booked = False   # clear flag every tick
+
            # 💰 SMART PARTIAL BOOKING
             if not partial_booked and current_pnl >= 1200:
 
                 # Skip partial if strong trend
                 if is_market_trending(
-                    CRUDE_TOKEN if instrument == "CRUDE" else (BANKNIFTY_TOKEN if instrument == "BANKNIFTY" else config.NIFTY_TOKEN)
+                    CRUDE_TOKEN if instrument == "CRUDE" else (BANKNIFTY_TOKEN if instrument == "BANKNIFTY" else (SENSEX_TOKEN if instrument == "SENSEX" else config.NIFTY_TOKEN))
                 ):
                     print("🚀 Strong trend — skipping partial booking")
                 else:
-                    half_qty = remaining_qty // 2
+                    # BUG FIX: half_qty must be a multiple of lot_size so Kite accepts the order.
+                    # remaining_qty is total shares (e.g. 65 for 1 lot, 130 for 2 lots).
+                    # We exit exactly 1 lot worth of shares, not remaining_qty // 2.
+                    if instrument == "SENSEX":
+                        one_lot = 10   # SENSEX lot size = 10
+                    elif instrument == "BANKNIFTY":
+                        one_lot = 30   # BankNifty lot size = 30 (current)
+                    elif instrument == "CRUDE":
+                        one_lot = 100
+                    else:
+                        one_lot = 65   # Nifty lot size = 65
 
-                    if half_qty > 0:
+                    # Exit half the lots (rounded down to whole lots)
+                    total_lots  = remaining_qty // one_lot
+                    exit_lots   = max(1, total_lots // 2)
+                    half_qty    = exit_lots * one_lot
+
+                    if half_qty > 0 and half_qty < remaining_qty:
                         exit_position(symbol, half_qty, exchange)
 
                         remaining_qty -= half_qty
                         partial_booked = True
 
-                        # Reset profit lock baseline to current half-qty P&L.
-                        # Without this, local_max_profit stays at full-qty peak,
-                        # so lock_level is unreachable with half qty → exits immediately.
-                        local_max_profit = profit * remaining_qty
+                        # Reset profit lock baseline to current POST-partial P&L.
+                        # current_pnl still reflects old remaining_qty — recompute with new qty.
+                        local_max_profit  = profit * remaining_qty
+                        manage_trade._partial_just_booked = True   # skip max() update this tick
 
-                        print(f"💰 Partial booked: {symbol} | Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
+                        print(f"💰 Partial booked: {half_qty} units of {symbol} | "
+                              f"Remaining: {remaining_qty} | "
+                              f"Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
+                        send_message(
+                            f"💰 PARTIAL BOOKING\n"
+                            f"📌 {instrument} {signal} → {symbol}\n"
+                            f"📤 Exited {half_qty} units (={exit_lots} lot{'s' if exit_lots>1 else ''})\n"
+                            f"📊 Remaining: {remaining_qty} units\n"
+                            f"💰 P&L so far: ₹{current_pnl:.0f}"
+                        )
 
             # ===============================
             # 💰 GLOBAL PROFIT PROTECTION
             # ===============================
-            
-
-            local_max_profit = max(local_max_profit, current_pnl)
 
             if local_max_profit >= 1000:
 
@@ -2742,8 +2772,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🧠 ATR BASED TRAILING
             # ===============================
             try:
+                _trail_token = (CRUDE_TOKEN      if instrument == "CRUDE"
+                                else BANKNIFTY_TOKEN if instrument == "BANKNIFTY"
+                                else SENSEX_TOKEN    if instrument == "SENSEX"
+                                else config.NIFTY_TOKEN)
                 df_trail = get_cached_data(
-                    CRUDE_TOKEN if instrument == "CRUDE" else (BANKNIFTY_TOKEN if instrument == "BANKNIFTY" else config.NIFTY_TOKEN),
+                    _trail_token,
                     "5minute",
                     50
                 )
@@ -8168,4 +8202,4 @@ if __name__ == "__main__":
         time.sleep(60)
 
 
-    # end of __main__ 
+    # end of __main__

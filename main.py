@@ -1071,20 +1071,22 @@ def get_ml_signal():
 # Returns (passed: bool, reason: str)
 # Call this right before order placement in nifty_loop / crude_loop.
 # ──────────────────────────────────────────────────────────────────────────────
-def apply_entry_filters(signal, instrument, df_15m, token):
+def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     """
-    All entry filters — each independently controlled by a True/False flag in config.
+    All entry filters — each independently controlled by a True/False flag.
 
     Filters (in order):
-      1. Session dead zone   — USE_SESSION_FILTER   (11:30 AM–1:30 PM block)
+      1. Session dead zone   — USE_SESSION_FILTER
       2. ADX trend strength  — USE_ADX_FILTER        (ADX >= ADX_MIN_VALUE)
       3. MTF 1-hour          — USE_MTF_FILTER        (1h HalfTrend agrees)
-      4. India VIX           — USE_VIX_FILTER        (VIX between VIX_MIN/VIX_MAX)
-      5. EMA 9/15 stack      — USE_EMA_FILTER        (9 EMA above/below 15 EMA)
-      6. ML signal           — USE_ML_FILTER         (ML model agrees, NIFTY only)
-      7. HTF 30-min          — USE_HTF_FILTER        (handled separately before this call)
+      4. India VIX           — USE_VIX_FILTER
+      5. EMA 9/15 stack      — USE_EMA_FILTER
+      6. ML signal           — USE_ML_FILTER         (NIFTY only)
+      7. Hull Suite          — USE_HULL_FILTER        ← NEW
+         Hull color must match HalfTrend signal on the same 15-min closed candle.
+         Green band (hull > hull[2]) → CALL only
+         Red band   (hull < hull[2]) → PUT  only
 
-    Set any flag to False to skip that filter entirely.
     Returns (passed: bool, reason: str).
     """
     now_ist = datetime.now(IST)
@@ -1158,13 +1160,255 @@ def apply_entry_filters(signal, instrument, df_15m, token):
         else:
             _ml_str = f"ML={ml_sig}({ml_conf:.0f}%)"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str}"
+    # ── 7. Hull Suite — colour must match HalfTrend AND band must be wide enough
+    # EXCEPTION: if HalfTrend flipped on a high-volume candle (volume spike),
+    # skip the Hull colour check and enter on HalfTrend alone.
+    # Hull (length=55) is too slow to react to sudden volume-driven moves.
+    # Band width check still applies even on volume spikes.
+    _hull_str = "Hull=off"
+    if USE_HULL_FILTER and df_15m is not None:
+        try:
+            hull_sig, hval, h2val, bw_pct = get_hull_signal(
+                df_15m, mode=HULL_MODE, length=HULL_LENGTH)
+
+            if hull_sig is None or hval is None:
+                _hull_str = "Hull=N/A"
+            else:
+                # ── Band width check — always applies, even on volume spikes ─
+                if HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT:
+                    pts = abs(hval - h2val)
+                    return False, (
+                        f"🌊 Hull filter: band too thin — "
+                        f"width={bw_pct*100:.3f}% ({pts:.1f} pts) "
+                        f"< min {HULL_MIN_BAND_WIDTH_PCT*100:.2f}% — "
+                        f"trend transitioning, skipping signal"
+                    )
+
+                # ── Volume spike check — bypasses Hull colour mismatch ────────
+                # If HalfTrend just flipped AND volume is unusually high,
+                # the move has strong conviction → skip Hull colour check.
+                _vol_override = False
+                if hull_sig != signal and VOLUME_SPIKE_MULTIPLIER > 0:
+                    _spike, _cvol, _avgvol, _ratio = is_volume_spike(df_15m)
+                    if _spike:
+                        _vol_override = True
+                        _hull_str = (
+                            f"Hull=⚡VOLUME OVERRIDE "
+                            f"(vol={_cvol:.0f} = {_ratio:.1f}× avg={_avgvol:.0f}) "
+                            f"— HalfTrend alone, Hull still "
+                            f"{'🟢' if hull_sig == 'CALL' else '🔴'}"
+                        )
+                        print(
+                            f"⚡ Volume spike detected — bypassing Hull colour check\n"
+                            f"   Volume: {_cvol:.0f}  Avg: {_avgvol:.0f}  "
+                            f"Ratio: {_ratio:.1f}×  Signal: {signal}",
+                            flush=True
+                        )
+
+                # ── Colour check — only when no volume spike ──────────────────
+                if not _vol_override and hull_sig != signal:
+                    hull_color = "🟢 GREEN" if hull_sig == "CALL" else "🔴 RED"
+                    ht_color   = "🟢 GREEN" if signal   == "CALL" else "🔴 RED"
+                    return False, (
+                        f"🌊 Hull filter: Hull={hull_color} vs HalfTrend={ht_color} — "
+                        f"colours must match (hull={hval:.1f}, hull[2]={h2val:.1f}, "
+                        f"band={bw_pct*100:.3f}%)"
+                    )
+
+                if not _vol_override:
+                    band_color = "🟢" if signal == "CALL" else "🔴"
+                    _hull_str  = (
+                        f"Hull={band_color}({hval:.1f} vs {h2val:.1f}) "
+                        f"band={bw_pct*100:.3f}%"
+                    )
+
+        except Exception as _hull_e:
+            _hull_str = f"Hull=err({_hull_e})"
+
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str}"
 
 
-# ======================================
-# TRUE TradingView HalfTrend
-# Pine v6 exact logic
-# ======================================
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🌊  HULL SUITE  —  exact Python port of InSilico's Pine Script v4 indicator
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Pine source:  "Hull Suite by InSilico"
+# Logic:
+#   HMA  = WMA(2 × WMA(src, n/2) − WMA(src, n),  round(√n))
+#   EHMA = EMA(2 × EMA(src, n/2) − EMA(src, n),  round(√n))
+#   THMA = WMA(3×WMA(src,n/3) − WMA(src,n/2) − WMA(src,n),  n)
+#
+#   Color rule (Pine):  HULL > HULL[2]  →  green (bullish)
+#                       HULL < HULL[2]  →  red   (bearish)
+#   MHULL = HULL[0]  (current bar)
+#   SHULL = HULL[2]  (2 bars ago — used for crossover detection)
+#
+#   Signal for bot:
+#     CALL  when MHULL > SHULL  (green band)
+#     PUT   when MHULL < SHULL  (red band)
+#
+# Parameters (matching Pine defaults used in the image):
+#   mode   = "Hma"   (default)
+#   length = 55      (swing entry default in Pine)
+# ──────────────────────────────────────────────────────────────────────────────
+
+USE_HULL_FILTER  = True    # set False to disable completely
+HULL_MODE        = "Hma"  # "Hma" | "Ehma" | "Thma"
+HULL_LENGTH      = 55     # Pine default for swing entry
+
+# Minimum band width as % of price.
+# Band width = abs(MHULL - SHULL) / price
+# When band is thin → trend is weak / transitioning → ignore signal.
+# 0.001 = 0.1% of price  (e.g. on Nifty 23000 → min gap of 23 pts)
+# 0.002 = 0.2% of price  (e.g. on Nifty 23000 → min gap of 46 pts) ← recommended
+# Set to 0.0 to disable the width check.
+HULL_MIN_BAND_WIDTH_PCT = 0.002   # 0.2% — ignores thin/transitioning bands
+
+# ── Volume spike config ───────────────────────────────────────────────────────
+# When HalfTrend flips AND the flip candle has unusually high volume,
+# skip the Hull colour check and enter on HalfTrend alone.
+# Logic: volume_spike = current_volume > VOLUME_SPIKE_MULTIPLIER × avg_volume(lookback)
+# Set VOLUME_SPIKE_MULTIPLIER = 0.0 to disable volume override entirely.
+VOLUME_SPIKE_MULTIPLIER = 2.0   # current bar volume must be 2× the 20-bar average
+VOLUME_SPIKE_LOOKBACK   = 20    # bars used to compute average volume
+
+
+def is_volume_spike(df, multiplier=VOLUME_SPIKE_MULTIPLIER,
+                    lookback=VOLUME_SPIKE_LOOKBACK):
+    """
+    Returns (is_spike: bool, current_vol: float, avg_vol: float, ratio: float)
+
+    Checks the last CLOSED candle (iloc[-2]) volume against the
+    rolling average of the prior `lookback` candles (iloc[-lookback-2:-2]).
+
+    A spike means: current_volume >= multiplier × avg_volume
+    """
+    try:
+        if df is None or len(df) < lookback + 3:
+            return False, 0.0, 0.0, 0.0
+
+        if "volume" not in df.columns:
+            return False, 0.0, 0.0, 0.0
+
+        current_vol = float(df["volume"].iloc[-2])
+        avg_vol     = float(df["volume"].iloc[-lookback-2:-2].mean())
+
+        if avg_vol <= 0:
+            return False, current_vol, avg_vol, 0.0
+
+        ratio    = current_vol / avg_vol
+        is_spike = ratio >= multiplier
+
+        return is_spike, current_vol, avg_vol, round(ratio, 2)
+
+    except Exception as e:
+        print(f"⚠️ Volume spike check error: {e}")
+        return False, 0.0, 0.0, 0.0
+
+
+def _wma(series: pd.Series, period: int) -> pd.Series:
+    """Weighted Moving Average — matches Pine's wma()."""
+    weights = np.arange(1, period + 1, dtype=float)
+    return series.rolling(period).apply(
+        lambda x: np.dot(x, weights) / weights.sum(), raw=True
+    )
+
+
+def hull_suite(df, mode=HULL_MODE, length=HULL_LENGTH):
+    """
+    Computes Hull Suite on the given OHLCV DataFrame.
+
+    Returns a DataFrame with extra columns:
+        hull      : the Hull MA line value (MHULL = HULL[0])
+        hull_2    : HULL shifted 2 bars back (SHULL = HULL[2])
+        hull_bull : True when hull > hull_2  (green band — bullish)
+        hull_bear : True when hull < hull_2  (red band   — bearish)
+        hull_signal: "CALL" | "PUT" | None
+    """
+    df = df.copy()
+    src = df["close"]
+    n   = int(length)
+
+    if mode == "Hma":
+        # Pine: wma(2 * wma(src, n/2) - wma(src, n), round(sqrt(n)))
+        half  = max(1, n // 2)
+        sqn   = max(1, round(np.sqrt(n)))
+        raw   = 2 * _wma(src, half) - _wma(src, n)
+        hull_series = _wma(raw, sqn)
+
+    elif mode == "Ehma":
+        # Pine: ema(2 * ema(src, n/2) - ema(src, n), round(sqrt(n)))
+        half  = max(1, n // 2)
+        sqn   = max(1, round(np.sqrt(n)))
+        raw   = 2 * src.ewm(span=half, adjust=False).mean() \
+                  - src.ewm(span=n,    adjust=False).mean()
+        hull_series = raw.ewm(span=sqn, adjust=False).mean()
+
+    elif mode == "Thma":
+        # Pine: wma(wma(src,n/3)*3 - wma(src,n/2) - wma(src,n), n)
+        # Note: Pine passes length/2 to Mode() for Thma, so effective n = n//2
+        n2    = max(1, n // 2)
+        third = max(1, n2 // 3)
+        half2 = max(1, n2 // 2)
+        raw   = 3 * _wma(src, third) - _wma(src, half2) - _wma(src, n2)
+        hull_series = _wma(raw, n2)
+
+    else:
+        raise ValueError(f"hull_suite: unknown mode '{mode}'")
+
+    df["hull"]    = hull_series
+    df["hull_2"]  = hull_series.shift(2)   # Pine: HULL[2]
+
+    # Color rule: HULL > HULL[2] → green (bullish), else red (bearish)
+    df["hull_bull"] = df["hull"] > df["hull_2"]
+    df["hull_bear"] = df["hull"] < df["hull_2"]
+
+    df["hull_signal"] = np.where(
+        df["hull_bull"], "CALL",
+        np.where(df["hull_bear"], "PUT", None)
+    )
+
+    return df
+
+
+def get_hull_signal(df_15m, mode=HULL_MODE, length=HULL_LENGTH):
+    """
+    Returns the Hull Suite signal on the last CLOSED 15-min candle (iloc[-2]).
+
+    Returns: (signal, hull_value, hull_2_value, band_width_pct)
+        signal          : "CALL" | "PUT" | None
+        hull_value      : MHULL  (current bar hull line)
+        hull_2_value    : SHULL  (hull 2 bars ago)
+        band_width_pct  : abs(MHULL - SHULL) / close  — thickness of the band
+                          Small value = thin band = weak/transitioning trend
+    """
+    try:
+        if df_15m is None or len(df_15m) < length + 5:
+            return None, None, None, None
+
+        ht  = hull_suite(df_15m, mode=mode, length=length)
+        bar = ht.iloc[-2]   # last CLOSED candle — anti-repaint
+
+        sig   = bar["hull_signal"]
+        hval  = round(float(bar["hull"]),   2)
+        h2val = round(float(bar["hull_2"]), 2)
+        price = round(float(bar["close"]),  2)
+
+        band_width_pct = abs(hval - h2val) / price if price > 0 else 0.0
+
+        return sig, hval, h2val, round(band_width_pct, 6)
+
+    except Exception as e:
+        print(f"⚠️ Hull Suite error: {e}")
+        return None, None, None, None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# END HULL SUITE
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 import pandas as pd
 import numpy as np
 
@@ -2675,82 +2919,46 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             current_pnl = profit * remaining_qty
 
-            # ── Update local_max_profit ONLY when NOT in a partial-just-booked tick ──
-            # After partial booking we reset local_max_profit to post-partial P&L.
-            # We must NOT let the line below overwrite that reset on the same tick
-            # (current_pnl here still reflects the OLD remaining_qty P&L).
-            # The flag _partial_just_booked guards this for exactly one tick.
-            if not getattr(manage_trade, "_partial_just_booked", False):
-                local_max_profit = max(local_max_profit, current_pnl)
-            manage_trade._partial_just_booked = False   # clear flag every tick
-
            # 💰 SMART PARTIAL BOOKING
             if not partial_booked and current_pnl >= 1200:
 
                 # Skip partial if strong trend
                 if is_market_trending(
-                    CRUDE_TOKEN if instrument == "CRUDE" else (BANKNIFTY_TOKEN if instrument == "BANKNIFTY" else (SENSEX_TOKEN if instrument == "SENSEX" else config.NIFTY_TOKEN))
+                    CRUDE_TOKEN if instrument == "CRUDE" else (BANKNIFTY_TOKEN if instrument == "BANKNIFTY" else config.NIFTY_TOKEN)
                 ):
                     print("🚀 Strong trend — skipping partial booking")
                 else:
-                    # BUG FIX: half_qty must be a multiple of lot_size so Kite accepts the order.
-                    # remaining_qty is total shares (e.g. 65 for 1 lot, 130 for 2 lots).
-                    # We exit exactly 1 lot worth of shares, not remaining_qty // 2.
-                    if instrument == "SENSEX":
-                        one_lot = 10   # SENSEX lot size = 10
-                    elif instrument == "BANKNIFTY":
-                        one_lot = 30   # BankNifty lot size = 30 (current)
-                    elif instrument == "CRUDE":
-                        one_lot = 100
-                    else:
-                        one_lot = 65   # Nifty lot size = 65
+                    half_qty = remaining_qty // 2
 
-                    # Exit half the lots (rounded down to whole lots)
-                    total_lots  = remaining_qty // one_lot
-                    exit_lots   = max(1, total_lots // 2)
-                    half_qty    = exit_lots * one_lot
-
-                    if half_qty > 0 and half_qty < remaining_qty:
+                    if half_qty > 0:
                         exit_position(symbol, half_qty, exchange)
 
                         remaining_qty -= half_qty
                         partial_booked = True
 
-                        # Reset profit lock baseline to current POST-partial P&L.
-                        # current_pnl still reflects old remaining_qty — recompute with new qty.
-                        local_max_profit  = profit * remaining_qty
-                        manage_trade._partial_just_booked = True   # skip max() update this tick
+                        # Reset profit lock baseline to current half-qty P&L.
+                        # Without this, local_max_profit stays at full-qty peak,
+                        # so lock_level is unreachable with half qty → exits immediately.
+                        local_max_profit = profit * remaining_qty
 
-                        print(f"💰 Partial booked: {half_qty} units of {symbol} | "
-                              f"Remaining: {remaining_qty} | "
-                              f"Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
-                        send_message(
-                            f"💰 PARTIAL BOOKING\n"
-                            f"📌 {instrument} {signal} → {symbol}\n"
-                            f"📤 Exited {half_qty} units (={exit_lots} lot{'s' if exit_lots>1 else ''})\n"
-                            f"📊 Remaining: {remaining_qty} units\n"
-                            f"💰 P&L so far: ₹{current_pnl:.0f}"
-                        )
+                        print(f"💰 Partial booked: {symbol} | Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
 
             # ===============================
             # 💰 GLOBAL PROFIT PROTECTION
             # ===============================
+            
+
+            local_max_profit = max(local_max_profit, current_pnl)
 
             if local_max_profit >= 1000:
 
-                # 🎯 DYNAMIC LOCK — tiers:
-                # ₹1,000 – ₹1,499 → lock 80%
-                # ₹1,500 – ₹2,299 → lock 85%
-                # ₹2,300 – ₹2,999 → lock 90%
-                # ₹3,000+          → lock 92%
+                # 🎯 DYNAMIC LOCK
                 if local_max_profit < 1500:
-                    lock_pct = 0.80
-                elif local_max_profit < 2300:
-                    lock_pct = 0.85
+                    lock_pct = 0.5
                 elif local_max_profit < 3000:
-                    lock_pct = 0.90
+                    lock_pct = 0.7
                 else:
-                    lock_pct = 0.92
+                    lock_pct = 0.8
 
                 lock_level = local_max_profit * lock_pct
 
@@ -2778,12 +2986,8 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🧠 ATR BASED TRAILING
             # ===============================
             try:
-                _trail_token = (CRUDE_TOKEN      if instrument == "CRUDE"
-                                else BANKNIFTY_TOKEN if instrument == "BANKNIFTY"
-                                else SENSEX_TOKEN    if instrument == "SENSEX"
-                                else config.NIFTY_TOKEN)
                 df_trail = get_cached_data(
-                    _trail_token,
+                    CRUDE_TOKEN if instrument == "CRUDE" else (BANKNIFTY_TOKEN if instrument == "BANKNIFTY" else config.NIFTY_TOKEN),
                     "5minute",
                     50
                 )
@@ -3806,7 +4010,7 @@ def nifty_loop():
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
                 cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "5minute", 600)
                 if cached_nifty_df is not None and len(cached_nifty_df) >= 120:
-                    cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=2, channel_deviation=2)
+                    cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=3, channel_deviation=2)
                 last_fetch_nifty = time.time()
 
             if cached_nifty_df is None or len(cached_nifty_df) < 120 or cached_nifty_ht is None:
@@ -3852,6 +4056,8 @@ def nifty_loop():
                 time.sleep(60)
                 continue
 
+            _just_flipped_nifty = False   # reset each iteration; set True right after flip exit
+
             # ── Signal detected — log only, no Telegram ──────────────────────
             if signal is not None and arrow_idx is not None:
                 arrow_bar = ht_df.iloc[arrow_idx]
@@ -3883,11 +4089,13 @@ def nifty_loop():
             print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session)
-            # All filters must pass before order placement.
+            # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session / Hull)
+            # Hull check is SKIPPED on flip re-entries — HalfTrend alone
+            # decides exit/re-entry direction on reversals.
             # ══════════════════════════════════════════════════════════════
             _filter_ok, _filter_reason = apply_entry_filters(
-                signal, "NIFTY", cached_nifty_df, config.NIFTY_TOKEN)
+                signal, "NIFTY", cached_nifty_df, config.NIFTY_TOKEN,
+                is_flip_reentry=_just_flipped_nifty)
 
             if not _filter_ok:
                 print(f"🚫 NIFTY entry blocked — {_filter_reason}", flush=True)
@@ -3951,6 +4159,7 @@ def nifty_loop():
                         nifty_trade_active = False
                         global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_nifty = None
+                    _just_flipped_nifty = True   # ← tells filter to skip Hull check
                     time.sleep(3)
 
             else:
@@ -4160,7 +4369,7 @@ def crude_loop():
                 cached_crude_15m = get_cached_data(CRUDE_TOKEN, "15minute", 600)
                 # Recompute HalfTrend only when data refreshes
                 if cached_crude_15m is not None and len(cached_crude_15m) >= 50:
-                    cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=2, channel_deviation=2)
+                    cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=3, channel_deviation=2)
                 last_fetch_crude = time.time()
 
             if cached_crude_15m is None or len(cached_crude_15m) < 50 or cached_crude_ht is None:
@@ -4230,12 +4439,13 @@ def crude_loop():
             print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 📊  STRATEGY FILTERS  (ADX / MTF / VIX)
-            # Note: Session filter not applied for CRUDE (evening session
-            # has no lunch dead-zone equivalent).
+            # 📊  STRATEGY FILTERS
             # ══════════════════════════════════════════════════════════════
+            _just_flipped_crude = getattr(crude_loop, "_just_flipped", False)
+            crude_loop._just_flipped = False
             _filter_ok, _filter_reason = apply_entry_filters(
-                signal, "CRUDE", cached_crude_15m, CRUDE_TOKEN)
+                signal, "CRUDE", cached_crude_15m, CRUDE_TOKEN,
+                is_flip_reentry=_just_flipped_crude)
 
             if not _filter_ok:
                 print(f"🚫 CRUDE entry blocked — {_filter_reason}", flush=True)
@@ -4300,11 +4510,11 @@ def crude_loop():
                                                "active": False})
                         crude_trade_active = False
                         global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
-                        last_executed_signal_crude = None   # FIX: reset so flip re-entry isn't blocked by Layer 3
-                    # FIX: reset carryover guard so new direction isn't blocked
+                        last_executed_signal_crude = None
                     crude_loop._carryover_done = None
                     crude_loop._sig_alerted = None
-                    time.sleep(3)   # let Kite process exit before re-entry
+                    _just_flipped_crude = True   # ← skip Hull check on re-entry
+                    time.sleep(3)
 
             else:
                 # No open Kite position — sync in-memory state if it drifted
@@ -4505,7 +4715,7 @@ def banknifty_loop():
             if time.time() - last_fetch_banknifty > 30 or cached_banknifty_df is None:
                 cached_banknifty_df = get_cached_data(BANKNIFTY_TOKEN, "5minute", 600)
                 if cached_banknifty_df is not None and len(cached_banknifty_df) >= 120:
-                    cached_banknifty_ht = halftrend_tv(cached_banknifty_df, amplitude=2, channel_deviation=2)
+                    cached_banknifty_ht = halftrend_tv(cached_banknifty_df, amplitude=3, channel_deviation=2)
                 last_fetch_banknifty = time.time()
 
             if cached_banknifty_df is None or len(cached_banknifty_df) < 120 or cached_banknifty_ht is None:
@@ -4582,10 +4792,13 @@ def banknifty_loop():
             print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session)
+            # 📊  STRATEGY FILTERS
             # ══════════════════════════════════════════════════════════════
+            _just_flipped_bn = getattr(banknifty_loop, "_just_flipped", False)
+            banknifty_loop._just_flipped = False
             _filter_ok, _filter_reason = apply_entry_filters(
-                signal, "BANKNIFTY", cached_banknifty_df, BANKNIFTY_TOKEN)
+                signal, "BANKNIFTY", cached_banknifty_df, BANKNIFTY_TOKEN,
+                is_flip_reentry=_just_flipped_bn)
 
             if not _filter_ok:
                 print(f"🚫 BANKNIFTY entry blocked — {_filter_reason}", flush=True)
@@ -4649,6 +4862,7 @@ def banknifty_loop():
                         last_executed_signal_banknifty = None
                     banknifty_loop._carryover_done = None
                     banknifty_loop._sig_alerted    = None
+                    banknifty_loop._just_flipped   = True   # ← skip Hull on re-entry
                     time.sleep(3)
 
             else:
@@ -4847,7 +5061,7 @@ def sensex_loop():
             if time.time() - last_fetch_sensex > 30 or cached_sensex_df is None:
                 cached_sensex_df = get_cached_data(SENSEX_TOKEN, "5minute", 600)
                 if cached_sensex_df is not None and len(cached_sensex_df) >= 120:
-                    cached_sensex_ht = halftrend_tv(cached_sensex_df, amplitude=2, channel_deviation=2)
+                    cached_sensex_ht = halftrend_tv(cached_sensex_df, amplitude=3, channel_deviation=2)
                 last_fetch_sensex = time.time()
 
             if cached_sensex_df is None or len(cached_sensex_df) < 120 or cached_sensex_ht is None:
@@ -4924,10 +5138,13 @@ def sensex_loop():
             print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session)
+            # 📊  STRATEGY FILTERS
             # ══════════════════════════════════════════════════════════════
+            _just_flipped_sx = getattr(sensex_loop, "_just_flipped", False)
+            sensex_loop._just_flipped = False
             _filter_ok, _filter_reason = apply_entry_filters(
-                signal, "SENSEX", cached_sensex_df, SENSEX_TOKEN)
+                signal, "SENSEX", cached_sensex_df, SENSEX_TOKEN,
+                is_flip_reentry=_just_flipped_sx)
 
             if not _filter_ok:
                 print(f"🚫 SENSEX entry blocked — {_filter_reason}", flush=True)
@@ -4991,6 +5208,7 @@ def sensex_loop():
                         last_executed_signal_sensex = None
                     sensex_loop._carryover_done = None
                     sensex_loop._sig_alerted    = None
+                    sensex_loop._just_flipped   = True   # ← skip Hull on re-entry
                     time.sleep(3)
 
             else:

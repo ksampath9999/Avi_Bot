@@ -6,7 +6,20 @@ import pandas as pd
 import threading
 from kiteconnect import KiteConnect
 import config
-from telegram_bot import send_message
+from telegram_bot import send_message as _raw_send_message
+
+def send_message(text):
+    """
+    HTML-safe wrapper around telegram_bot.send_message.
+    Replaces < and > with safe equivalents so Telegram never
+    throws 'Unsupported start tag' errors regardless of what
+    filter reason strings or error messages contain.
+    """
+    try:
+        safe = str(text).replace("<", "‹").replace(">", "›")
+        _raw_send_message(safe)
+    except Exception as _tg_err:
+        print(f"⚠️ Telegram send failed: {_tg_err}", flush=True)
 import csv
 import os
 import json
@@ -1107,7 +1120,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         try:
             adx_val = ADX(df_15m, period=14).iloc[-2]
             if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
-                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} < {ADX_MIN_VALUE} (choppy market)"
+                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} below {ADX_MIN_VALUE} (choppy market)"
             _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
         except Exception as _e:
             _adx_str = f"ADX=err"
@@ -1126,7 +1139,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         vix = get_india_vix()
         if vix is not None:
             if vix < VIX_MIN:
-                return False, f"⏸️ VIX filter: VIX={vix:.1f} < {VIX_MIN} (premiums too cheap)"
+                return False, f"⏸️ VIX filter: VIX={vix:.1f} below {VIX_MIN} (premiums too cheap)"
             if vix > VIX_MAX:
                 return False, f"⏸️ VIX filter: VIX={vix:.1f} > {VIX_MAX} (too volatile)"
             _vix_str = f"VIX={vix:.1f}"
@@ -1138,10 +1151,10 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
             e9  = round(float(df_15m["close"].ewm(span=9,  adjust=False).mean().iloc[-2]), 2)
             e15 = round(float(df_15m["close"].ewm(span=15, adjust=False).mean().iloc[-2]), 2)
             if signal == "CALL" and e9 < e15:
-                return False, f"⏸️ EMA filter: 9 EMA ({e9:.1f}) < 15 EMA ({e15:.1f}) — bearish stack vs CALL"
+                return False, f"⏸️ EMA filter: 9 EMA ({e9:.1f}) below 15 EMA ({e15:.1f}) — bearish stack vs CALL"
             if signal == "PUT" and e9 > e15:
                 return False, f"⏸️ EMA filter: 9 EMA ({e9:.1f}) > 15 EMA ({e15:.1f}) — bullish stack vs PUT"
-            _ema_str = f"EMA9={e9:.1f} {'>' if e9>e15 else '<'} EMA15={e15:.1f}"
+            _ema_str = f"EMA9={e9:.1f} {'above' if e9>e15 else 'below'} EMA15={e15:.1f}"
         except Exception as _e:
             _ema_str = "EMA=err"
 
@@ -1156,7 +1169,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         elif ml_sig != signal:
             return False, f"🤖 ML filter: ML={ml_sig} vs HT={signal} ({ml_conf:.0f}%)"
         elif ml_conf < ML_MIN_CONFIDENCE:
-            return False, f"🤖 ML filter: low confidence {ml_conf:.0f}% < {ML_MIN_CONFIDENCE}%"
+            return False, f"🤖 ML filter: low confidence {ml_conf:.0f}% below {ML_MIN_CONFIDENCE}%"
         else:
             _ml_str = f"ML={ml_sig}({ml_conf:.0f}%)"
 
@@ -1180,7 +1193,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                     reason = (
                         f"🌊 Hull filter: band too thin — "
                         f"width={bw_pct*100:.3f}% ({pts:.1f} pts) "
-                        f"< min {HULL_MIN_BAND_WIDTH_PCT*100:.2f}% — "
+                        f"min {HULL_MIN_BAND_WIDTH_PCT*100:.2f}% — "
                         f"trend transitioning, skipping signal"
                     )
                     print(f"🚫 HULL BLOCK: {reason}", flush=True)
@@ -1213,7 +1226,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                     ht_color   = "🟢 GREEN" if signal   == "CALL" else "🔴 RED"
                     reason = (
                         f"🌊 Hull filter: Hull={hull_color} vs HalfTrend={ht_color} — "
-                        f"colours must match (hull={hval:.1f}, hull[2]={h2val:.1f}, "
+                        f"colours must match (hull={hval:.1f}, hull2={h2val:.1f}, "
                         f"band={bw_pct*100:.3f}%)"
                     )
                     print(f"🚫 HULL BLOCK: {reason}", flush=True)

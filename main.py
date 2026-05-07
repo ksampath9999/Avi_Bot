@@ -1177,12 +1177,14 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                 # ── Band width check — always applies, even on volume spikes ─
                 if HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT:
                     pts = abs(hval - h2val)
-                    return False, (
+                    reason = (
                         f"🌊 Hull filter: band too thin — "
                         f"width={bw_pct*100:.3f}% ({pts:.1f} pts) "
                         f"< min {HULL_MIN_BAND_WIDTH_PCT*100:.2f}% — "
                         f"trend transitioning, skipping signal"
                     )
+                    print(f"🚫 HULL BLOCK: {reason}", flush=True)
+                    return False, reason
 
                 # ── Volume spike check — bypasses Hull colour mismatch ────────
                 # If HalfTrend just flipped AND volume is unusually high,
@@ -1209,11 +1211,13 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                 if not _vol_override and hull_sig != signal:
                     hull_color = "🟢 GREEN" if hull_sig == "CALL" else "🔴 RED"
                     ht_color   = "🟢 GREEN" if signal   == "CALL" else "🔴 RED"
-                    return False, (
+                    reason = (
                         f"🌊 Hull filter: Hull={hull_color} vs HalfTrend={ht_color} — "
                         f"colours must match (hull={hval:.1f}, hull[2]={h2val:.1f}, "
                         f"band={bw_pct*100:.3f}%)"
                     )
+                    print(f"🚫 HULL BLOCK: {reason}", flush=True)
+                    return False, reason
 
                 if not _vol_override:
                     band_color = "🟢" if signal == "CALL" else "🔴"
@@ -3973,6 +3977,12 @@ def nifty_loop():
                 time.sleep(60)
                 continue
 
+            # ── Before 9:15 AM: market not yet open ──────────────────────────
+            if now_dt.hour == 9 and now_dt.minute < 15:
+                print("⏳ NIFTY: waiting for market open at 9:15 AM...", flush=True)
+                time.sleep(30)
+                continue
+
             # ── After 3:20 PM: block all NEW entries (force-close time) ─────────
             # Force close fires at 3:20 PM. Don't allow a fresh/carry-over entry
             # in the 3:20–3:30 PM window — it would get immediately force-closed.
@@ -4034,7 +4044,7 @@ def nifty_loop():
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
-                    print(f"{tag} NIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
+                    print(f"{tag} NIFTY {signal} — {bars_ago} bars ({bars_ago*5} min) ago @ {arrow_level:.2f}")
 
             if signal is None:
                 status = "NO_ARROW_NIFTY"

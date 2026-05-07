@@ -453,6 +453,15 @@ ADX_MIN_VALUE      = 20
                             # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
                             # only true choppy/sideways (TV ADX would be ~15 or below)
 
+# ── Support & Resistance Filter ───────────────────────────────────────────────
+# Blocks entries when price is within SR_BLOCK_PCT of key S&R levels:
+#   PDH / PDL (previous day high/low)
+#   Pivot R1 / R2 / S1 / S2 (standard pivot points)
+#   Round numbers (every 50 pts on Nifty, 100 pts on BankNifty/SENSEX)
+# Set False to disable completely.
+USE_SR_FILTER      = True    # True = active | False = disabled
+SR_BLOCK_PCT       = 0.003   # 0.3% proximity — within 72 pts on Nifty 24000
+
 # ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
 # Both HalfTrend AND 9/15 EMA must agree before an order is placed.
 # CALL entry: 9 EMA must be above 15 EMA (bullish alignment)
@@ -477,7 +486,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Flip back to True to resume immediately on next cycle.
 ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
-ENABLE_SENSEX     = True    # ✅ SENSEX trading active
+ENABLE_SENSEX     = False    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
 ENABLE_SWING      = False    # ✅ Swing stock trading active
 
@@ -1275,10 +1284,6 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     #   - If price has already broken BELOW support   → allow PUT  (breakdown)
     #
     # Set USE_SR_FILTER = False to disable.
-    USE_SR_FILTER   = True
-    SR_BLOCK_PCT    = 0.003   # 0.3% proximity to any S&R level triggers block
-
-    _sr_str = "SR=off"
     if USE_SR_FILTER and df_15m is not None and len(df_15m) >= 30:
         try:
             cur_close = float(df_15m["close"].iloc[-2])

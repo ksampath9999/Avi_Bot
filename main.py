@@ -1188,16 +1188,26 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                 _hull_str = "Hull=N/A"
             else:
                 # ── Band width check — always applies, even on volume spikes ─
-                if HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT:
+                # EXCEPTION: morning warm-up bypass — Hull band is always narrow
+                # at open regardless of actual trend strength. Skip width check
+                # for first HULL_MORNING_BYPASS_MINS minutes after 9:15 AM.
+                _now_ist = datetime.now(IST)
+                _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
+                _morning_bypass = (0 <= _mins_since_open <= HULL_MORNING_BYPASS_MINS)
+
+                if HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
                     pts = abs(hval - h2val)
                     reason = (
                         f"🌊 Hull filter: band too thin — "
                         f"width={bw_pct*100:.3f}% ({pts:.1f} pts) "
-                        f"min {HULL_MIN_BAND_WIDTH_PCT*100:.2f}% — "
+                        f"min {HULL_MIN_BAND_WIDTH_PCT*100:.3f}% — "
                         f"trend transitioning, skipping signal"
                     )
                     print(f"🚫 HULL BLOCK: {reason}", flush=True)
                     return False, reason
+                elif _morning_bypass and bw_pct < HULL_MIN_BAND_WIDTH_PCT:
+                    print(f"🌅 Hull morning bypass active ({_mins_since_open} min since open) — "
+                          f"band={bw_pct*100:.3f}% skipping width check", flush=True)
 
                 # ── Volume spike check — bypasses Hull colour mismatch ────────
                 # If HalfTrend just flipped AND volume is unusually high,
@@ -1280,7 +1290,11 @@ HULL_LENGTH      = 55     # Pine default for swing entry
 # 0.001 = 0.1% of price  (e.g. on Nifty 23000 → min gap of 23 pts)
 # 0.002 = 0.2% of price  (e.g. on Nifty 23000 → min gap of 46 pts) ← recommended
 # Set to 0.0 to disable the width check.
-HULL_MIN_BAND_WIDTH_PCT = 0.002   # 0.2% — ignores thin/transitioning bands
+HULL_MIN_BAND_WIDTH_PCT = 0.0005   # 0.05% — lowered from 0.20% which was blocking valid morning entries
+# Hull band is mathematically narrow at market open even when visually wide on chart.
+# MHULL vs SHULL (2 bars apart) takes ~30-45 min to widen after open.
+# HULL_MORNING_BYPASS_MINS skips the band width check during warm-up window.
+HULL_MORNING_BYPASS_MINS = 45     # skip band width check for first 45 min after 9:15 AM
 
 # ── Volume spike config ───────────────────────────────────────────────────────
 # When HalfTrend flips AND the flip candle has unusually high volume,

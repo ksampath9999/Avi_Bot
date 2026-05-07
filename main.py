@@ -1290,11 +1290,10 @@ HULL_LENGTH      = 55     # Pine default for swing entry
 # 0.001 = 0.1% of price  (e.g. on Nifty 23000 → min gap of 23 pts)
 # 0.002 = 0.2% of price  (e.g. on Nifty 23000 → min gap of 46 pts) ← recommended
 # Set to 0.0 to disable the width check.
-HULL_MIN_BAND_WIDTH_PCT = 0.0005   # 0.05% — lowered from 0.20% which was blocking valid morning entries
-# Hull band is mathematically narrow at market open even when visually wide on chart.
-# MHULL vs SHULL (2 bars apart) takes ~30-45 min to widen after open.
-# HULL_MORNING_BYPASS_MINS skips the band width check during warm-up window.
-HULL_MORNING_BYPASS_MINS = 45     # skip band width check for first 45 min after 9:15 AM
+HULL_MIN_BAND_WIDTH_PCT = 0.0002   # 0.02% — very permissive, only blocks truly flat bands
+# Hull band warm-up: mathematically narrow for ~60-75 min after open on 5-min charts.
+# Bypass the width check entirely during this window.
+HULL_MORNING_BYPASS_MINS = 75     # skip band width check for first 75 min after 9:15 AM (until ~10:30 AM)
 
 # ── Volume spike config ───────────────────────────────────────────────────────
 # When HalfTrend flips AND the flip candle has unusually high volume,

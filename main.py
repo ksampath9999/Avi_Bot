@@ -1443,17 +1443,17 @@ HULL_MORNING_BYPASS_MINS = 75
 # FIRST_CANDLE_BUFFER_PCT  = small buffer to avoid false breakout triggers
 #   e.g. 0.001 = 0.1% → on Nifty 24000, buffer = 24 pts above/below first candle
 USE_FIRST_CANDLE_FILTER  = True
-FIRST_CANDLE_BUFFER_PCT  = 0.001   # 0.1% buffer beyond the first candle range
+FIRST_CANDLE_BUFFER_PCT  = 0.001   # 0.1% buffer beyond the opening range
 
 # Per-instrument first candle cache — reset daily
-_first_candle_cache: dict = {}   # { "NIFTY": {"high": x, "low": y, "date": d}, ... }
-_first_candle_alert_sent: dict = {}  # { "NIFTY_2025-05-09": True } — Telegram sent once
+_first_candle_cache: dict = {}
+_first_candle_alert_sent: dict = {}
 
 
 def get_first_candle(df, instrument):
     """
-    Returns the high and low of the first 5-min candle of today (9:15–9:20 AM).
-    Uses the cached value if already computed for today.
+    Returns the high and low of the first 30-minute opening range (9:15–9:45 AM).
+    Aggregates all 5-min bars between 9:15 and 9:45 AM into one range.
     Returns (high, low, candle_time) or (None, None, None) if not available.
     """
     global _first_candle_cache
@@ -1476,30 +1476,35 @@ def get_first_candle(df, instrument):
         else:
             df_copy["_dt"] = df_copy["_dt"].dt.tz_convert(IST)
 
-        # Find the first candle of today at 9:15 AM
+        # Get all 5-min bars within the 9:15–9:45 AM window
         today_bars = df_copy[df_copy["_dt"].dt.date == today]
-        if len(today_bars) == 0:
+        opening_bars = today_bars[
+            (today_bars["_dt"].dt.hour == 9) &
+            (today_bars["_dt"].dt.minute >= 15) &
+            (today_bars["_dt"].dt.minute < 45)
+        ]
+
+        # Need at least 3 bars (9:15, 9:20, 9:25...) — wait until 9:45 AM
+        now_ist = datetime.now(IST)
+        if now_ist.hour == 9 and now_ist.minute < 45:
+            return None, None, None   # window not yet complete
+
+        if len(opening_bars) == 0:
             return None, None, None
 
-        first_bar = today_bars.iloc[0]
-        bar_time  = first_bar["_dt"]
-
-        # Only use it if it's the 9:15 candle (or close to open)
-        if bar_time.hour != 9 or bar_time.minute > 20:
-            return None, None, None
-
-        fc_high = float(first_bar["high"])
-        fc_low  = float(first_bar["low"])
+        fc_high = float(opening_bars["high"].max())
+        fc_low  = float(opening_bars["low"].min())
+        fc_time = opening_bars["_dt"].iloc[0]
 
         _first_candle_cache[cache_key] = {
             "high": fc_high,
             "low":  fc_low,
-            "time": bar_time
+            "time": fc_time
         }
-        print(f"📊 First candle [{instrument}] {bar_time.strftime('%H:%M')} → "
-              f"High={fc_high:.1f}  Low={fc_low:.1f}  "
+        print(f"📊 Opening range 30-min [{instrument}] → "
+              f"High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
               f"Range={fc_high-fc_low:.1f} pts", flush=True)
-        return fc_high, fc_low, bar_time
+        return fc_high, fc_low, fc_time
 
     except Exception as e:
         print(f"⚠️ get_first_candle({instrument}) error: {e}", flush=True)
@@ -1549,14 +1554,17 @@ def check_first_candle_range(signal, df, instrument):
         today_str = str(datetime.now(IST).date())
         alert_key = f"{instrument}_{today_str}_range"
 
-        if _first_candle_alert_sent.get(alert_key) is None:
-            _first_candle_alert_sent[alert_key] = True
+        # Send Telegram alert — throttled to once every 30 minutes per instrument
+        _last_sent_ts = _first_candle_alert_sent.get(alert_key, 0)
+        _thirty_mins  = 30 * 60   # 1800 seconds
+        if time.time() - _last_sent_ts >= _thirty_mins:
+            _first_candle_alert_sent[alert_key] = time.time()
             msg = (
-                f"📦 {instrument}: market inside first candle range\n"
-                f"First candle: High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
+                f"📦 {instrument}: market inside opening range\n"
+                f"Opening range: High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
                 f"Range={fc_high-fc_low:.1f} pts\n"
                 f"Current close: ₹{cur_close:.1f}\n"
-                f"Waiting for breakout — no orders placed until price exits this range"
+                f"No orders until price breaks {'above ₹' + str(round(breakout_high,1)) if signal=='CALL' else 'below ₹' + str(round(breakout_low,1))}"
             )
             print(f"🚫 FC RANGE BLOCK [{instrument}]: {msg}", flush=True)
             try:

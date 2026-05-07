@@ -448,8 +448,8 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # Toggle each filter on/off with True/False.
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ADX_FILTER     = False   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
-ADX_MIN_VALUE      = 22     # Kite API data gives ~3 pts lower ADX than TradingView
+USE_ADX_FILTER     = False   # OFF — using first-candle range filter instead
+ADX_MIN_VALUE      = 20
                             # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
                             # only true choppy/sideways (TV ADX would be ~15 or below)
 
@@ -1104,6 +1104,14 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     """
     now_ist = datetime.now(IST)
 
+    # ── 0. First candle range filter — rangebound inside-day detection ─────────
+    # If price is still inside the 9:15 AM first candle's high/low range,
+    # the market has no breakout direction — skip all entries.
+    if df_15m is not None and len(df_15m) >= 2:
+        _fc_ok, _fc_reason = check_first_candle_range(signal, df_15m, instrument)
+        if not _fc_ok:
+            return False, _fc_reason
+
     # ── 1. Session dead zone ──────────────────────────────────────────────────
     if USE_SESSION_FILTER and instrument in ("NIFTY", "BANKNIFTY", "SENSEX"):
         _dead = (
@@ -1120,7 +1128,10 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         try:
             adx_val = ADX(df_15m, period=14).iloc[-2]
             if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
-                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} below {ADX_MIN_VALUE} (choppy market)"
+                reason = (f"📊 ADX={adx_val:.1f} below {ADX_MIN_VALUE} — "
+                          f"market is rangebound/choppy, skipping entry")
+                print(f"🚫 ADX BLOCK: {reason}", flush=True)
+                return False, reason
             _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
         except Exception as _e:
             _adx_str = f"ADX=err"
@@ -1252,7 +1263,136 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _hull_e:
             _hull_str = f"Hull=err({_hull_e})"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str}"
+    # ── 8. Support & Resistance proximity block ───────────────────────────────
+    # If price is AT or NEAR a key resistance → block CALL entry (rejection risk)
+    # If price is AT or NEAR a key support    → block PUT entry  (bounce risk)
+    #
+    # Logic:
+    #   - Find swing highs (resistance) and swing lows (support) in last 50 bars
+    #   - "Near" = within SR_BLOCK_PCT % of current price
+    #   - Only block if the S&R level has been tested 2+ times (confirmed level)
+    #   - If price has already broken ABOVE resistance → allow CALL (breakout)
+    #   - If price has already broken BELOW support   → allow PUT  (breakdown)
+    #
+    # Set USE_SR_FILTER = False to disable.
+    USE_SR_FILTER   = True
+    SR_BLOCK_PCT    = 0.003   # 0.3% proximity to any S&R level triggers block
+
+    _sr_str = "SR=off"
+    if USE_SR_FILTER and df_15m is not None and len(df_15m) >= 30:
+        try:
+            cur_close = float(df_15m["close"].iloc[-2])
+            cur_high  = float(df_15m["high"].iloc[-2])
+            prox      = cur_close * SR_BLOCK_PCT
+
+            # ── Method 1: Previous Day High / Low (PDH / PDL) ────────────────
+            # Fetch daily candles to get yesterday's OHLC
+            # We derive PDH/PDL from the 5-min data itself (first/last bars of prev day)
+            df_15m["date_only"] = pd.to_datetime(df_15m["date"]).dt.date
+            _unique_days = sorted(df_15m["date_only"].unique())
+            pdh = pdl = pdc = None
+            if len(_unique_days) >= 2:
+                _prev_day = _unique_days[-2]
+                _prev_bars = df_15m[df_15m["date_only"] == _prev_day]
+                if len(_prev_bars) > 0:
+                    pdh = float(_prev_bars["high"].max())
+                    pdl = float(_prev_bars["low"].min())
+                    pdc = float(_prev_bars["close"].iloc[-1])
+
+            # ── Method 2: Pivot Points (Standard) ────────────────────────────
+            # Calculated once from previous day's H/L/C
+            r1 = r2 = s1 = s2 = pivot = None
+            if pdh and pdl and pdc:
+                pivot = (pdh + pdl + pdc) / 3
+                r1    = (2 * pivot) - pdl
+                r2    = pivot + (pdh - pdl)
+                s1    = (2 * pivot) - pdh
+                s2    = pivot - (pdh - pdl)
+
+            # ── Method 3: Round Number / Psychological Levels ─────────────────
+            # Nifty: 50-pt round numbers (24000, 24050, 24100...)
+            # BankNifty/SENSEX: 100-pt round numbers
+            if instrument in ("BANKNIFTY", "SENSEX"):
+                _round_step = 100
+            elif instrument == "CRUDE":
+                _round_step = 50
+            else:
+                _round_step = 50   # Nifty 50-pt strikes
+
+            _nearest_round_below = (cur_close // _round_step) * _round_step
+            _nearest_round_above = _nearest_round_below + _round_step
+
+            # ── Build complete resistance and support level lists ──────────────
+            resistance_levels = []
+            support_levels    = []
+
+            # PDH → resistance, PDL → support
+            if pdh and pdh > cur_close:
+                resistance_levels.append(("PDH", pdh))
+            if pdl and pdl < cur_close:
+                support_levels.append(("PDL", pdl))
+            if pdc:
+                if pdc > cur_close:
+                    resistance_levels.append(("PDC", pdc))
+                elif pdc < cur_close:
+                    support_levels.append(("PDC", pdc))
+
+            # Pivot levels → resistance if above, support if below
+            for _name, _val in [("R1", r1), ("R2", r2), ("S1", s1),
+                                 ("S2", s2), ("Pivot", pivot)]:
+                if _val is None: continue
+                if _val > cur_close:
+                    resistance_levels.append((_name, _val))
+                elif _val < cur_close:
+                    support_levels.append((_name, _val))
+
+            # Round numbers
+            if _nearest_round_above > cur_close:
+                resistance_levels.append(("Round", _nearest_round_above))
+            if _nearest_round_below < cur_close:
+                support_levels.append(("Round", _nearest_round_below))
+
+            # ── Find nearest levels ───────────────────────────────────────────
+            nearest_res = min(resistance_levels, key=lambda x: x[1]) if resistance_levels else None
+            nearest_sup = max(support_levels,    key=lambda x: x[1]) if support_levels    else None
+
+            _sr_blocked = False
+
+            # CALL near resistance → block
+            if signal == "CALL" and nearest_res:
+                _name, _level = nearest_res
+                dist_pct = (_level - cur_close) / cur_close
+                if dist_pct <= SR_BLOCK_PCT:
+                    _sr_blocked = True
+                    reason = (
+                        f"🧱 SR filter: CALL blocked — price ₹{cur_close:.1f} within "
+                        f"{dist_pct*100:.2f}% of {_name} resistance ₹{_level:.1f} — rejection risk"
+                    )
+                    print(f"🚫 SR BLOCK: {reason}", flush=True)
+                    return False, reason
+
+            # PUT near support → block
+            if signal == "PUT" and nearest_sup:
+                _name, _level = nearest_sup
+                dist_pct = (cur_close - _level) / cur_close
+                if dist_pct <= SR_BLOCK_PCT:
+                    _sr_blocked = True
+                    reason = (
+                        f"🧱 SR filter: PUT blocked — price ₹{cur_close:.1f} within "
+                        f"{dist_pct*100:.2f}% of {_name} support ₹{_level:.1f} — bounce risk"
+                    )
+                    print(f"🚫 SR BLOCK: {reason}", flush=True)
+                    return False, reason
+
+            if not _sr_blocked:
+                _r = f"{nearest_res[0]}=₹{nearest_res[1]:.0f}" if nearest_res else "none"
+                _s = f"{nearest_sup[0]}=₹{nearest_sup[1]:.0f}" if nearest_sup else "none"
+                _sr_str = f"SR=clear(res:{_r},sup:{_s})"
+
+        except Exception as _sr_e:
+            _sr_str = f"SR=err({_sr_e})"
+
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_sr_str}"
 
 
 
@@ -1290,10 +1430,150 @@ HULL_LENGTH      = 55     # Pine default for swing entry
 # 0.001 = 0.1% of price  (e.g. on Nifty 23000 → min gap of 23 pts)
 # 0.002 = 0.2% of price  (e.g. on Nifty 23000 → min gap of 46 pts) ← recommended
 # Set to 0.0 to disable the width check.
-HULL_MIN_BAND_WIDTH_PCT = 0.0002   # 0.02% — very permissive, only blocks truly flat bands
-# Hull band warm-up: mathematically narrow for ~60-75 min after open on 5-min charts.
-# Bypass the width check entirely during this window.
-HULL_MORNING_BYPASS_MINS = 75     # skip band width check for first 75 min after 9:15 AM (until ~10:30 AM)
+HULL_MIN_BAND_WIDTH_PCT  = 0.0002
+HULL_MORNING_BYPASS_MINS = 75
+
+# ── First 5-min candle range filter ──────────────────────────────────────────
+# Strategy: The first 5-min candle of the day (9:15–9:20 AM) sets the
+# opening range. If subsequent candles stay INSIDE this range, the market
+# is in a balance/inside-day mode — no directional bias → skip all entries.
+# Only enter when price BREAKS OUT of the first candle's high or low.
+#
+# USE_FIRST_CANDLE_FILTER = True  → active
+# FIRST_CANDLE_BUFFER_PCT  = small buffer to avoid false breakout triggers
+#   e.g. 0.001 = 0.1% → on Nifty 24000, buffer = 24 pts above/below first candle
+USE_FIRST_CANDLE_FILTER  = True
+FIRST_CANDLE_BUFFER_PCT  = 0.001   # 0.1% buffer beyond the first candle range
+
+# Per-instrument first candle cache — reset daily
+_first_candle_cache: dict = {}   # { "NIFTY": {"high": x, "low": y, "date": d}, ... }
+_first_candle_alert_sent: dict = {}  # { "NIFTY_2025-05-09": True } — Telegram sent once
+
+
+def get_first_candle(df, instrument):
+    """
+    Returns the high and low of the first 5-min candle of today (9:15–9:20 AM).
+    Uses the cached value if already computed for today.
+    Returns (high, low, candle_time) or (None, None, None) if not available.
+    """
+    global _first_candle_cache
+
+    try:
+        today = datetime.now(IST).date()
+        cache_key = f"{instrument}_{today}"
+
+        if cache_key in _first_candle_cache:
+            c = _first_candle_cache[cache_key]
+            return c["high"], c["low"], c["time"]
+
+        if df is None or len(df) < 2:
+            return None, None, None
+
+        df_copy = df.copy()
+        df_copy["_dt"] = pd.to_datetime(df_copy["date"])
+        if df_copy["_dt"].dt.tz is None:
+            df_copy["_dt"] = df_copy["_dt"].dt.tz_localize(IST)
+        else:
+            df_copy["_dt"] = df_copy["_dt"].dt.tz_convert(IST)
+
+        # Find the first candle of today at 9:15 AM
+        today_bars = df_copy[df_copy["_dt"].dt.date == today]
+        if len(today_bars) == 0:
+            return None, None, None
+
+        first_bar = today_bars.iloc[0]
+        bar_time  = first_bar["_dt"]
+
+        # Only use it if it's the 9:15 candle (or close to open)
+        if bar_time.hour != 9 or bar_time.minute > 20:
+            return None, None, None
+
+        fc_high = float(first_bar["high"])
+        fc_low  = float(first_bar["low"])
+
+        _first_candle_cache[cache_key] = {
+            "high": fc_high,
+            "low":  fc_low,
+            "time": bar_time
+        }
+        print(f"📊 First candle [{instrument}] {bar_time.strftime('%H:%M')} → "
+              f"High={fc_high:.1f}  Low={fc_low:.1f}  "
+              f"Range={fc_high-fc_low:.1f} pts", flush=True)
+        return fc_high, fc_low, bar_time
+
+    except Exception as e:
+        print(f"⚠️ get_first_candle({instrument}) error: {e}", flush=True)
+        return None, None, None
+
+
+def check_first_candle_range(signal, df, instrument):
+    """
+    Returns (passed: bool, reason: str)
+
+    Checks if the current closed candle (iloc[-2]) close price has broken
+    OUTSIDE the first 5-min candle's high/low range (with buffer).
+
+    CALL signal: close must be ABOVE first_candle_high + buffer → breakout up
+    PUT  signal: close must be BELOW first_candle_low  − buffer → breakout down
+
+    If price is still inside the range → rangebound → block + send Telegram once.
+    """
+    global _first_candle_alert_sent
+
+    if not USE_FIRST_CANDLE_FILTER:
+        return True, "FC=off"
+
+    try:
+        fc_high, fc_low, fc_time = get_first_candle(df, instrument)
+
+        if fc_high is None or fc_low is None:
+            # First candle not yet available (before 9:20 AM or data issue)
+            return True, "FC=N/A"
+
+        cur_close = float(df["close"].iloc[-2])
+        buffer    = cur_close * FIRST_CANDLE_BUFFER_PCT
+
+        breakout_high = fc_high + buffer   # must close above this for CALL
+        breakout_low  = fc_low  - buffer   # must close below this for PUT
+
+        # Check breakout
+        if signal == "CALL" and cur_close > breakout_high:
+            return True, (f"FC=breakout↑ close={cur_close:.1f} "
+                          f"above FC_high={fc_high:.1f}+buf={buffer:.1f}")
+
+        if signal == "PUT" and cur_close < breakout_low:
+            return True, (f"FC=breakout↓ close={cur_close:.1f} "
+                          f"below FC_low={fc_low:.1f}-buf={buffer:.1f}")
+
+        # Price still inside first candle range → rangebound
+        today_str = str(datetime.now(IST).date())
+        alert_key = f"{instrument}_{today_str}_range"
+
+        if _first_candle_alert_sent.get(alert_key) is None:
+            _first_candle_alert_sent[alert_key] = True
+            msg = (
+                f"📦 {instrument}: market inside first candle range\n"
+                f"First candle: High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
+                f"Range={fc_high-fc_low:.1f} pts\n"
+                f"Current close: ₹{cur_close:.1f}\n"
+                f"Waiting for breakout — no orders placed until price exits this range"
+            )
+            print(f"🚫 FC RANGE BLOCK [{instrument}]: {msg}", flush=True)
+            try:
+                send_message(msg)
+            except Exception:
+                pass
+
+        return False, (
+            f"📦 FC range block — close=₹{cur_close:.1f} inside "
+            f"[₹{fc_low:.1f} – ₹{fc_high:.1f}] "
+            f"(breakout needs close {'above' if signal=='CALL' else 'below'} "
+            f"₹{breakout_high if signal=='CALL' else breakout_low:.1f})"
+        )
+
+    except Exception as e:
+        print(f"⚠️ check_first_candle_range error: {e}", flush=True)
+        return True, f"FC=err({e})"
 
 # ── Volume spike config ───────────────────────────────────────────────────────
 # When HalfTrend flips AND the flip candle has unusually high volume,
@@ -4031,16 +4311,18 @@ def nifty_loop():
 
             # ══════════════════════════════════════════════════════════════
             # 🔒  HARD SAME-DIRECTION GUARD
-            # If a NIFTY trade is already active (any signal type), skip
-            # entry completely. Only a full exit clears nifty_position.
-            # This prevents duplicate orders on carry-over after a fresh entry.
-            # ══════════════════════════════════════════════════════════════
+            # Only skip if the open position MATCHES the current HalfTrend direction.
+            # If opposite position is open, fall through so Layer 1 can flip it.
             with lock:
                 _trade_active  = nifty_trade_active or nifty_position["active"]
                 _active_signal = nifty_position.get("signal")
             if _trade_active:
-                time.sleep(10)
-                continue
+                _curr_trend = int(cached_nifty_ht.iloc[-2]["trend"]) if cached_nifty_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    time.sleep(10)
+                    continue
+                print(f"⚠️ NIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
@@ -4394,10 +4676,15 @@ def crude_loop():
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
             with lock:
-                _trade_active = crude_trade_active or crude_position["active"]
+                _trade_active  = crude_trade_active or crude_position["active"]
+                _active_signal = crude_position.get("signal")
             if _trade_active:
-                time.sleep(10)
-                continue
+                _curr_trend = int(cached_crude_ht.iloc[-2]["trend"]) if cached_crude_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    time.sleep(10)
+                    continue
+                print(f"⚠️ CRUDE: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
 
             # Refresh data cache every 20 seconds
             if time.time() - last_fetch_crude > 20 or cached_crude_15m is None:
@@ -4740,10 +5027,15 @@ def banknifty_loop():
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
             with lock:
-                _trade_active = banknifty_trade_active or banknifty_position["active"]
+                _trade_active  = banknifty_trade_active or banknifty_position["active"]
+                _active_signal = banknifty_position.get("signal")
             if _trade_active:
-                time.sleep(10)
-                continue
+                _curr_trend = int(cached_banknifty_ht.iloc[-2]["trend"]) if cached_banknifty_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    time.sleep(10)
+                    continue
+                print(f"⚠️ BANKNIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_banknifty > 30 or cached_banknifty_df is None:
@@ -5086,11 +5378,23 @@ def sensex_loop():
                 continue
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
+            # Only skip if the open position MATCHES the current signal.
+            # If an opposite position is open, we must NOT skip — the flip
+            # exit logic at Layer 1 (below) needs to run to close it.
             with lock:
-                _trade_active = sensex_trade_active or sensex_position["active"]
+                _trade_active  = sensex_trade_active or sensex_position["active"]
+                _active_signal = sensex_position.get("signal")
+
             if _trade_active:
-                time.sleep(10)
-                continue
+                # Quick check: does open trade match current HalfTrend trend?
+                _curr_trend = int(cached_sensex_ht.iloc[-2]["trend"]) if cached_sensex_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    # Same direction — safe to skip
+                    time.sleep(10)
+                    continue
+                # Opposite direction — fall through so Layer 1 can flip it
+                print(f"⚠️ SENSEX: open {_active_signal} trade but HT says {_curr_sig} — running flip check", flush=True)
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_sensex > 30 or cached_sensex_df is None:
@@ -5805,6 +6109,11 @@ def reset_daily_pnl():
         # Clear stale option chain cache from prior trading day
         instrument_cache.clear()
         _data_cache_store.clear()   # also flush historical data cache
+
+        # Reset first candle range cache for new day
+        _first_candle_cache.clear()
+        _first_candle_alert_sent.clear()
+        print("📊 First candle range cache reset for new day", flush=True)
 
         # ── Reset progressive profit lock for new day ─────────────────────
         global _peak_daily_pnl, _profit_lock_floor, _profit_lock_tier
@@ -8298,13 +8607,17 @@ if __name__ == "__main__":
 
     if BANKNIFTY_TOKEN:
         threading.Thread(target=banknifty_loop, daemon=True).start()
+        print(f"✅ BANKNIFTY loop started (token={BANKNIFTY_TOKEN})", flush=True)
     else:
-        print("⚠️ BANKNIFTY LOOP SKIPPED — token not found")
+        print("❌ BANKNIFTY LOOP SKIPPED — BANKNIFTY_TOKEN missing from config.py", flush=True)
 
     if SENSEX_TOKEN:
         threading.Thread(target=sensex_loop, daemon=True).start()
+        print(f"✅ SENSEX loop started (token={SENSEX_TOKEN})", flush=True)
     else:
-        print("⚠️ SENSEX LOOP SKIPPED — token not found")
+        print("❌ SENSEX LOOP SKIPPED — SENSEX_TOKEN is None or missing from config.py", flush=True)
+        print("   Add SENSEX_TOKEN = <instrument_token> to your config.py", flush=True)
+        send_message("⚠️ SENSEX loop NOT started — SENSEX_TOKEN missing from config.py")
 
     if ENABLE_SWING:
         threading.Thread(target=swing_loop, daemon=True, name="SwingLoop").start()

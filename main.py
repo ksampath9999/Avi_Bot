@@ -4024,39 +4024,41 @@ def nifty_loop():
                 last_fetch_nifty = time.time()
 
             if cached_nifty_df is None or len(cached_nifty_df) < 120 or cached_nifty_ht is None:
+                print(f"⚠️ NIFTY: insufficient data — df={len(cached_nifty_df) if cached_nifty_df is not None else 'None'} bars, ht={'ok' if cached_nifty_ht is not None else 'None'}", flush=True)
                 time.sleep(10)
                 continue
 
             ht_df = cached_nifty_ht
             current_trend = int(ht_df.iloc[-2]["trend"])
-            print("🧠 Current Trend:", "CALL" if current_trend == 0 else "PUT")
+            print(f"🧠 NIFTY trend={'CALL(bullish)' if current_trend == 0 else 'PUT(bearish)'}  bars={len(ht_df)}  time={datetime.now(IST).strftime('%H:%M:%S')}", flush=True)
 
             # ── Signal Detection (fresh arrow + carry-over) ───────────────────
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
 
             arrow_level = None
             if signal is not None and arrow_idx is not None:
-                arrow_bar = ht_df.iloc[arrow_idx]
+                arrow_bar  = ht_df.iloc[arrow_idx]
                 arrow_level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
+                bars_ago   = len(ht_df) - arrow_idx - 2
                 if is_fresh:
                     tag = "🟢 FRESH" if signal == "CALL" else "🔴 FRESH"
-                    print(f"{tag} NIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
+                    print(f"{tag} NIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}", flush=True)
                 else:
-                    bars_ago = len(ht_df) - arrow_idx - 2
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
-                    print(f"{tag} NIFTY {signal} — {bars_ago} bars ({bars_ago*5} min) ago @ {arrow_level:.2f}")
+                    print(f"{tag} NIFTY {signal} — {bars_ago} bars ({bars_ago*5} min ago) @ {arrow_level:.2f}", flush=True)
 
             if signal is None:
                 status = "NO_ARROW_NIFTY"
                 if last_status != status or time.time() - last_weak_log_time > 60:
                     trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
-                    print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 120 bars — waiting")
+                    print(f"⏸️ NIFTY: trend={trend_name} but no valid arrow in last 120 bars — waiting", flush=True)
                     last_status = status
                     last_weak_log_time = time.time()
                 time.sleep(10)
                 continue
 
             # ── Daily trade limit check ───────────────────────────────────────
+            print(f"📊 NIFTY trades today: {nifty_trade_count}/{MAX_NIFTY_TRADES_PER_DAY}", flush=True)
             if nifty_trade_count >= MAX_NIFTY_TRADES_PER_DAY:
                 _msg = f"🔒 NIFTY daily limit reached ({nifty_trade_count}/{MAX_NIFTY_TRADES_PER_DAY} trades) — no more trades today"
                 if last_status != "NIFTY_LIMIT":
@@ -4068,19 +4070,12 @@ def nifty_loop():
 
             _just_flipped_nifty = False   # reset each iteration; set True right after flip exit
 
-            # ── Signal detected — log only, no Telegram ──────────────────────
-            if signal is not None and arrow_idx is not None:
-                arrow_bar = ht_df.iloc[arrow_idx]
-                _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
-                _bars_ago = len(ht_df) - arrow_idx - 2
-                _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
-                print(f"🔔 NIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
-
             # ── Carry-over: enter only once per day ───────────────────────────
-            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+            today_str     = datetime.now(IST).strftime("%Y-%m-%d")
             carryover_key = f"NIFTY_{signal}_{today_str}"
             if not is_fresh:
                 if getattr(nifty_loop, "_carryover_done", None) == carryover_key:
+                    print(f"⏭️ NIFTY carry-over already entered today ({carryover_key}) — skipping", flush=True)
                     time.sleep(10)
                     continue
 
@@ -4188,18 +4183,19 @@ def nifty_loop():
                 pos_signal = nifty_position["signal"]
 
             if pos_active and pos_signal == signal:
+                print(f"⏭️ NIFTY Layer2: already in {pos_signal} trade — skipping", flush=True)
                 time.sleep(10)
                 continue
 
             # Layer 3 — duplicate prevention for same fresh signal
             if is_fresh and signal == last_executed_signal_nifty:
+                print(f"⏭️ NIFTY Layer3: fresh {signal} already executed — skipping", flush=True)
                 time.sleep(10)
                 continue
 
             # ══════════════════════════════════════════════════════════════
             # 🚀  ENTRY — all guards passed, place the order
             # ══════════════════════════════════════════════════════════════
-            # FIX: check flag then release lock; sleep OUTSIDE the lock.
             with lock:
                 if nifty_trade_active:
                     already_active = True
@@ -4209,12 +4205,13 @@ def nifty_loop():
                     global_trade_active = True
 
             if already_active:
+                print(f"⏭️ NIFTY: nifty_trade_active=True — skipping", flush=True)
                 time.sleep(10)
                 continue
 
             # ── Profit-lock exit cooldown (15 min) ────────────────────────────
             _pl_exit_ts = _profit_lock_exit_time.get("NIFTY", 0)
-            _pl_wait = 900 - (time.time() - _pl_exit_ts)   # 900s = 15 min
+            _pl_wait = 900 - (time.time() - _pl_exit_ts)
             if _pl_wait > 0:
                 print(f"⏳ NIFTY profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
                 with lock:
@@ -4223,10 +4220,11 @@ def nifty_loop():
                 time.sleep(min(_pl_wait, 60))
                 continue
 
-            print(f"🧠 NIFTY entering: {signal}")
+            print(f"🚀 NIFTY all guards passed — calling find_option({signal})", flush=True)
             symbol, price, lot, exchange = find_option(signal, "NIFTY")
 
             if not symbol or price is None:
+                print(f"❌ NIFTY find_option returned None — no valid option found for {signal}", flush=True)
                 with lock:
                     nifty_trade_active = False
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active

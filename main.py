@@ -4031,18 +4031,16 @@ def nifty_loop():
 
             # ══════════════════════════════════════════════════════════════
             # 🔒  HARD SAME-DIRECTION GUARD
-            # Only skip if the open position MATCHES the current HalfTrend direction.
-            # If opposite position is open, fall through so Layer 1 can flip it.
+            # If a NIFTY trade is already active (any signal type), skip
+            # entry completely. Only a full exit clears nifty_position.
+            # This prevents duplicate orders on carry-over after a fresh entry.
+            # ══════════════════════════════════════════════════════════════
             with lock:
                 _trade_active  = nifty_trade_active or nifty_position["active"]
                 _active_signal = nifty_position.get("signal")
             if _trade_active:
-                _curr_trend = int(cached_nifty_ht.iloc[-2]["trend"]) if cached_nifty_ht is not None else -1
-                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
-                if _active_signal == _curr_sig:
-                    time.sleep(10)
-                    continue
-                print(f"⚠️ NIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
+                time.sleep(10)
+                continue
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
@@ -4396,15 +4394,10 @@ def crude_loop():
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
             with lock:
-                _trade_active  = crude_trade_active or crude_position["active"]
-                _active_signal = crude_position.get("signal")
+                _trade_active = crude_trade_active or crude_position["active"]
             if _trade_active:
-                _curr_trend = int(cached_crude_ht.iloc[-2]["trend"]) if cached_crude_ht is not None else -1
-                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
-                if _active_signal == _curr_sig:
-                    time.sleep(10)
-                    continue
-                print(f"⚠️ CRUDE: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
+                time.sleep(10)
+                continue
 
             # Refresh data cache every 20 seconds
             if time.time() - last_fetch_crude > 20 or cached_crude_15m is None:
@@ -4747,15 +4740,10 @@ def banknifty_loop():
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
             with lock:
-                _trade_active  = banknifty_trade_active or banknifty_position["active"]
-                _active_signal = banknifty_position.get("signal")
+                _trade_active = banknifty_trade_active or banknifty_position["active"]
             if _trade_active:
-                _curr_trend = int(cached_banknifty_ht.iloc[-2]["trend"]) if cached_banknifty_ht is not None else -1
-                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
-                if _active_signal == _curr_sig:
-                    time.sleep(10)
-                    continue
-                print(f"⚠️ BANKNIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
+                time.sleep(10)
+                continue
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_banknifty > 30 or cached_banknifty_df is None:
@@ -5098,23 +5086,11 @@ def sensex_loop():
                 continue
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
-            # Only skip if the open position MATCHES the current signal.
-            # If an opposite position is open, we must NOT skip — the flip
-            # exit logic at Layer 1 (below) needs to run to close it.
             with lock:
-                _trade_active  = sensex_trade_active or sensex_position["active"]
-                _active_signal = sensex_position.get("signal")
-
+                _trade_active = sensex_trade_active or sensex_position["active"]
             if _trade_active:
-                # Quick check: does open trade match current HalfTrend trend?
-                _curr_trend = int(cached_sensex_ht.iloc[-2]["trend"]) if cached_sensex_ht is not None else -1
-                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
-                if _active_signal == _curr_sig:
-                    # Same direction — safe to skip
-                    time.sleep(10)
-                    continue
-                # Opposite direction — fall through so Layer 1 can flip it
-                print(f"⚠️ SENSEX: open {_active_signal} trade but HT says {_curr_sig} — running flip check", flush=True)
+                time.sleep(10)
+                continue
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_sensex > 30 or cached_sensex_df is None:
@@ -8488,4 +8464,4 @@ if __name__ == "__main__":
         time.sleep(60)
 
 
-    # end of __main__ 
+    # end of __main__

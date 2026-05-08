@@ -1252,136 +1252,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _hull_e:
             _hull_str = f"Hull=err({_hull_e})"
 
-    # ── 8. Support & Resistance proximity block ───────────────────────────────
-    # If price is AT or NEAR a key resistance → block CALL entry (rejection risk)
-    # If price is AT or NEAR a key support    → block PUT entry  (bounce risk)
-    #
-    # Logic:
-    #   - Find swing highs (resistance) and swing lows (support) in last 50 bars
-    #   - "Near" = within SR_BLOCK_PCT % of current price
-    #   - Only block if the S&R level has been tested 2+ times (confirmed level)
-    #   - If price has already broken ABOVE resistance → allow CALL (breakout)
-    #   - If price has already broken BELOW support   → allow PUT  (breakdown)
-    #
-    # Set USE_SR_FILTER = False to disable.
-    USE_SR_FILTER   = True
-    SR_BLOCK_PCT    = 0.003   # 0.3% proximity to any S&R level triggers block
-
-    _sr_str = "SR=off"
-    if USE_SR_FILTER and df_15m is not None and len(df_15m) >= 30:
-        try:
-            cur_close = float(df_15m["close"].iloc[-2])
-            cur_high  = float(df_15m["high"].iloc[-2])
-            prox      = cur_close * SR_BLOCK_PCT
-
-            # ── Method 1: Previous Day High / Low (PDH / PDL) ────────────────
-            # Fetch daily candles to get yesterday's OHLC
-            # We derive PDH/PDL from the 5-min data itself (first/last bars of prev day)
-            df_15m["date_only"] = pd.to_datetime(df_15m["date"]).dt.date
-            _unique_days = sorted(df_15m["date_only"].unique())
-            pdh = pdl = pdc = None
-            if len(_unique_days) >= 2:
-                _prev_day = _unique_days[-2]
-                _prev_bars = df_15m[df_15m["date_only"] == _prev_day]
-                if len(_prev_bars) > 0:
-                    pdh = float(_prev_bars["high"].max())
-                    pdl = float(_prev_bars["low"].min())
-                    pdc = float(_prev_bars["close"].iloc[-1])
-
-            # ── Method 2: Pivot Points (Standard) ────────────────────────────
-            # Calculated once from previous day's H/L/C
-            r1 = r2 = s1 = s2 = pivot = None
-            if pdh and pdl and pdc:
-                pivot = (pdh + pdl + pdc) / 3
-                r1    = (2 * pivot) - pdl
-                r2    = pivot + (pdh - pdl)
-                s1    = (2 * pivot) - pdh
-                s2    = pivot - (pdh - pdl)
-
-            # ── Method 3: Round Number / Psychological Levels ─────────────────
-            # Nifty: 50-pt round numbers (24000, 24050, 24100...)
-            # BankNifty/SENSEX: 100-pt round numbers
-            if instrument in ("BANKNIFTY", "SENSEX"):
-                _round_step = 100
-            elif instrument == "CRUDE":
-                _round_step = 50
-            else:
-                _round_step = 50   # Nifty 50-pt strikes
-
-            _nearest_round_below = (cur_close // _round_step) * _round_step
-            _nearest_round_above = _nearest_round_below + _round_step
-
-            # ── Build complete resistance and support level lists ──────────────
-            resistance_levels = []
-            support_levels    = []
-
-            # PDH → resistance, PDL → support
-            if pdh and pdh > cur_close:
-                resistance_levels.append(("PDH", pdh))
-            if pdl and pdl < cur_close:
-                support_levels.append(("PDL", pdl))
-            if pdc:
-                if pdc > cur_close:
-                    resistance_levels.append(("PDC", pdc))
-                elif pdc < cur_close:
-                    support_levels.append(("PDC", pdc))
-
-            # Pivot levels → resistance if above, support if below
-            for _name, _val in [("R1", r1), ("R2", r2), ("S1", s1),
-                                 ("S2", s2), ("Pivot", pivot)]:
-                if _val is None: continue
-                if _val > cur_close:
-                    resistance_levels.append((_name, _val))
-                elif _val < cur_close:
-                    support_levels.append((_name, _val))
-
-            # Round numbers
-            if _nearest_round_above > cur_close:
-                resistance_levels.append(("Round", _nearest_round_above))
-            if _nearest_round_below < cur_close:
-                support_levels.append(("Round", _nearest_round_below))
-
-            # ── Find nearest levels ───────────────────────────────────────────
-            nearest_res = min(resistance_levels, key=lambda x: x[1]) if resistance_levels else None
-            nearest_sup = max(support_levels,    key=lambda x: x[1]) if support_levels    else None
-
-            _sr_blocked = False
-
-            # CALL near resistance → block
-            if signal == "CALL" and nearest_res:
-                _name, _level = nearest_res
-                dist_pct = (_level - cur_close) / cur_close
-                if dist_pct <= SR_BLOCK_PCT:
-                    _sr_blocked = True
-                    reason = (
-                        f"🧱 SR filter: CALL blocked — price ₹{cur_close:.1f} within "
-                        f"{dist_pct*100:.2f}% of {_name} resistance ₹{_level:.1f} — rejection risk"
-                    )
-                    print(f"🚫 SR BLOCK: {reason}", flush=True)
-                    return False, reason
-
-            # PUT near support → block
-            if signal == "PUT" and nearest_sup:
-                _name, _level = nearest_sup
-                dist_pct = (cur_close - _level) / cur_close
-                if dist_pct <= SR_BLOCK_PCT:
-                    _sr_blocked = True
-                    reason = (
-                        f"🧱 SR filter: PUT blocked — price ₹{cur_close:.1f} within "
-                        f"{dist_pct*100:.2f}% of {_name} support ₹{_level:.1f} — bounce risk"
-                    )
-                    print(f"🚫 SR BLOCK: {reason}", flush=True)
-                    return False, reason
-
-            if not _sr_blocked:
-                _r = f"{nearest_res[0]}=₹{nearest_res[1]:.0f}" if nearest_res else "none"
-                _s = f"{nearest_sup[0]}=₹{nearest_sup[1]:.0f}" if nearest_sup else "none"
-                _sr_str = f"SR=clear(res:{_r},sup:{_s})"
-
-        except Exception as _sr_e:
-            _sr_str = f"SR=err({_sr_e})"
-
-    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_sr_str}"
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str}"
 
 
 
@@ -4160,18 +4031,16 @@ def nifty_loop():
 
             # ══════════════════════════════════════════════════════════════
             # 🔒  HARD SAME-DIRECTION GUARD
-            # Only skip if the open position MATCHES the current HalfTrend direction.
-            # If opposite position is open, fall through so Layer 1 can flip it.
+            # If a NIFTY trade is already active (any signal type), skip
+            # entry completely. Only a full exit clears nifty_position.
+            # This prevents duplicate orders on carry-over after a fresh entry.
+            # ══════════════════════════════════════════════════════════════
             with lock:
                 _trade_active  = nifty_trade_active or nifty_position["active"]
                 _active_signal = nifty_position.get("signal")
             if _trade_active:
-                _curr_trend = int(cached_nifty_ht.iloc[-2]["trend"]) if cached_nifty_ht is not None else -1
-                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
-                if _active_signal == _curr_sig:
-                    time.sleep(10)
-                    continue
-                print(f"⚠️ NIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
+                time.sleep(10)
+                continue
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
@@ -4525,15 +4394,10 @@ def crude_loop():
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
             with lock:
-                _trade_active  = crude_trade_active or crude_position["active"]
-                _active_signal = crude_position.get("signal")
+                _trade_active = crude_trade_active or crude_position["active"]
             if _trade_active:
-                _curr_trend = int(cached_crude_ht.iloc[-2]["trend"]) if cached_crude_ht is not None else -1
-                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
-                if _active_signal == _curr_sig:
-                    time.sleep(10)
-                    continue
-                print(f"⚠️ CRUDE: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
+                time.sleep(10)
+                continue
 
             # Refresh data cache every 20 seconds
             if time.time() - last_fetch_crude > 20 or cached_crude_15m is None:
@@ -4876,15 +4740,10 @@ def banknifty_loop():
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
             with lock:
-                _trade_active  = banknifty_trade_active or banknifty_position["active"]
-                _active_signal = banknifty_position.get("signal")
+                _trade_active = banknifty_trade_active or banknifty_position["active"]
             if _trade_active:
-                _curr_trend = int(cached_banknifty_ht.iloc[-2]["trend"]) if cached_banknifty_ht is not None else -1
-                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
-                if _active_signal == _curr_sig:
-                    time.sleep(10)
-                    continue
-                print(f"⚠️ BANKNIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
+                time.sleep(10)
+                continue
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_banknifty > 30 or cached_banknifty_df is None:
@@ -5227,23 +5086,11 @@ def sensex_loop():
                 continue
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
-            # Only skip if the open position MATCHES the current signal.
-            # If an opposite position is open, we must NOT skip — the flip
-            # exit logic at Layer 1 (below) needs to run to close it.
             with lock:
-                _trade_active  = sensex_trade_active or sensex_position["active"]
-                _active_signal = sensex_position.get("signal")
-
+                _trade_active = sensex_trade_active or sensex_position["active"]
             if _trade_active:
-                # Quick check: does open trade match current HalfTrend trend?
-                _curr_trend = int(cached_sensex_ht.iloc[-2]["trend"]) if cached_sensex_ht is not None else -1
-                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
-                if _active_signal == _curr_sig:
-                    # Same direction — safe to skip
-                    time.sleep(10)
-                    continue
-                # Opposite direction — fall through so Layer 1 can flip it
-                print(f"⚠️ SENSEX: open {_active_signal} trade but HT says {_curr_sig} — running flip check", flush=True)
+                time.sleep(10)
+                continue
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_sensex > 30 or cached_sensex_df is None:

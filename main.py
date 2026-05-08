@@ -297,23 +297,6 @@ def zerodha_auto_login():
 
 
 # ── Initial login at startup ─────────────────────────────────────────────────
-# Print which env vars are set (masked) so you can diagnose missing values
-print("\n🔑 Checking Railway environment variables:", flush=True)
-_ev_checks = {
-    "ZERODHA_USER_ID":     os.environ.get("ZERODHA_USER_ID"),
-    "ZERODHA_PASSWORD":    os.environ.get("ZERODHA_PASSWORD"),
-    "ZERODHA_TOTP_SECRET": os.environ.get("ZERODHA_TOTP_SECRET"),
-    "KITE_API_KEY":        os.environ.get("KITE_API_KEY"),
-    "KITE_API_SECRET":     os.environ.get("KITE_API_SECRET") or os.environ.get("API_SECRET"),
-}
-for _k, _v in _ev_checks.items():
-    if _v:
-        _masked = _v[:4] + "****" + _v[-2:] if len(_v) > 6 else "****"
-        print(f"   ✅ {_k} = {_masked} (len={len(_v)})", flush=True)
-    else:
-        print(f"   ❌ {_k} = NOT SET ← fix this in Railway Variables", flush=True)
-print(flush=True)
-
 try:
     _startup_token = zerodha_auto_login()
     print("✅ Auto-login successful", flush=True)
@@ -8547,46 +8530,14 @@ if __name__ == "__main__":
         print("⚠️ NIFTY FUT TOKEN NOT FOUND")
 
     # -----------------------------
-    # 🔍 API TEST — halt if token invalid
+    # 🔍 API TEST
     # -----------------------------
-    _api_ok = False
-    for _api_attempt in range(3):
-        try:
-            print(f"🔍 Testing Kite API (attempt {_api_attempt+1}/3)...", flush=True)
-            test = kite.ltp("NSE:NIFTY 50")
-            print("✅ Kite API working:", test, flush=True)
-            _api_ok = True
-            break
-        except Exception as _api_err:
-            print(f"❌ Kite API FAILED (attempt {_api_attempt+1}/3): {_api_err}", flush=True)
-            if _api_attempt < 2:
-                print("   Retrying login...", flush=True)
-                try:
-                    zerodha_auto_login()
-                except Exception:
-                    pass
-                time.sleep(5)
-
-    if not _api_ok:
-        _err_msg = (
-            f"❌ KITE API INVALID — BOT HALTED\n"
-            f"api_key or access_token is invalid.\n"
-            f"Tried 3 times — all failed.\n\n"
-            f"Fix steps:\n"
-            f"1. Check KITE_API_KEY in Railway vars\n"
-            f"2. Check KITE_PASSWORD is correct\n"
-            f"3. Check KITE_TOTP_SECRET is correct\n"
-            f"4. Whitelist IP at developers.kite.trade\n"
-            f"5. Redeploy after fixing"
-        )
-        print(_err_msg, flush=True)
-        try:
-            send_message(_err_msg)
-        except Exception:
-            pass
-        # Stop — no point starting loops with invalid token
-        import sys
-        sys.exit(1)
+    try:
+        print("🔍 Testing Kite API...")
+        test = kite.ltp("NSE:NIFTY 50")
+        print("✅ Kite API working:", test)
+    except Exception as e:
+        print("❌ Kite API FAILED:", e)
 
     # -----------------------------
     # 🔒 LOCK FILE HANDLING

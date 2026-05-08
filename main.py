@@ -299,8 +299,19 @@ def zerodha_auto_login():
 # ── Initial login at startup ─────────────────────────────────────────────────
 try:
     _startup_token = zerodha_auto_login()
-except Exception:
+    print("✅ Auto-login successful", flush=True)
+except Exception as _startup_err:
     _startup_token = None
+    print(f"❌ Startup login failed: {_startup_err}", flush=True)
+    try:
+        send_message(
+            f"❌ KITE LOGIN FAILED AT STARTUP\n"
+            f"Error: {str(_startup_err)[:200]}\n"
+            f"Bot is running with expired/old token — orders will be rejected.\n"
+            f"Fix: Check TOTP secret, password, IP whitelist then redeploy."
+        )
+    except Exception:
+        pass
 
 # 🌐 PRINT RAILWAY PUBLIC IP
 try:
@@ -486,7 +497,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Flip back to True to resume immediately on next cycle.
 ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
-ENABLE_SENSEX     = False    # ✅ SENSEX trading active
+ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
 ENABLE_SWING      = False    # ✅ Swing stock trading active
 
@@ -4620,7 +4631,13 @@ def nifty_loop():
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
-            print("❌ NIFTY LOOP ERROR:", e)
+            err_str = str(e)
+            print("❌ NIFTY LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"NIFTY_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(nifty_loop, "_token_alerted", None) != _tk:
+                    nifty_loop._token_alerted = _tk
+                    send_message(f"❌ NIFTY: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
             try:
                 if get_open_kite_position("NIFTY") is None:
                     with lock:
@@ -4970,7 +4987,13 @@ def crude_loop():
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
-            print("❌ CRUDE LOOP ERROR:", e)
+            err_str = str(e)
+            print("❌ CRUDE LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"CRUDE_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(crude_loop, "_token_alerted", None) != _tk:
+                    crude_loop._token_alerted = _tk
+                    send_message(f"❌ CRUDE: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
             # Safety reset: if flag was set True before the exception,
             # only reset it if Kite confirms no open position
             try:
@@ -5323,7 +5346,13 @@ def banknifty_loop():
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
-            print("❌ BANKNIFTY LOOP ERROR:", e)
+            err_str = str(e)
+            print("❌ BANKNIFTY LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"BN_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(banknifty_loop, "_token_alerted", None) != _tk:
+                    banknifty_loop._token_alerted = _tk
+                    send_message(f"❌ BANKNIFTY: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
             try:
                 if get_open_kite_position("BANKNIFTY") is None:
                     with lock:
@@ -5683,7 +5712,13 @@ def sensex_loop():
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
-            print("❌ SENSEX LOOP ERROR:", e)
+            err_str = str(e)
+            print("❌ SENSEX LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"SX_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(sensex_loop, "_token_alerted", None) != _tk:
+                    sensex_loop._token_alerted = _tk
+                    send_message(f"❌ SENSEX: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
             try:
                 if get_open_kite_position("SENSEX") is None:
                     with lock:

@@ -184,58 +184,129 @@ def zerodha_auto_login():
         print("   Getting request_token from Kite Connect redirect...", flush=True)
         _api_key = os.environ.get("KITE_API_KEY") or config.API_KEY
         print(f"   Using api_key: {_api_key[:6]}... (len={len(str(_api_key))})", flush=True)
-        login_url = f"https://kite.zerodha.com/connect/login?api_key={_api_key}&v=3"
 
+        # Capture all cookies from the 2FA session — these MUST be sent with
+        # every redirect call otherwise Kite resets the session to /connect/login
+        _cookies = dict(session.cookies)
+        print(f"   Session cookies available: {list(_cookies.keys())}", flush=True)
+
+        # Build cookie header string explicitly
+        _cookie_hdr = "; ".join(f"{k}={v}" for k, v in _cookies.items())
+
+        # Dedicated session for redirect flow with all cookies pre-loaded
+        _rs = requests.Session()
+        _rs.cookies.update(_cookies)
+        _rs.headers.update({
+            "User-Agent"    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "X-Kite-Version": "3",
+            "Referer"       : "https://kite.zerodha.com/",
+            "Cookie"        : _cookie_hdr,
+        })
+
+        login_url = f"https://kite.zerodha.com/connect/login?api_key={_api_key}&v=3"
         request_token = None
 
-        # ── 3a: Hop 1 — /connect/login → /connect/finish ────────────────────
-        resp_login = session.get(login_url, allow_redirects=False, timeout=15)
+        # ── 3a: Hop 1 ────────────────────────────────────────────────────────
+        resp_login = _rs.get(login_url, allow_redirects=False, timeout=15)
         loc1 = resp_login.headers.get("Location", "")
         print(f"   [hop1] status={resp_login.status_code} | loc={loc1[:150]}", flush=True)
-        print(f"   [hop1] body={resp_login.text[:200]}", flush=True)
         sys.stdout.flush()
 
         m = re.search(r"request_token=([^&]+)", loc1)
         if m:
             request_token = m.group(1)
 
-        # ── 3b: Hop 2 — /connect/finish → app redirect URL ──────────────────
-        if not request_token and loc1:
-            finish_url = loc1 if loc1.startswith("http") else "https://kite.zerodha.com" + loc1
-            resp_finish = session.get(finish_url, allow_redirects=False, timeout=15)
-            loc2 = resp_finish.headers.get("Location", "")
-            print(f"   [hop2] status={resp_finish.status_code} | loc={loc2[:150]}", flush=True)
-            print(f"   [hop2] body={resp_finish.text[:400]}", flush=True)
-            sys.stdout.flush()
-
-            m = re.search(r"request_token=([^&\"']+)", loc2)
+        # If hop1 redirected back to /connect/login — session not carried
+        if not request_token and "/connect/login" in loc1:
+            print("   ⚠️ hop1 redirected back to /connect/login — retrying with enctoken header", flush=True)
+            _enctoken_val = _cookies.get("enctoken", "")
+            if _enctoken_val:
+                _rs.headers.update({
+                    "Authorization": f"enctoken {_enctoken_val}",
+                })
+            resp_login = _rs.get(login_url, allow_redirects=False, timeout=15)
+            loc1 = resp_login.headers.get("Location", "")
+            print(f"   [hop1-retry] status={resp_login.status_code} | loc={loc1[:150]}", flush=True)
+            m = re.search(r"request_token=([^&]+)", loc1)
             if m:
                 request_token = m.group(1)
 
-            if not request_token:
-                m = re.search(r"request_token[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9]+)", resp_finish.text)
-                if m:
-                    request_token = m.group(1)
+        # ── 3b: Hop 2 ────────────────────────────────────────────────────────
+        if not request_token and loc1 and "/connect/login" not in loc1:
+            finish_url = loc1 if loc1.startswith("http") else "https://kite.zerodha.com" + loc1
+            resp_finish = _rs.get(finish_url, allow_redirects=False, timeout=15)
+            loc2 = resp_finish.headers.get("Location", "")
+            print(f"   [hop2] status={resp_finish.status_code} | loc={loc2[:150]}", flush=True)
+            sys.stdout.flush()
 
-            # ── 3c: Hop 3 — follow app redirect URL ─────────────────────────
+            # Extract token from loc2 directly — handles localhost and 127.0.0.1 redirects
+            m = re.search(r"request_token=([^&\"']+)", loc2)
+            if m:
+                request_token = m.group(1)
+                print(f"   [hop2] ✅ request_token found in redirect URL", flush=True)
+
+            # ── 3c: Hop 3 — only follow if NOT a localhost/127 redirect ──────
+            # If loc2 points to localhost or 127.0.0.1, the token should already
+            # be in the URL above. Fetching localhost would fail (nothing running there).
             if not request_token and loc2:
-                try:
-                    app_url = loc2 if loc2.startswith("http") else "https://kite.zerodha.com" + loc2
-                    resp_app = session.get(app_url, allow_redirects=False, timeout=10)
-                    loc3 = resp_app.headers.get("Location", "")
-                    print(f"   [hop3] status={resp_app.status_code} | loc={loc3[:150]}", flush=True)
-                    print(f"   [hop3] body={resp_app.text[:400]}", flush=True)
-                    sys.stdout.flush()
-                    m = re.search(r"request_token=([^&\"']+)", loc3 + resp_app.text)
-                    if m:
-                        request_token = m.group(1)
-                except Exception as e:
-                    print(f"   [hop3] error: {e}", flush=True)
-                    sys.stdout.flush()
+                _is_local = any(x in loc2 for x in ["localhost", "127.0.0.1", "127.0.0"])
+                if _is_local:
+                    print(f"   [hop3] skipping fetch — localhost redirect, token not in URL", flush=True)
+                    print(f"   ⚠️ Fix: change your Kite app redirect URL from 'http://localhost' to 'https://127.0.0.1'", flush=True)
+                else:
+                    try:
+                        app_url = loc2 if loc2.startswith("http") else "https://kite.zerodha.com" + loc2
+                        resp_app = _rs.get(app_url, allow_redirects=False, timeout=10)
+                        loc3 = resp_app.headers.get("Location", "")
+                        print(f"   [hop3] status={resp_app.status_code} | loc={loc3[:150]}", flush=True)
+                        sys.stdout.flush()
+                        m = re.search(r"request_token=([^&\"']+)", loc3 + resp_app.text)
+                        if m:
+                            request_token = m.group(1)
+
+                        # ── Hop3b: /connect/authorize SPA ────────────────────
+                        if not request_token and resp_app.status_code == 200 and "authorize" in app_url:
+                            print("   [hop3b] /connect/authorize SPA — trying JS API...", flush=True)
+                            _sess_id = re.search(r"sess_id=([^&]+)", app_url)
+                            if _sess_id:
+                                _sid = _sess_id.group(1)
+                                resp_auth2 = _rs.post(
+                                    "https://kite.zerodha.com/connect/authorize",
+                                    json={"api_key": _api_key, "sess_id": _sid},
+                                    headers={"Content-Type": "application/json",
+                                             "X-Kite-Version": "3",
+                                             "Accept": "application/json"},
+                                    allow_redirects=False,
+                                    timeout=15
+                                )
+                                loc3b = resp_auth2.headers.get("Location", "")
+                                print(f"   [hop3b] status={resp_auth2.status_code} | loc={loc3b[:200]}", flush=True)
+                                m = re.search(r"request_token=([^&\"']+)", loc3b + resp_auth2.text)
+                                if m:
+                                    request_token = m.group(1)
+
+                    except Exception as e:
+                        print(f"   [hop3] error: {e}", flush=True)
+                        sys.stdout.flush()
 
         if not request_token:
+            # Final fallback: try enctoken from session cookies
+            _enctoken = _cookies.get("enctoken", "")
+            if _enctoken:
+                print(f"   [enctoken final fallback] using enctoken (len={len(_enctoken)})", flush=True)
+                kite.set_access_token(_enctoken)
+                try:
+                    _test = kite.profile()
+                    print(f"   [enctoken] ✅ works — user: {_test.get('user_name', '?')}", flush=True)
+                    return _enctoken
+                except Exception as _enc_err:
+                    print(f"   [enctoken] ❌ failed: {_enc_err}", flush=True)
+
             raise Exception(
-                "request_token not found. Check hop1/hop2/hop3 debug lines above."
+                "request_token not found. "
+                "Go to developers.kite.trade → your app → "
+                "change Redirect URL from 'http://localhost' to 'https://127.0.0.1' → save. "
+                "Then whitelist your Railway IP. Then redeploy."
             )
         print(f"   request_token: {request_token[:10]}...", flush=True)
 
@@ -297,10 +368,38 @@ def zerodha_auto_login():
 
 
 # ── Initial login at startup ─────────────────────────────────────────────────
+# Print which env vars are set (masked) so you can diagnose missing values
+print("\n🔑 Checking Railway environment variables:", flush=True)
+_ev_checks = {
+    "ZERODHA_USER_ID":     os.environ.get("ZERODHA_USER_ID"),
+    "ZERODHA_PASSWORD":    os.environ.get("ZERODHA_PASSWORD"),
+    "ZERODHA_TOTP_SECRET": os.environ.get("ZERODHA_TOTP_SECRET"),
+    "KITE_API_KEY":        os.environ.get("KITE_API_KEY"),
+    "KITE_API_SECRET":     os.environ.get("KITE_API_SECRET") or os.environ.get("API_SECRET"),
+}
+for _k, _v in _ev_checks.items():
+    if _v:
+        _masked = _v[:4] + "****" + _v[-2:] if len(_v) > 6 else "****"
+        print(f"   ✅ {_k} = {_masked} (len={len(_v)})", flush=True)
+    else:
+        print(f"   ❌ {_k} = NOT SET ← fix this in Railway Variables", flush=True)
+print(flush=True)
+
 try:
     _startup_token = zerodha_auto_login()
-except Exception:
+    print("✅ Auto-login successful", flush=True)
+except Exception as _startup_err:
     _startup_token = None
+    print(f"❌ Startup login failed: {_startup_err}", flush=True)
+    try:
+        send_message(
+            f"❌ KITE LOGIN FAILED AT STARTUP\n"
+            f"Error: {str(_startup_err)[:200]}\n"
+            f"Bot is running with expired/old token — orders will be rejected.\n"
+            f"Fix: Check TOTP secret, password, IP whitelist then redeploy."
+        )
+    except Exception:
+        pass
 
 # 🌐 PRINT RAILWAY PUBLIC IP
 try:
@@ -448,10 +547,19 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # Toggle each filter on/off with True/False.
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ADX_FILTER     = False   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
-ADX_MIN_VALUE      = 22     # Kite API data gives ~3 pts lower ADX than TradingView
+USE_ADX_FILTER     = False   # OFF — using first-candle range filter instead
+ADX_MIN_VALUE      = 20
                             # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
                             # only true choppy/sideways (TV ADX would be ~15 or below)
+
+# ── Support & Resistance Filter ───────────────────────────────────────────────
+# Blocks entries when price is within SR_BLOCK_PCT of key S&R levels:
+#   PDH / PDL (previous day high/low)
+#   Pivot R1 / R2 / S1 / S2 (standard pivot points)
+#   Round numbers (every 50 pts on Nifty, 100 pts on BankNifty/SENSEX)
+# Set False to disable completely.
+USE_SR_FILTER      = True    # True = active | False = disabled
+SR_BLOCK_PCT       = 0.003   # 0.3% proximity — within 72 pts on Nifty 24000
 
 # ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
 # Both HalfTrend AND 9/15 EMA must agree before an order is placed.
@@ -1104,6 +1212,14 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     """
     now_ist = datetime.now(IST)
 
+    # ── 0. First candle range filter — rangebound inside-day detection ─────────
+    # If price is still inside the 9:15 AM first candle's high/low range,
+    # the market has no breakout direction — skip all entries.
+    if df_15m is not None and len(df_15m) >= 2:
+        _fc_ok, _fc_reason = check_first_candle_range(signal, df_15m, instrument)
+        if not _fc_ok:
+            return False, _fc_reason
+
     # ── 1. Session dead zone ──────────────────────────────────────────────────
     if USE_SESSION_FILTER and instrument in ("NIFTY", "BANKNIFTY", "SENSEX"):
         _dead = (
@@ -1120,7 +1236,10 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         try:
             adx_val = ADX(df_15m, period=14).iloc[-2]
             if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
-                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} below {ADX_MIN_VALUE} (choppy market)"
+                reason = (f"📊 ADX={adx_val:.1f} below {ADX_MIN_VALUE} — "
+                          f"market is rangebound/choppy, skipping entry")
+                print(f"🚫 ADX BLOCK: {reason}", flush=True)
+                return False, reason
             _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
         except Exception as _e:
             _adx_str = f"ADX=err"
@@ -1252,7 +1371,132 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _hull_e:
             _hull_str = f"Hull=err({_hull_e})"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str}"
+    # ── 8. Support & Resistance proximity block ───────────────────────────────
+    # If price is AT or NEAR a key resistance → block CALL entry (rejection risk)
+    # If price is AT or NEAR a key support    → block PUT entry  (bounce risk)
+    #
+    # Logic:
+    #   - Find swing highs (resistance) and swing lows (support) in last 50 bars
+    #   - "Near" = within SR_BLOCK_PCT % of current price
+    #   - Only block if the S&R level has been tested 2+ times (confirmed level)
+    #   - If price has already broken ABOVE resistance → allow CALL (breakout)
+    #   - If price has already broken BELOW support   → allow PUT  (breakdown)
+    #
+    # Set USE_SR_FILTER = False to disable.
+    if USE_SR_FILTER and df_15m is not None and len(df_15m) >= 30:
+        try:
+            cur_close = float(df_15m["close"].iloc[-2])
+            cur_high  = float(df_15m["high"].iloc[-2])
+            prox      = cur_close * SR_BLOCK_PCT
+
+            # ── Method 1: Previous Day High / Low (PDH / PDL) ────────────────
+            # Fetch daily candles to get yesterday's OHLC
+            # We derive PDH/PDL from the 5-min data itself (first/last bars of prev day)
+            df_15m["date_only"] = pd.to_datetime(df_15m["date"]).dt.date
+            _unique_days = sorted(df_15m["date_only"].unique())
+            pdh = pdl = pdc = None
+            if len(_unique_days) >= 2:
+                _prev_day = _unique_days[-2]
+                _prev_bars = df_15m[df_15m["date_only"] == _prev_day]
+                if len(_prev_bars) > 0:
+                    pdh = float(_prev_bars["high"].max())
+                    pdl = float(_prev_bars["low"].min())
+                    pdc = float(_prev_bars["close"].iloc[-1])
+
+            # ── Method 2: Pivot Points (Standard) ────────────────────────────
+            # Calculated once from previous day's H/L/C
+            r1 = r2 = s1 = s2 = pivot = None
+            if pdh and pdl and pdc:
+                pivot = (pdh + pdl + pdc) / 3
+                r1    = (2 * pivot) - pdl
+                r2    = pivot + (pdh - pdl)
+                s1    = (2 * pivot) - pdh
+                s2    = pivot - (pdh - pdl)
+
+            # ── Method 3: Round Number / Psychological Levels ─────────────────
+            # Nifty: 50-pt round numbers (24000, 24050, 24100...)
+            # BankNifty/SENSEX: 100-pt round numbers
+            if instrument in ("BANKNIFTY", "SENSEX"):
+                _round_step = 100
+            elif instrument == "CRUDE":
+                _round_step = 50
+            else:
+                _round_step = 50   # Nifty 50-pt strikes
+
+            _nearest_round_below = (cur_close // _round_step) * _round_step
+            _nearest_round_above = _nearest_round_below + _round_step
+
+            # ── Build complete resistance and support level lists ──────────────
+            resistance_levels = []
+            support_levels    = []
+
+            # PDH → resistance, PDL → support
+            if pdh and pdh > cur_close:
+                resistance_levels.append(("PDH", pdh))
+            if pdl and pdl < cur_close:
+                support_levels.append(("PDL", pdl))
+            if pdc:
+                if pdc > cur_close:
+                    resistance_levels.append(("PDC", pdc))
+                elif pdc < cur_close:
+                    support_levels.append(("PDC", pdc))
+
+            # Pivot levels → resistance if above, support if below
+            for _name, _val in [("R1", r1), ("R2", r2), ("S1", s1),
+                                 ("S2", s2), ("Pivot", pivot)]:
+                if _val is None: continue
+                if _val > cur_close:
+                    resistance_levels.append((_name, _val))
+                elif _val < cur_close:
+                    support_levels.append((_name, _val))
+
+            # Round numbers
+            if _nearest_round_above > cur_close:
+                resistance_levels.append(("Round", _nearest_round_above))
+            if _nearest_round_below < cur_close:
+                support_levels.append(("Round", _nearest_round_below))
+
+            # ── Find nearest levels ───────────────────────────────────────────
+            nearest_res = min(resistance_levels, key=lambda x: x[1]) if resistance_levels else None
+            nearest_sup = max(support_levels,    key=lambda x: x[1]) if support_levels    else None
+
+            _sr_blocked = False
+
+            # CALL near resistance → block
+            if signal == "CALL" and nearest_res:
+                _name, _level = nearest_res
+                dist_pct = (_level - cur_close) / cur_close
+                if dist_pct <= SR_BLOCK_PCT:
+                    _sr_blocked = True
+                    reason = (
+                        f"🧱 SR filter: CALL blocked — price ₹{cur_close:.1f} within "
+                        f"{dist_pct*100:.2f}% of {_name} resistance ₹{_level:.1f} — rejection risk"
+                    )
+                    print(f"🚫 SR BLOCK: {reason}", flush=True)
+                    return False, reason
+
+            # PUT near support → block
+            if signal == "PUT" and nearest_sup:
+                _name, _level = nearest_sup
+                dist_pct = (cur_close - _level) / cur_close
+                if dist_pct <= SR_BLOCK_PCT:
+                    _sr_blocked = True
+                    reason = (
+                        f"🧱 SR filter: PUT blocked — price ₹{cur_close:.1f} within "
+                        f"{dist_pct*100:.2f}% of {_name} support ₹{_level:.1f} — bounce risk"
+                    )
+                    print(f"🚫 SR BLOCK: {reason}", flush=True)
+                    return False, reason
+
+            if not _sr_blocked:
+                _r = f"{nearest_res[0]}=₹{nearest_res[1]:.0f}" if nearest_res else "none"
+                _s = f"{nearest_sup[0]}=₹{nearest_sup[1]:.0f}" if nearest_sup else "none"
+                _sr_str = f"SR=clear(res:{_r},sup:{_s})"
+
+        except Exception as _sr_e:
+            _sr_str = f"SR=err({_sr_e})"
+
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_sr_str}"
 
 
 
@@ -1290,10 +1534,165 @@ HULL_LENGTH      = 55     # Pine default for swing entry
 # 0.001 = 0.1% of price  (e.g. on Nifty 23000 → min gap of 23 pts)
 # 0.002 = 0.2% of price  (e.g. on Nifty 23000 → min gap of 46 pts) ← recommended
 # Set to 0.0 to disable the width check.
-HULL_MIN_BAND_WIDTH_PCT = 0.0002   # 0.02% — very permissive, only blocks truly flat bands
-# Hull band warm-up: mathematically narrow for ~60-75 min after open on 5-min charts.
-# Bypass the width check entirely during this window.
-HULL_MORNING_BYPASS_MINS = 75     # skip band width check for first 75 min after 9:15 AM (until ~10:30 AM)
+HULL_MIN_BAND_WIDTH_PCT  = 0.0002
+HULL_MORNING_BYPASS_MINS = 75
+
+# ── First 5-min candle range filter ──────────────────────────────────────────
+# Strategy: The first 5-min candle of the day (9:15–9:20 AM) sets the
+# opening range. If subsequent candles stay INSIDE this range, the market
+# is in a balance/inside-day mode — no directional bias → skip all entries.
+# Only enter when price BREAKS OUT of the first candle's high or low.
+#
+# USE_FIRST_CANDLE_FILTER = True  → active
+# FIRST_CANDLE_BUFFER_PCT  = small buffer to avoid false breakout triggers
+#   e.g. 0.001 = 0.1% → on Nifty 24000, buffer = 24 pts above/below first candle
+USE_FIRST_CANDLE_FILTER  = True
+FIRST_CANDLE_BUFFER_PCT  = 0.001   # 0.1% buffer beyond the opening range
+
+# Per-instrument first candle cache — reset daily
+_first_candle_cache: dict = {}
+_first_candle_alert_sent: dict = {}
+
+
+def get_first_candle(df, instrument):
+    """
+    Returns the high and low of the first 30-minute opening range (9:15–9:45 AM).
+    Aggregates all 5-min bars between 9:15 and 9:45 AM into one range.
+    Returns (high, low, candle_time) or (None, None, None) if not available.
+    """
+    global _first_candle_cache
+
+    try:
+        today = datetime.now(IST).date()
+        cache_key = f"{instrument}_{today}"
+
+        if cache_key in _first_candle_cache:
+            c = _first_candle_cache[cache_key]
+            return c["high"], c["low"], c["time"]
+
+        if df is None or len(df) < 2:
+            return None, None, None
+
+        df_copy = df.copy()
+        df_copy["_dt"] = pd.to_datetime(df_copy["date"])
+        if df_copy["_dt"].dt.tz is None:
+            df_copy["_dt"] = df_copy["_dt"].dt.tz_localize(IST)
+        else:
+            df_copy["_dt"] = df_copy["_dt"].dt.tz_convert(IST)
+
+        # Get all 5-min bars within the 9:15–9:45 AM window
+        today_bars = df_copy[df_copy["_dt"].dt.date == today]
+        opening_bars = today_bars[
+            (today_bars["_dt"].dt.hour == 9) &
+            (today_bars["_dt"].dt.minute >= 15) &
+            (today_bars["_dt"].dt.minute < 45)
+        ]
+
+        # Need at least 3 bars (9:15, 9:20, 9:25...) — wait until 9:45 AM
+        now_ist = datetime.now(IST)
+        if now_ist.hour == 9 and now_ist.minute < 45:
+            return None, None, None   # window not yet complete
+
+        if len(opening_bars) == 0:
+            return None, None, None
+
+        fc_high = float(opening_bars["high"].max())
+        fc_low  = float(opening_bars["low"].min())
+        fc_time = opening_bars["_dt"].iloc[0]
+
+        _first_candle_cache[cache_key] = {
+            "high": fc_high,
+            "low":  fc_low,
+            "time": fc_time
+        }
+        print(f"📊 Opening range 30-min [{instrument}] → "
+              f"High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
+              f"Range={fc_high-fc_low:.1f} pts", flush=True)
+        return fc_high, fc_low, fc_time
+
+    except Exception as e:
+        print(f"⚠️ get_first_candle({instrument}) error: {e}", flush=True)
+        return None, None, None
+
+
+def check_first_candle_range(signal, df, instrument):
+    """
+    Returns (passed: bool, reason: str)
+
+    Checks if the current closed candle (iloc[-2]) close price has broken
+    OUTSIDE the first 5-min candle's high/low range (with buffer).
+
+    CALL signal: close must be ABOVE first_candle_high + buffer → breakout up
+    PUT  signal: close must be BELOW first_candle_low  − buffer → breakout down
+
+    If price is still inside the range → rangebound → block + send Telegram once.
+    """
+    global _first_candle_alert_sent
+
+    if not USE_FIRST_CANDLE_FILTER:
+        return True, "FC=off"
+
+    try:
+        # ── Time gate: FC range filter only active 9:15 AM – 11:15 AM ──────────
+        # After 11:15 AM the opening range is stale — price has had 2 hours to
+        # establish direction. Keeping it active blocks valid afternoon entries.
+        _now_ist = datetime.now(IST)
+        _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
+        if _mins_since_open > 120:   # more than 2 hours since open
+            return True, f"FC=expired(market open {_mins_since_open} min ago)"
+        fc_high, fc_low, fc_time = get_first_candle(df, instrument)
+
+        if fc_high is None or fc_low is None:
+            # First candle not yet available (before 9:20 AM or data issue)
+            return True, "FC=N/A"
+
+        cur_close = float(df["close"].iloc[-2])
+        buffer    = cur_close * FIRST_CANDLE_BUFFER_PCT
+
+        breakout_high = fc_high + buffer   # must close above this for CALL
+        breakout_low  = fc_low  - buffer   # must close below this for PUT
+
+        # Check breakout
+        if signal == "CALL" and cur_close > breakout_high:
+            return True, (f"FC=breakout↑ close={cur_close:.1f} "
+                          f"above FC_high={fc_high:.1f}+buf={buffer:.1f}")
+
+        if signal == "PUT" and cur_close < breakout_low:
+            return True, (f"FC=breakout↓ close={cur_close:.1f} "
+                          f"below FC_low={fc_low:.1f}-buf={buffer:.1f}")
+
+        # Price still inside first candle range → rangebound
+        today_str = str(datetime.now(IST).date())
+        alert_key = f"{instrument}_{today_str}_range"
+
+        # Send Telegram alert — throttled to once every 30 minutes per instrument
+        _last_sent_ts = _first_candle_alert_sent.get(alert_key, 0)
+        _thirty_mins  = 30 * 60   # 1800 seconds
+        if time.time() - _last_sent_ts >= _thirty_mins:
+            _first_candle_alert_sent[alert_key] = time.time()
+            msg = (
+                f"📦 {instrument}: market inside opening range\n"
+                f"Opening range: High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
+                f"Range={fc_high-fc_low:.1f} pts\n"
+                f"Current close: ₹{cur_close:.1f}\n"
+                f"No orders until price breaks {'above ₹' + str(round(breakout_high,1)) if signal=='CALL' else 'below ₹' + str(round(breakout_low,1))}"
+            )
+            print(f"🚫 FC RANGE BLOCK [{instrument}]: {msg}", flush=True)
+            try:
+                send_message(msg)
+            except Exception:
+                pass
+
+        return False, (
+            f"📦 FC range block — close=₹{cur_close:.1f} inside "
+            f"[₹{fc_low:.1f} – ₹{fc_high:.1f}] "
+            f"(breakout needs close {'above' if signal=='CALL' else 'below'} "
+            f"₹{breakout_high if signal=='CALL' else breakout_low:.1f})"
+        )
+
+    except Exception as e:
+        print(f"⚠️ check_first_candle_range error: {e}", flush=True)
+        return True, f"FC=err({e})"
 
 # ── Volume spike config ───────────────────────────────────────────────────────
 # When HalfTrend flips AND the flip candle has unusually high volume,
@@ -4031,16 +4430,18 @@ def nifty_loop():
 
             # ══════════════════════════════════════════════════════════════
             # 🔒  HARD SAME-DIRECTION GUARD
-            # If a NIFTY trade is already active (any signal type), skip
-            # entry completely. Only a full exit clears nifty_position.
-            # This prevents duplicate orders on carry-over after a fresh entry.
-            # ══════════════════════════════════════════════════════════════
+            # Only skip if the open position MATCHES the current HalfTrend direction.
+            # If opposite position is open, fall through so Layer 1 can flip it.
             with lock:
                 _trade_active  = nifty_trade_active or nifty_position["active"]
                 _active_signal = nifty_position.get("signal")
             if _trade_active:
-                time.sleep(10)
-                continue
+                _curr_trend = int(cached_nifty_ht.iloc[-2]["trend"]) if cached_nifty_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    time.sleep(10)
+                    continue
+                print(f"⚠️ NIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
@@ -4146,7 +4547,8 @@ def nifty_loop():
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth (handles bot restarts / flag drift)
+            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
+            _kite_pos_cache.pop("NIFTY", None)
             kite_pos = get_open_kite_position("NIFTY")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
@@ -4317,7 +4719,13 @@ def nifty_loop():
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
-            print("❌ NIFTY LOOP ERROR:", e)
+            err_str = str(e)
+            print("❌ NIFTY LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"NIFTY_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(nifty_loop, "_token_alerted", None) != _tk:
+                    nifty_loop._token_alerted = _tk
+                    send_message(f"❌ NIFTY: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
             try:
                 if get_open_kite_position("NIFTY") is None:
                     with lock:
@@ -4393,10 +4801,15 @@ def crude_loop():
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
             with lock:
-                _trade_active = crude_trade_active or crude_position["active"]
+                _trade_active  = crude_trade_active or crude_position["active"]
+                _active_signal = crude_position.get("signal")
             if _trade_active:
-                time.sleep(10)
-                continue
+                _curr_trend = int(cached_crude_ht.iloc[-2]["trend"]) if cached_crude_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    time.sleep(10)
+                    continue
+                print(f"⚠️ CRUDE: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
 
             # Refresh data cache every 20 seconds
             if time.time() - last_fetch_crude > 20 or cached_crude_15m is None:
@@ -4498,9 +4911,8 @@ def crude_loop():
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth (handles bot restarts / flag drift)
-            # FIX: Layer 1 must run FIRST so that in-memory state is synced
-            # from Kite on restart before any duplicate-prevention logic fires.
+            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
+            _kite_pos_cache.pop("CRUDE", None)
             kite_pos = get_open_kite_position("CRUDE")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
@@ -4663,7 +5075,13 @@ def crude_loop():
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
-            print("❌ CRUDE LOOP ERROR:", e)
+            err_str = str(e)
+            print("❌ CRUDE LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"CRUDE_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(crude_loop, "_token_alerted", None) != _tk:
+                    crude_loop._token_alerted = _tk
+                    send_message(f"❌ CRUDE: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
             # Safety reset: if flag was set True before the exception,
             # only reset it if Kite confirms no open position
             try:
@@ -4740,10 +5158,15 @@ def banknifty_loop():
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
             with lock:
-                _trade_active = banknifty_trade_active or banknifty_position["active"]
+                _trade_active  = banknifty_trade_active or banknifty_position["active"]
+                _active_signal = banknifty_position.get("signal")
             if _trade_active:
-                time.sleep(10)
-                continue
+                _curr_trend = int(cached_banknifty_ht.iloc[-2]["trend"]) if cached_banknifty_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    time.sleep(10)
+                    continue
+                print(f"⚠️ BANKNIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_banknifty > 30 or cached_banknifty_df is None:
@@ -4851,7 +5274,8 @@ def banknifty_loop():
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth
+            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
+            _kite_pos_cache.pop("BANKNIFTY", None)
             kite_pos = get_open_kite_position("BANKNIFTY")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
@@ -5010,7 +5434,13 @@ def banknifty_loop():
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
-            print("❌ BANKNIFTY LOOP ERROR:", e)
+            err_str = str(e)
+            print("❌ BANKNIFTY LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"BN_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(banknifty_loop, "_token_alerted", None) != _tk:
+                    banknifty_loop._token_alerted = _tk
+                    send_message(f"❌ BANKNIFTY: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
             try:
                 if get_open_kite_position("BANKNIFTY") is None:
                     with lock:
@@ -5085,11 +5515,23 @@ def sensex_loop():
                 continue
 
             # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
+            # Only skip if the open position MATCHES the current signal.
+            # If an opposite position is open, we must NOT skip — the flip
+            # exit logic at Layer 1 (below) needs to run to close it.
             with lock:
-                _trade_active = sensex_trade_active or sensex_position["active"]
+                _trade_active  = sensex_trade_active or sensex_position["active"]
+                _active_signal = sensex_position.get("signal")
+
             if _trade_active:
-                time.sleep(10)
-                continue
+                # Quick check: does open trade match current HalfTrend trend?
+                _curr_trend = int(cached_sensex_ht.iloc[-2]["trend"]) if cached_sensex_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    # Same direction — safe to skip
+                    time.sleep(10)
+                    continue
+                # Opposite direction — fall through so Layer 1 can flip it
+                print(f"⚠️ SENSEX: open {_active_signal} trade but HT says {_curr_sig} — running flip check", flush=True)
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_sensex > 30 or cached_sensex_df is None:
@@ -5119,7 +5561,7 @@ def sensex_loop():
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
-                    print(f"{tag} SENSEX {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
+                    print(f"{tag} SENSEX {signal} — {bars_ago} bars ({bars_ago*5} min) ago @ {arrow_level:.2f}", flush=True)
 
             if signal is None:
                 status = "NO_ARROW_SENSEX"
@@ -5198,6 +5640,9 @@ def sensex_loop():
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
             # Layer 1 — Kite ground truth
+            # Always force-refresh the cache before flip detection
+            # so a stale None result never hides an open position.
+            _kite_pos_cache.pop("SENSEX", None)
             kite_pos = get_open_kite_position("SENSEX")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
@@ -5355,7 +5800,13 @@ def sensex_loop():
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
-            print("❌ SENSEX LOOP ERROR:", e)
+            err_str = str(e)
+            print("❌ SENSEX LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"SX_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(sensex_loop, "_token_alerted", None) != _tk:
+                    sensex_loop._token_alerted = _tk
+                    send_message(f"❌ SENSEX: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
             try:
                 if get_open_kite_position("SENSEX") is None:
                     with lock:
@@ -5801,6 +6252,11 @@ def reset_daily_pnl():
         # Clear stale option chain cache from prior trading day
         instrument_cache.clear()
         _data_cache_store.clear()   # also flush historical data cache
+
+        # Reset first candle range cache for new day
+        _first_candle_cache.clear()
+        _first_candle_alert_sent.clear()
+        print("📊 First candle range cache reset for new day", flush=True)
 
         # ── Reset progressive profit lock for new day ─────────────────────
         global _peak_daily_pnl, _profit_lock_floor, _profit_lock_tier
@@ -8162,14 +8618,46 @@ if __name__ == "__main__":
         print("⚠️ NIFTY FUT TOKEN NOT FOUND")
 
     # -----------------------------
-    # 🔍 API TEST
+    # 🔍 API TEST — halt if token invalid
     # -----------------------------
-    try:
-        print("🔍 Testing Kite API...")
-        test = kite.ltp("NSE:NIFTY 50")
-        print("✅ Kite API working:", test)
-    except Exception as e:
-        print("❌ Kite API FAILED:", e)
+    _api_ok = False
+    for _api_attempt in range(3):
+        try:
+            print(f"🔍 Testing Kite API (attempt {_api_attempt+1}/3)...", flush=True)
+            test = kite.ltp("NSE:NIFTY 50")
+            print("✅ Kite API working:", test, flush=True)
+            _api_ok = True
+            break
+        except Exception as _api_err:
+            print(f"❌ Kite API FAILED (attempt {_api_attempt+1}/3): {_api_err}", flush=True)
+            if _api_attempt < 2:
+                print("   Retrying login...", flush=True)
+                try:
+                    zerodha_auto_login()
+                except Exception:
+                    pass
+                time.sleep(5)
+
+    if not _api_ok:
+        _err_msg = (
+            f"❌ KITE API INVALID — BOT HALTED\n"
+            f"api_key or access_token is invalid.\n"
+            f"Tried 3 times — all failed.\n\n"
+            f"Fix steps:\n"
+            f"1. Check KITE_API_KEY in Railway vars\n"
+            f"2. Check KITE_PASSWORD is correct\n"
+            f"3. Check KITE_TOTP_SECRET is correct\n"
+            f"4. Whitelist IP at developers.kite.trade\n"
+            f"5. Redeploy after fixing"
+        )
+        print(_err_msg, flush=True)
+        try:
+            send_message(_err_msg)
+        except Exception:
+            pass
+        # Stop — no point starting loops with invalid token
+        import sys
+        sys.exit(1)
 
     # -----------------------------
     # 🔒 LOCK FILE HANDLING
@@ -8294,13 +8782,17 @@ if __name__ == "__main__":
 
     if BANKNIFTY_TOKEN:
         threading.Thread(target=banknifty_loop, daemon=True).start()
+        print(f"✅ BANKNIFTY loop started (token={BANKNIFTY_TOKEN})", flush=True)
     else:
-        print("⚠️ BANKNIFTY LOOP SKIPPED — token not found")
+        print("❌ BANKNIFTY LOOP SKIPPED — BANKNIFTY_TOKEN missing from config.py", flush=True)
 
     if SENSEX_TOKEN:
         threading.Thread(target=sensex_loop, daemon=True).start()
+        print(f"✅ SENSEX loop started (token={SENSEX_TOKEN})", flush=True)
     else:
-        print("⚠️ SENSEX LOOP SKIPPED — token not found")
+        print("❌ SENSEX LOOP SKIPPED — SENSEX_TOKEN is None or missing from config.py", flush=True)
+        print("   Add SENSEX_TOKEN = <instrument_token> to your config.py", flush=True)
+        send_message("⚠️ SENSEX loop NOT started — SENSEX_TOKEN missing from config.py")
 
     if ENABLE_SWING:
         threading.Thread(target=swing_loop, daemon=True, name="SwingLoop").start()

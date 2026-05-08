@@ -448,8 +448,8 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # Toggle each filter on/off with True/False.
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ADX_FILTER     = False   # OFF — using first-candle range filter instead
-ADX_MIN_VALUE      = 20
+USE_ADX_FILTER     = False   # ✅ ACTIVE — only enter when ADX >= ADX_MIN_VALUE
+ADX_MIN_VALUE      = 22     # Kite API data gives ~3 pts lower ADX than TradingView
                             # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
                             # only true choppy/sideways (TV ADX would be ~15 or below)
 
@@ -1104,14 +1104,6 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     """
     now_ist = datetime.now(IST)
 
-    # ── 0. First candle range filter — rangebound inside-day detection ─────────
-    # If price is still inside the 9:15 AM first candle's high/low range,
-    # the market has no breakout direction — skip all entries.
-    if df_15m is not None and len(df_15m) >= 2:
-        _fc_ok, _fc_reason = check_first_candle_range(signal, df_15m, instrument)
-        if not _fc_ok:
-            return False, _fc_reason
-
     # ── 1. Session dead zone ──────────────────────────────────────────────────
     if USE_SESSION_FILTER and instrument in ("NIFTY", "BANKNIFTY", "SENSEX"):
         _dead = (
@@ -1128,10 +1120,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         try:
             adx_val = ADX(df_15m, period=14).iloc[-2]
             if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
-                reason = (f"📊 ADX={adx_val:.1f} below {ADX_MIN_VALUE} — "
-                          f"market is rangebound/choppy, skipping entry")
-                print(f"🚫 ADX BLOCK: {reason}", flush=True)
-                return False, reason
+                return False, f"⏸️ ADX filter: ADX={adx_val:.1f} below {ADX_MIN_VALUE} (choppy market)"
             _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
         except Exception as _e:
             _adx_str = f"ADX=err"
@@ -1430,158 +1419,10 @@ HULL_LENGTH      = 55     # Pine default for swing entry
 # 0.001 = 0.1% of price  (e.g. on Nifty 23000 → min gap of 23 pts)
 # 0.002 = 0.2% of price  (e.g. on Nifty 23000 → min gap of 46 pts) ← recommended
 # Set to 0.0 to disable the width check.
-HULL_MIN_BAND_WIDTH_PCT  = 0.0002
-HULL_MORNING_BYPASS_MINS = 75
-
-# ── First 5-min candle range filter ──────────────────────────────────────────
-# Strategy: The first 5-min candle of the day (9:15–9:20 AM) sets the
-# opening range. If subsequent candles stay INSIDE this range, the market
-# is in a balance/inside-day mode — no directional bias → skip all entries.
-# Only enter when price BREAKS OUT of the first candle's high or low.
-#
-# USE_FIRST_CANDLE_FILTER = True  → active
-# FIRST_CANDLE_BUFFER_PCT  = small buffer to avoid false breakout triggers
-#   e.g. 0.001 = 0.1% → on Nifty 24000, buffer = 24 pts above/below first candle
-USE_FIRST_CANDLE_FILTER  = True
-FIRST_CANDLE_BUFFER_PCT  = 0.001   # 0.1% buffer beyond the opening range
-
-# Per-instrument first candle cache — reset daily
-_first_candle_cache: dict = {}
-_first_candle_alert_sent: dict = {}
-
-
-def get_first_candle(df, instrument):
-    """
-    Returns the high and low of the first 30-minute opening range (9:15–9:45 AM).
-    Aggregates all 5-min bars between 9:15 and 9:45 AM into one range.
-    Returns (high, low, candle_time) or (None, None, None) if not available.
-    """
-    global _first_candle_cache
-
-    try:
-        today = datetime.now(IST).date()
-        cache_key = f"{instrument}_{today}"
-
-        if cache_key in _first_candle_cache:
-            c = _first_candle_cache[cache_key]
-            return c["high"], c["low"], c["time"]
-
-        if df is None or len(df) < 2:
-            return None, None, None
-
-        df_copy = df.copy()
-        df_copy["_dt"] = pd.to_datetime(df_copy["date"])
-        if df_copy["_dt"].dt.tz is None:
-            df_copy["_dt"] = df_copy["_dt"].dt.tz_localize(IST)
-        else:
-            df_copy["_dt"] = df_copy["_dt"].dt.tz_convert(IST)
-
-        # Get all 5-min bars within the 9:15–9:45 AM window
-        today_bars = df_copy[df_copy["_dt"].dt.date == today]
-        opening_bars = today_bars[
-            (today_bars["_dt"].dt.hour == 9) &
-            (today_bars["_dt"].dt.minute >= 15) &
-            (today_bars["_dt"].dt.minute < 45)
-        ]
-
-        # Need at least 3 bars (9:15, 9:20, 9:25...) — wait until 9:45 AM
-        now_ist = datetime.now(IST)
-        if now_ist.hour == 9 and now_ist.minute < 45:
-            return None, None, None   # window not yet complete
-
-        if len(opening_bars) == 0:
-            return None, None, None
-
-        fc_high = float(opening_bars["high"].max())
-        fc_low  = float(opening_bars["low"].min())
-        fc_time = opening_bars["_dt"].iloc[0]
-
-        _first_candle_cache[cache_key] = {
-            "high": fc_high,
-            "low":  fc_low,
-            "time": fc_time
-        }
-        print(f"📊 Opening range 30-min [{instrument}] → "
-              f"High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
-              f"Range={fc_high-fc_low:.1f} pts", flush=True)
-        return fc_high, fc_low, fc_time
-
-    except Exception as e:
-        print(f"⚠️ get_first_candle({instrument}) error: {e}", flush=True)
-        return None, None, None
-
-
-def check_first_candle_range(signal, df, instrument):
-    """
-    Returns (passed: bool, reason: str)
-
-    Checks if the current closed candle (iloc[-2]) close price has broken
-    OUTSIDE the first 5-min candle's high/low range (with buffer).
-
-    CALL signal: close must be ABOVE first_candle_high + buffer → breakout up
-    PUT  signal: close must be BELOW first_candle_low  − buffer → breakout down
-
-    If price is still inside the range → rangebound → block + send Telegram once.
-    """
-    global _first_candle_alert_sent
-
-    if not USE_FIRST_CANDLE_FILTER:
-        return True, "FC=off"
-
-    try:
-        fc_high, fc_low, fc_time = get_first_candle(df, instrument)
-
-        if fc_high is None or fc_low is None:
-            # First candle not yet available (before 9:20 AM or data issue)
-            return True, "FC=N/A"
-
-        cur_close = float(df["close"].iloc[-2])
-        buffer    = cur_close * FIRST_CANDLE_BUFFER_PCT
-
-        breakout_high = fc_high + buffer   # must close above this for CALL
-        breakout_low  = fc_low  - buffer   # must close below this for PUT
-
-        # Check breakout
-        if signal == "CALL" and cur_close > breakout_high:
-            return True, (f"FC=breakout↑ close={cur_close:.1f} "
-                          f"above FC_high={fc_high:.1f}+buf={buffer:.1f}")
-
-        if signal == "PUT" and cur_close < breakout_low:
-            return True, (f"FC=breakout↓ close={cur_close:.1f} "
-                          f"below FC_low={fc_low:.1f}-buf={buffer:.1f}")
-
-        # Price still inside first candle range → rangebound
-        today_str = str(datetime.now(IST).date())
-        alert_key = f"{instrument}_{today_str}_range"
-
-        # Send Telegram alert — throttled to once every 30 minutes per instrument
-        _last_sent_ts = _first_candle_alert_sent.get(alert_key, 0)
-        _thirty_mins  = 30 * 60   # 1800 seconds
-        if time.time() - _last_sent_ts >= _thirty_mins:
-            _first_candle_alert_sent[alert_key] = time.time()
-            msg = (
-                f"📦 {instrument}: market inside opening range\n"
-                f"Opening range: High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
-                f"Range={fc_high-fc_low:.1f} pts\n"
-                f"Current close: ₹{cur_close:.1f}\n"
-                f"No orders until price breaks {'above ₹' + str(round(breakout_high,1)) if signal=='CALL' else 'below ₹' + str(round(breakout_low,1))}"
-            )
-            print(f"🚫 FC RANGE BLOCK [{instrument}]: {msg}", flush=True)
-            try:
-                send_message(msg)
-            except Exception:
-                pass
-
-        return False, (
-            f"📦 FC range block — close=₹{cur_close:.1f} inside "
-            f"[₹{fc_low:.1f} – ₹{fc_high:.1f}] "
-            f"(breakout needs close {'above' if signal=='CALL' else 'below'} "
-            f"₹{breakout_high if signal=='CALL' else breakout_low:.1f})"
-        )
-
-    except Exception as e:
-        print(f"⚠️ check_first_candle_range error: {e}", flush=True)
-        return True, f"FC=err({e})"
+HULL_MIN_BAND_WIDTH_PCT = 0.0002   # 0.02% — very permissive, only blocks truly flat bands
+# Hull band warm-up: mathematically narrow for ~60-75 min after open on 5-min charts.
+# Bypass the width check entirely during this window.
+HULL_MORNING_BYPASS_MINS = 75     # skip band width check for first 75 min after 9:15 AM (until ~10:30 AM)
 
 # ── Volume spike config ───────────────────────────────────────────────────────
 # When HalfTrend flips AND the flip candle has unusually high volume,
@@ -6118,11 +5959,6 @@ def reset_daily_pnl():
         instrument_cache.clear()
         _data_cache_store.clear()   # also flush historical data cache
 
-        # Reset first candle range cache for new day
-        _first_candle_cache.clear()
-        _first_candle_alert_sent.clear()
-        print("📊 First candle range cache reset for new day", flush=True)
-
         # ── Reset progressive profit lock for new day ─────────────────────
         global _peak_daily_pnl, _profit_lock_floor, _profit_lock_tier
         _peak_daily_pnl    = 0.0
@@ -8615,17 +8451,13 @@ if __name__ == "__main__":
 
     if BANKNIFTY_TOKEN:
         threading.Thread(target=banknifty_loop, daemon=True).start()
-        print(f"✅ BANKNIFTY loop started (token={BANKNIFTY_TOKEN})", flush=True)
     else:
-        print("❌ BANKNIFTY LOOP SKIPPED — BANKNIFTY_TOKEN missing from config.py", flush=True)
+        print("⚠️ BANKNIFTY LOOP SKIPPED — token not found")
 
     if SENSEX_TOKEN:
         threading.Thread(target=sensex_loop, daemon=True).start()
-        print(f"✅ SENSEX loop started (token={SENSEX_TOKEN})", flush=True)
     else:
-        print("❌ SENSEX LOOP SKIPPED — SENSEX_TOKEN is None or missing from config.py", flush=True)
-        print("   Add SENSEX_TOKEN = <instrument_token> to your config.py", flush=True)
-        send_message("⚠️ SENSEX loop NOT started — SENSEX_TOKEN missing from config.py")
+        print("⚠️ SENSEX LOOP SKIPPED — token not found")
 
     if ENABLE_SWING:
         threading.Thread(target=swing_loop, daemon=True, name="SwingLoop").start()

@@ -229,6 +229,47 @@ def zerodha_auto_login():
                     m = re.search(r"request_token=([^&\"']+)", loc3 + resp_app.text)
                     if m:
                         request_token = m.group(1)
+
+                    # ── Hop 3b: Kite shows /connect/authorize HTML page ──────
+                    # This happens when the app has not been pre-approved.
+                    # We need to POST to /connect/authorize to approve and get redirect.
+                    if not request_token and resp_app.status_code == 200 and "authorize" in app_url:
+                        print("   [hop3b] Kite authorize page detected — submitting approval...", flush=True)
+                        # Extract any hidden form fields (csrf token etc.)
+                        _hidden = {}
+                        for _m in re.finditer(r'<input[^>]+name=["\']([^"\']+)["\'][^>]+value=["\']([^"\']*)["\']', resp_app.text):
+                            _hidden[_m.group(1)] = _m.group(2)
+                        for _m in re.finditer(r'<input[^>]+value=["\']([^"\']*)["\'][^>]+name=["\']([^"\']+)["\']', resp_app.text):
+                            _hidden[_m.group(2)] = _m.group(1)
+                        print(f"   [hop3b] hidden fields: {list(_hidden.keys())}", flush=True)
+
+                        resp_auth = session.post(
+                            app_url,
+                            data=_hidden,
+                            allow_redirects=False,
+                            timeout=15
+                        )
+                        loc3b = resp_auth.headers.get("Location", "")
+                        print(f"   [hop3b] status={resp_auth.status_code} | loc={loc3b[:200]}", flush=True)
+                        sys.stdout.flush()
+
+                        m = re.search(r"request_token=([^&\"']+)", loc3b + resp_auth.text)
+                        if m:
+                            request_token = m.group(1)
+
+                        # ── Hop 3c: follow the post-authorize redirect ───────
+                        if not request_token and loc3b:
+                            try:
+                                final_url = loc3b if loc3b.startswith("http") else "https://kite.zerodha.com" + loc3b
+                                resp_final = session.get(final_url, allow_redirects=False, timeout=10)
+                                loc_final  = resp_final.headers.get("Location", "")
+                                print(f"   [hop3c] status={resp_final.status_code} | loc={loc_final[:200]}", flush=True)
+                                m = re.search(r"request_token=([^&\"']+)", loc_final + resp_final.text)
+                                if m:
+                                    request_token = m.group(1)
+                            except Exception as _h3c_err:
+                                print(f"   [hop3c] error: {_h3c_err}", flush=True)
+
                 except Exception as e:
                     print(f"   [hop3] error: {e}", flush=True)
                     sys.stdout.flush()

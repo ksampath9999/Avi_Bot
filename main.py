@@ -486,7 +486,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Flip back to True to resume immediately on next cycle.
 ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
-ENABLE_SENSEX     = False    # ✅ SENSEX trading active
+ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
 ENABLE_SWING      = False    # ✅ Swing stock trading active
 

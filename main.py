@@ -192,7 +192,6 @@ def zerodha_auto_login():
         resp_login = session.get(login_url, allow_redirects=False, timeout=15)
         loc1 = resp_login.headers.get("Location", "")
         print(f"   [hop1] status={resp_login.status_code} | loc={loc1[:150]}", flush=True)
-        print(f"   [hop1] body={resp_login.text[:200]}", flush=True)
         sys.stdout.flush()
 
         m = re.search(r"request_token=([^&]+)", loc1)
@@ -205,78 +204,85 @@ def zerodha_auto_login():
             resp_finish = session.get(finish_url, allow_redirects=False, timeout=15)
             loc2 = resp_finish.headers.get("Location", "")
             print(f"   [hop2] status={resp_finish.status_code} | loc={loc2[:150]}", flush=True)
-            print(f"   [hop2] body={resp_finish.text[:400]}", flush=True)
             sys.stdout.flush()
 
             m = re.search(r"request_token=([^&\"']+)", loc2)
             if m:
                 request_token = m.group(1)
 
-            if not request_token:
-                m = re.search(r"request_token[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9]+)", resp_finish.text)
-                if m:
-                    request_token = m.group(1)
-
-            # ── 3c: Hop 3 — follow app redirect URL ─────────────────────────
+            # ── 3c: Hop 3 ────────────────────────────────────────────────────
             if not request_token and loc2:
                 try:
                     app_url = loc2 if loc2.startswith("http") else "https://kite.zerodha.com" + loc2
                     resp_app = session.get(app_url, allow_redirects=False, timeout=10)
                     loc3 = resp_app.headers.get("Location", "")
                     print(f"   [hop3] status={resp_app.status_code} | loc={loc3[:150]}", flush=True)
-                    print(f"   [hop3] body={resp_app.text[:400]}", flush=True)
                     sys.stdout.flush()
                     m = re.search(r"request_token=([^&\"']+)", loc3 + resp_app.text)
                     if m:
                         request_token = m.group(1)
 
-                    # ── Hop 3b: Kite shows /connect/authorize HTML page ──────
-                    # This happens when the app has not been pre-approved.
-                    # We need to POST to /connect/authorize to approve and get redirect.
+                    # ── Hop3b: /connect/authorize detected ───────────────────
+                    # Kite's authorize page is a React SPA — cannot be POSTed.
+                    # Try the Kite Connect JS API endpoint instead.
                     if not request_token and resp_app.status_code == 200 and "authorize" in app_url:
-                        print("   [hop3b] Kite authorize page detected — submitting approval...", flush=True)
-                        # Extract any hidden form fields (csrf token etc.)
-                        _hidden = {}
-                        for _m in re.finditer(r'<input[^>]+name=["\']([^"\']+)["\'][^>]+value=["\']([^"\']*)["\']', resp_app.text):
-                            _hidden[_m.group(1)] = _m.group(2)
-                        for _m in re.finditer(r'<input[^>]+value=["\']([^"\']*)["\'][^>]+name=["\']([^"\']+)["\']', resp_app.text):
-                            _hidden[_m.group(2)] = _m.group(1)
-                        print(f"   [hop3b] hidden fields: {list(_hidden.keys())}", flush=True)
+                        print("   [hop3b] /connect/authorize SPA — trying JS API...", flush=True)
+                        _sess_id = re.search(r"sess_id=([^&]+)", app_url)
+                        if _sess_id:
+                            _sid = _sess_id.group(1)
+                            resp_auth2 = session.post(
+                                "https://kite.zerodha.com/connect/authorize",
+                                json={"api_key": _api_key, "sess_id": _sid},
+                                headers={"Content-Type": "application/json",
+                                         "X-Kite-Version": "3",
+                                         "Accept": "application/json"},
+                                allow_redirects=False,
+                                timeout=15
+                            )
+                            loc3b = resp_auth2.headers.get("Location", "")
+                            print(f"   [hop3b-json] status={resp_auth2.status_code} | loc={loc3b[:200]} | body={resp_auth2.text[:200]}", flush=True)
+                            m = re.search(r"request_token=([^&\"']+)", loc3b + resp_auth2.text)
+                            if m:
+                                request_token = m.group(1)
 
-                        resp_auth = session.post(
-                            app_url,
-                            data=_hidden,
-                            allow_redirects=False,
-                            timeout=15
-                        )
-                        loc3b = resp_auth.headers.get("Location", "")
-                        print(f"   [hop3b] status={resp_auth.status_code} | loc={loc3b[:200]}", flush=True)
-                        sys.stdout.flush()
-
-                        m = re.search(r"request_token=([^&\"']+)", loc3b + resp_auth.text)
-                        if m:
-                            request_token = m.group(1)
-
-                        # ── Hop 3c: follow the post-authorize redirect ───────
-                        if not request_token and loc3b:
-                            try:
-                                final_url = loc3b if loc3b.startswith("http") else "https://kite.zerodha.com" + loc3b
-                                resp_final = session.get(final_url, allow_redirects=False, timeout=10)
-                                loc_final  = resp_final.headers.get("Location", "")
-                                print(f"   [hop3c] status={resp_final.status_code} | loc={loc_final[:200]}", flush=True)
-                                m = re.search(r"request_token=([^&\"']+)", loc_final + resp_final.text)
-                                if m:
-                                    request_token = m.group(1)
-                            except Exception as _h3c_err:
-                                print(f"   [hop3c] error: {_h3c_err}", flush=True)
+                        # ── Last resort: use enctoken directly ───────────────
+                        # After 2FA the session has an enctoken cookie.
+                        # We can use this with the Kite API directly without
+                        # going through the Connect OAuth flow.
+                        if not request_token:
+                            _enctoken = session.cookies.get("enctoken", "")
+                            if _enctoken:
+                                print(f"   [enctoken fallback] using enctoken directly (len={len(_enctoken)})", flush=True)
+                                kite.set_access_token(_enctoken)
+                                # Test if it works
+                                try:
+                                    _test = kite.profile()
+                                    print(f"   [enctoken] ✅ works — user: {_test.get('user_name', '?')}", flush=True)
+                                    return _enctoken   # ← return early, skip generate_session
+                                except Exception as _enc_err:
+                                    print(f"   [enctoken] ❌ failed: {_enc_err}", flush=True)
 
                 except Exception as e:
                     print(f"   [hop3] error: {e}", flush=True)
                     sys.stdout.flush()
 
         if not request_token:
+            # Final fallback: try enctoken from first login session
+            _enctoken = session.cookies.get("enctoken", "")
+            if _enctoken:
+                print(f"   [enctoken final fallback] using enctoken (len={len(_enctoken)})", flush=True)
+                kite.set_access_token(_enctoken)
+                try:
+                    _test = kite.profile()
+                    print(f"   [enctoken] ✅ works — user: {_test.get('user_name', '?')}", flush=True)
+                    return _enctoken
+                except Exception as _enc_err:
+                    print(f"   [enctoken] ❌ failed: {_enc_err}", flush=True)
+
             raise Exception(
-                "request_token not found. Check hop1/hop2/hop3 debug lines above."
+                "request_token not found after all hops. "
+                "Fix: Go to developers.kite.trade → your app → set Redirect URL to https://127.0.0.1 → save. "
+                "Then whitelist your Railway IP in the app settings."
             )
         print(f"   request_token: {request_token[:10]}...", flush=True)
 

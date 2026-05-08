@@ -1529,13 +1529,6 @@ def check_first_candle_range(signal, df, instrument):
         return True, "FC=off"
 
     try:
-        # ── Time gate: FC range filter only active 9:15 AM – 11:15 AM ──────────
-        # After 11:15 AM the opening range is stale — price has had 2 hours to
-        # establish direction. Keeping it active blocks valid afternoon entries.
-        _now_ist = datetime.now(IST)
-        _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
-        if _mins_since_open > 120:   # more than 2 hours since open
-            return True, f"FC=expired(market open {_mins_since_open} min ago)"
         fc_high, fc_low, fc_time = get_first_candle(df, instrument)
 
         if fc_high is None or fc_low is None:

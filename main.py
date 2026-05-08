@@ -4146,8 +4146,7 @@ def nifty_loop():
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
-            _kite_pos_cache.pop("NIFTY", None)
+            # Layer 1 — Kite ground truth (handles bot restarts / flag drift)
             kite_pos = get_open_kite_position("NIFTY")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
@@ -4499,8 +4498,9 @@ def crude_loop():
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
-            _kite_pos_cache.pop("CRUDE", None)
+            # Layer 1 — Kite ground truth (handles bot restarts / flag drift)
+            # FIX: Layer 1 must run FIRST so that in-memory state is synced
+            # from Kite on restart before any duplicate-prevention logic fires.
             kite_pos = get_open_kite_position("CRUDE")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
@@ -4851,8 +4851,7 @@ def banknifty_loop():
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
-            _kite_pos_cache.pop("BANKNIFTY", None)
+            # Layer 1 — Kite ground truth
             kite_pos = get_open_kite_position("BANKNIFTY")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
@@ -5120,7 +5119,7 @@ def sensex_loop():
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
-                    print(f"{tag} SENSEX {signal} — {bars_ago} bars ({bars_ago*5} min) ago @ {arrow_level:.2f}", flush=True)
+                    print(f"{tag} SENSEX {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
 
             if signal is None:
                 status = "NO_ARROW_SENSEX"
@@ -5199,9 +5198,6 @@ def sensex_loop():
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
             # ══════════════════════════════════════════════════════════════
             # Layer 1 — Kite ground truth
-            # Always force-refresh the cache before flip detection
-            # so a stale None result never hides an open position.
-            _kite_pos_cache.pop("SENSEX", None)
             kite_pos = get_open_kite_position("SENSEX")
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"

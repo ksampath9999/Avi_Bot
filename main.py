@@ -3472,72 +3472,62 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             if current_pnl >= 3000 and not sl_expanded:
                 sl = max(sl, peak - (atr_value * 0.8))
 
-            # 🔥 HALF TREND EXIT — Pine-accurate: exit when opposite arrow fires on closed candle
-            # NOTE: nifty_loop / crude_loop is the PRIMARY flip handler (runs every 10s).
-            # This block is a safety fallback that fires inside manage_trade's 1.5s loop,
-            # covering the window between nifty_loop iterations.
-            # exit_position() is idempotent — it checks Kite positions before placing the
-            # sell order, so double-exit is impossible even if both paths fire.
+            # 🔥 HALFTREND EXIT — fires when arrow flips on closed candle
+            # This is the PRIMARY exit path — runs every 1.5s inside the trade.
+            # The loop's Layer 1 is a backup that runs every 10s.
+            # Rule: if HalfTrend trend direction changes → exit immediately.
+            # No filters apply to exits — only to new entries.
             try:
-                # CRUDE stays on 15-min; NIFTY/BANKNIFTY/SENSEX use 5-min (matches entry TF)
                 _exit_tf = "15minute" if instrument == "CRUDE" else "5minute"
                 _exit_token = (CRUDE_TOKEN      if instrument == "CRUDE"
                                else BANKNIFTY_TOKEN if instrument == "BANKNIFTY"
                                else SENSEX_TOKEN    if instrument == "SENSEX"
                                else config.NIFTY_TOKEN)
-                df_ht_exit = get_cached_data(
-                    _exit_token,
-                    _exit_tf,
-                    120
-                )
+                df_ht_exit = get_cached_data(_exit_token, _exit_tf, 120)
 
                 if df_ht_exit is None or len(df_ht_exit) < 10:
                     raise ValueError("Insufficient data for HT exit check")
 
-                ht_df_exit = halftrend_tv(df_ht_exit)
+                ht_df_exit = halftrend_tv(df_ht_exit, amplitude=3, channel_deviation=2)
+                last_exit  = ht_df_exit.iloc[-2]   # last CLOSED candle — anti-repaint
 
-                # Use closed candle (-2) — same anti-repaint rule as entry
-                last_exit = ht_df_exit.iloc[-2]
+                # Exit on TREND CHANGE — faster than waiting for arrow
+                # trend=0 (bullish) → signal should be CALL
+                # trend=1 (bearish) → signal should be PUT
+                current_ht_trend = int(last_exit["trend"])
+                expected_trend   = 0 if signal == "CALL" else 1
 
-                # Pine: buySignal = not na(arrowUp) and trend==0 and trend[1]==1
-                # Pine: sellSignal = not na(arrowDown) and trend==1 and trend[1]==0
-                exit_signal = None
-                if last_exit["buy"]:
-                    exit_signal = "CALL"
-                elif last_exit["sell"]:
-                    exit_signal = "PUT"
-
-                if exit_signal and exit_signal != signal:
-                    # Check whether nifty_loop already handled this flip
-                    # (pos dict will have been cleared or updated to the new signal)
-                    pos_dict = nifty_position if instrument == "NIFTY" else crude_position
+                if current_ht_trend != expected_trend:
+                    # Trend has flipped — check if loop already handled it
+                    pos_dict = (nifty_position    if instrument == "NIFTY"
+                                else banknifty_position if instrument == "BANKNIFTY"
+                                else sensex_position    if instrument == "SENSEX"
+                                else crude_position)
                     with lock:
                         already_flipped = (pos_dict.get("symbol") != symbol)
 
                     if already_flipped:
-                        # nifty_loop already exited this trade — just break cleanly
-                        print(f"ℹ️ HT exit: flip already handled by loop — breaking cleanly")
+                        print(f"ℹ️ {instrument} HT exit: loop already handled flip — breaking cleanly", flush=True)
                         pnl = current_pnl
                         break
 
-                    print(f"🔄 HalfTrend Exit Triggered — new arrow: {exit_signal}, was in: {signal}")
-                    print(f"   HT={last_exit['ht']:.2f}  atrHigh={last_exit['atrHigh']:.2f}  atrLow={last_exit['atrLow']:.2f}")
+                    new_dir = "CALL" if current_ht_trend == 0 else "PUT"
+                    print(f"🔄 {instrument} HalfTrend FLIP → was {signal}, now {new_dir} — exiting", flush=True)
                     send_message(
-                        f"🔄 HALFTREND ARROW FLIP — EXIT\n"
-                        f"📌 {instrument}: was {signal} on {symbol}\n"
-                        f"🔁 New arrow: {exit_signal}\n"
-                        f"💰 Trade P&L: ₹{current_pnl:.0f}  |  LTP: ₹{ltp:.1f}\n"
-                        f"📊 HT line: {last_exit['ht']:.2f}"
+                        f"🔄 HALFTREND FLIP EXIT\n"
+                        f"📌 {instrument}: {signal} → {new_dir}\n"
+                        f"🏷️ {symbol}\n"
+                        f"💰 P&L: ₹{current_pnl:.0f}  |  LTP: ₹{ltp:.1f}\n"
+                        f"📊 HT={last_exit['ht']:.2f}"
                     )
                     if not exit_done:
                         exit_position(symbol, remaining_qty, exchange)
                         exit_done = True
-
                     pnl = current_pnl
                     break
 
             except Exception as e:
-                print("HT exit error:", e)
+                print(f"HT exit error [{instrument}]: {e}", flush=True)
 
             # ================================================================
             # 🛑 STOP LOSS EXITS  (checked in priority order every 1.5 s)
@@ -4543,9 +4533,46 @@ def nifty_loop():
             print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 📊  STRATEGY FILTERS  (ADX / MTF / VIX / Session / Hull)
-            # Hull check is SKIPPED on flip re-entries — HalfTrend alone
-            # decides exit/re-entry direction on reversals.
+            # 🔒  LAYER 1 — Kite flip detection (BEFORE filters)
+            # Exit any opposite position first — exits must never be blocked
+            # ══════════════════════════════════════════════════════════════
+            _kite_pos_cache.pop("NIFTY", None)
+            kite_pos = get_open_kite_position("NIFTY")
+            if kite_pos:
+                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
+                if kite_sig == signal:
+                    with lock:
+                        if not nifty_position["active"]:
+                            nifty_position.update({"symbol": kite_pos["symbol"], "qty": kite_pos["qty"],
+                                                   "exchange": kite_pos["exchange"], "signal": kite_sig, "active": True})
+                            nifty_trade_active = True
+                    time.sleep(10)
+                    continue
+                else:
+                    print(f"🔁 NIFTY FLIP (Kite): {kite_sig} → {signal}", flush=True)
+                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"], kite_pos["exchange"])
+                    if exit_ok:
+                        send_message(f"🔁 NIFTY flip exit\nClosed: {kite_sig} ({kite_pos['symbol']})\nNew signal: {signal}")
+                        _kite_pos_cache.pop("NIFTY", None)
+                    else:
+                        print("⚠️ NIFTY flip exit failed — retrying", flush=True)
+                        time.sleep(5)
+                        continue
+                    with lock:
+                        nifty_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
+                        nifty_trade_active = False
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        last_executed_signal_nifty = None
+                    _just_flipped_nifty = True
+                    time.sleep(3)
+            else:
+                with lock:
+                    if nifty_position["active"]:
+                        nifty_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
+                        nifty_trade_active = False
+
+            # ══════════════════════════════════════════════════════════════
+            # 📊  STRATEGY FILTERS  (entry only — flip handled above)
             # ══════════════════════════════════════════════════════════════
             _filter_ok, _filter_reason = apply_entry_filters(
                 signal, "NIFTY", cached_nifty_df, config.NIFTY_TOKEN,
@@ -4553,7 +4580,6 @@ def nifty_loop():
 
             if not _filter_ok:
                 print(f"🚫 NIFTY entry blocked — {_filter_reason}", flush=True)
-                # Alert once per 15-min candle; re-fires if block reason changes
                 _fkey = f"NIFTY_f_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
                 if getattr(nifty_loop, "_filter_alerted", None) != _fkey:
                     try:
@@ -4563,81 +4589,10 @@ def nifty_loop():
                         print(f"⚠️ Filter alert send failed: {_e}", flush=True)
                 time.sleep(30)
                 continue
-
             print(f"   {_filter_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
-            # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
-            _kite_pos_cache.pop("NIFTY", None)
-            kite_pos = get_open_kite_position("NIFTY")
-            if kite_pos:
-                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
-
-                if kite_sig == signal:
-                    # Already have a live NFO position in the same direction — skip
-                    with lock:
-                        if not nifty_position["active"]:
-                            nifty_position.update({
-                                "symbol":   kite_pos["symbol"],
-                                "qty":      kite_pos["qty"],
-                                "exchange": kite_pos["exchange"],
-                                "signal":   kite_sig,
-                                "active":   True,
-                            })
-                            nifty_trade_active = True
-                    time.sleep(10)
-                    continue
-
-                else:
-                    # Open position in opposite direction → flip
-                    print(f"🔁 NIFTY FLIP (Kite): {kite_sig} → {signal}")
-                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"],
-                                            kite_pos["exchange"])
-                    if exit_ok:
-                        send_message(
-                            f"🔁 NIFTY flip exit\n"
-                            f"Closed: {kite_sig} ({kite_pos['symbol']})\n"
-                            f"New signal: {signal}"
-                        )
-                        _kite_pos_cache.pop("NIFTY", None)
-                    else:
-                        print("⚠️ NIFTY flip exit failed — retrying next tick")
-                        time.sleep(5)
-                        continue
-
-                    with lock:
-                        nifty_position.update({"symbol": None, "qty": 0,
-                                               "exchange": None, "signal": None,
-                                               "active": False})
-                        nifty_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
-                        last_executed_signal_nifty = None
-                    _just_flipped_nifty = True   # ← tells filter to skip Hull check
-                    time.sleep(3)
-
-            else:
-                # No live Kite position — sync in-memory if drifted
-                with lock:
-                    if nifty_position["active"]:
-                        print("⚠️ NIFTY in-memory says active but Kite shows no position — resetting")
-                        nifty_position.update({"symbol": None, "qty": 0,
-                                               "exchange": None, "signal": None,
-                                               "active": False})
-                        nifty_trade_active = False
-
-            # Layer 2 — in-memory flag (fast path)
-            with lock:
-                pos_active = nifty_position["active"]
-                pos_signal = nifty_position["signal"]
-
-            if pos_active and pos_signal == signal:
-                print(f"⏭️ NIFTY Layer2: already in {pos_signal} trade — skipping", flush=True)
-                time.sleep(10)
-                continue
-
-            # Layer 3 — duplicate prevention for same fresh signal
+            # 🔒  ONE-ORDER-AT-A-TIME GUARD (layers 2 & 3)
             if is_fresh and signal == last_executed_signal_nifty:
                 print(f"⏭️ NIFTY Layer3: fresh {signal} already executed — skipping", flush=True)
                 time.sleep(10)
@@ -4908,7 +4863,47 @@ def crude_loop():
             print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 📊  STRATEGY FILTERS
+            # 🔒  LAYER 1 — Kite flip detection (BEFORE filters)
+            # ══════════════════════════════════════════════════════════════
+            _kite_pos_cache.pop("CRUDE", None)
+            kite_pos = get_open_kite_position("CRUDE")
+            if kite_pos:
+                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
+                if kite_sig == signal:
+                    with lock:
+                        if not crude_position["active"]:
+                            crude_position.update({"symbol": kite_pos["symbol"], "qty": kite_pos["qty"],
+                                                   "exchange": kite_pos["exchange"], "signal": kite_sig, "active": True})
+                            crude_trade_active = True
+                    time.sleep(10)
+                    continue
+                else:
+                    print(f"🔁 CRUDE FLIP (Kite): {kite_sig} → {signal}", flush=True)
+                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"], kite_pos["exchange"])
+                    if exit_ok:
+                        send_message(f"🔁 CRUDE flip exit\nClosed: {kite_sig} ({kite_pos['symbol']})\nNew signal: {signal}")
+                        _kite_pos_cache.pop("CRUDE", None)
+                    else:
+                        print("⚠️ CRUDE flip exit failed — retrying", flush=True)
+                        time.sleep(5)
+                        continue
+                    with lock:
+                        crude_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
+                        crude_trade_active = False
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        last_executed_signal_crude = None
+                    crude_loop._carryover_done = None
+                    crude_loop._sig_alerted = None
+                    _just_flipped_crude = True
+                    time.sleep(3)
+            else:
+                with lock:
+                    if crude_position["active"]:
+                        crude_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
+                        crude_trade_active = False
+
+            # ══════════════════════════════════════════════════════════════
+            # 📊  STRATEGY FILTERS (entry only — flip handled above)
             # ══════════════════════════════════════════════════════════════
             _just_flipped_crude = getattr(crude_loop, "_just_flipped", False)
             crude_loop._just_flipped = False
@@ -4927,15 +4922,10 @@ def crude_loop():
                         print(f"⚠️ Filter alert send failed: {_e}", flush=True)
                 time.sleep(30)
                 continue
-
             print(f"   {_filter_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
-            # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
-            _kite_pos_cache.pop("CRUDE", None)
-            kite_pos = get_open_kite_position("CRUDE")
+            # 🔒  ONE-ORDER-AT-A-TIME GUARD (layers 2 & 3)
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
 
@@ -5271,7 +5261,47 @@ def banknifty_loop():
             print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 📊  STRATEGY FILTERS
+            # 🔒  LAYER 1 — Kite flip detection (BEFORE filters)
+            # ══════════════════════════════════════════════════════════════
+            _kite_pos_cache.pop("BANKNIFTY", None)
+            kite_pos = get_open_kite_position("BANKNIFTY")
+            if kite_pos:
+                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
+                if kite_sig == signal:
+                    with lock:
+                        if not banknifty_position["active"]:
+                            banknifty_position.update({"symbol": kite_pos["symbol"], "qty": kite_pos["qty"],
+                                                       "exchange": kite_pos["exchange"], "signal": kite_sig, "active": True})
+                            banknifty_trade_active = True
+                    time.sleep(10)
+                    continue
+                else:
+                    print(f"🔁 BANKNIFTY FLIP (Kite): {kite_sig} → {signal}", flush=True)
+                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"], kite_pos["exchange"])
+                    if exit_ok:
+                        send_message(f"🔁 BANKNIFTY flip exit\nClosed: {kite_sig} ({kite_pos['symbol']})\nNew signal: {signal}")
+                        _kite_pos_cache.pop("BANKNIFTY", None)
+                    else:
+                        print("⚠️ BANKNIFTY flip exit failed — retrying", flush=True)
+                        time.sleep(5)
+                        continue
+                    with lock:
+                        banknifty_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
+                        banknifty_trade_active = False
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        last_executed_signal_banknifty = None
+                    banknifty_loop._carryover_done = None
+                    banknifty_loop._sig_alerted    = None
+                    banknifty_loop._just_flipped   = True
+                    time.sleep(3)
+            else:
+                with lock:
+                    if banknifty_position["active"]:
+                        banknifty_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
+                        banknifty_trade_active = False
+
+            # ══════════════════════════════════════════════════════════════
+            # 📊  STRATEGY FILTERS (entry only — flip handled above)
             # ══════════════════════════════════════════════════════════════
             _just_flipped_bn = getattr(banknifty_loop, "_just_flipped", False)
             banknifty_loop._just_flipped = False
@@ -5290,15 +5320,10 @@ def banknifty_loop():
                         print(f"⚠️ Filter alert send failed: {_e}", flush=True)
                 time.sleep(30)
                 continue
-
             print(f"   {_filter_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
-            # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth (force-refresh cache before flip check)
-            _kite_pos_cache.pop("BANKNIFTY", None)
-            kite_pos = get_open_kite_position("BANKNIFTY")
+            # 🔒  ONE-ORDER-AT-A-TIME GUARD (layers 2 & 3)
             if kite_pos:
                 kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
 
@@ -5639,7 +5664,60 @@ def sensex_loop():
             print(f"   {_htf_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 📊  STRATEGY FILTERS
+            # 🔒  LAYER 1 — Kite flip detection (MUST run before filters)
+            # Exit any opposite position BEFORE applying entry filters.
+            # Filters only block NEW entries — they must never block exits.
+            # ══════════════════════════════════════════════════════════════
+            _kite_pos_cache.pop("SENSEX", None)
+            kite_pos = get_open_kite_position("SENSEX")
+            if kite_pos:
+                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
+
+                if kite_sig == signal:
+                    with lock:
+                        if not sensex_position["active"]:
+                            sensex_position.update({
+                                "symbol":   kite_pos["symbol"],
+                                "qty":      kite_pos["qty"],
+                                "exchange": kite_pos["exchange"],
+                                "signal":   kite_sig,
+                                "active":   True,
+                            })
+                            sensex_trade_active = True
+                    time.sleep(10)
+                    continue
+
+                else:
+                    # Open position in opposite direction → flip exit
+                    print(f"🔁 SENSEX FLIP (Kite): {kite_sig} → {signal}", flush=True)
+                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"],
+                                            kite_pos["exchange"])
+                    if exit_ok:
+                        send_message(
+                            f"🔁 SENSEX flip exit\n"
+                            f"Closed: {kite_sig} ({kite_pos['symbol']})\n"
+                            f"New signal: {signal}"
+                        )
+                        _kite_pos_cache.pop("SENSEX", None)
+                    else:
+                        print("⚠️ SENSEX flip exit failed — retrying next tick", flush=True)
+                        time.sleep(5)
+                        continue
+
+                    with lock:
+                        sensex_position.update({"symbol": None, "qty": 0,
+                                                "exchange": None, "signal": None,
+                                                "active": False})
+                        sensex_trade_active = False
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        last_executed_signal_sensex = None
+                    sensex_loop._carryover_done = None
+                    sensex_loop._sig_alerted    = None
+                    sensex_loop._just_flipped   = True
+                    time.sleep(3)
+
+            # ══════════════════════════════════════════════════════════════
+            # 📊  STRATEGY FILTERS (entry only — flip already handled above)
             # ══════════════════════════════════════════════════════════════
             _just_flipped_sx = getattr(sensex_loop, "_just_flipped", False)
             sensex_loop._just_flipped = False
@@ -5662,68 +5740,7 @@ def sensex_loop():
             print(f"   {_filter_reason}", flush=True)
 
             # ══════════════════════════════════════════════════════════════
-            # 🔒  ONE-ORDER-AT-A-TIME GUARD (3-layer defence)
-            # ══════════════════════════════════════════════════════════════
-            # Layer 1 — Kite ground truth
-            # Always force-refresh the cache before flip detection
-            # so a stale None result never hides an open position.
-            _kite_pos_cache.pop("SENSEX", None)
-            kite_pos = get_open_kite_position("SENSEX")
-            if kite_pos:
-                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
-
-                if kite_sig == signal:
-                    with lock:
-                        if not sensex_position["active"]:
-                            sensex_position.update({
-                                "symbol":   kite_pos["symbol"],
-                                "qty":      kite_pos["qty"],
-                                "exchange": kite_pos["exchange"],
-                                "signal":   kite_sig,
-                                "active":   True,
-                            })
-                            sensex_trade_active = True
-                    time.sleep(10)
-                    continue
-
-                else:
-                    # Open position in opposite direction → flip
-                    print(f"🔁 SENSEX FLIP (Kite): {kite_sig} → {signal}")
-                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"],
-                                            kite_pos["exchange"])
-                    if exit_ok:
-                        send_message(
-                            f"🔁 SENSEX flip exit\n"
-                            f"Closed: {kite_sig} ({kite_pos['symbol']})\n"
-                            f"New signal: {signal}"
-                        )
-                        _kite_pos_cache.pop("SENSEX", None)
-                    else:
-                        print("⚠️ SENSEX flip exit failed — retrying next tick")
-                        time.sleep(5)
-                        continue
-
-                    with lock:
-                        sensex_position.update({"symbol": None, "qty": 0,
-                                                "exchange": None, "signal": None,
-                                                "active": False})
-                        sensex_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
-                        last_executed_signal_sensex = None
-                    sensex_loop._carryover_done = None
-                    sensex_loop._sig_alerted    = None
-                    sensex_loop._just_flipped   = True   # ← skip Hull on re-entry
-                    time.sleep(3)
-
-            else:
-                # No live Kite position — sync in-memory if drifted
-                with lock:
-                    if sensex_position["active"]:
-                        print("⚠️ SENSEX in-memory says active but Kite shows no position — resetting")
-                        sensex_position.update({"symbol": None, "qty": 0,
-                                                "exchange": None, "signal": None,
-                                                "active": False})
-                        sensex_trade_active = False
+            # 🔒  ONE-ORDER-AT-A-TIME GUARD (layers 2 & 3)
 
             # Layer 2 — in-memory flag (fast path)
             with lock:

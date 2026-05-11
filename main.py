@@ -1547,8 +1547,7 @@ HULL_MORNING_BYPASS_MINS = 75
 # FIRST_CANDLE_BUFFER_PCT  = small buffer to avoid false breakout triggers
 #   e.g. 0.001 = 0.1% → on Nifty 24000, buffer = 24 pts above/below first candle
 USE_FIRST_CANDLE_FILTER  = True
-FIRST_CANDLE_BUFFER_PCT  = 0.0005   # 0.05% buffer — ~12 pts on Nifty 24000
-                                     # was 0.1% (24 pts) which was too wide
+FIRST_CANDLE_BUFFER_PCT  = 0.0   # No buffer — any close outside first candle range = breakout
 
 # Per-instrument first candle cache — reset daily
 _first_candle_cache: dict = {}
@@ -1645,17 +1644,17 @@ def check_first_candle_range(signal, df, instrument):
         cur_close = float(df["close"].iloc[-2])
         buffer    = cur_close * FIRST_CANDLE_BUFFER_PCT
 
-        breakout_high = fc_high + buffer   # must close above this for CALL
-        breakout_low  = fc_low  - buffer   # must close below this for PUT
+        breakout_high = fc_high + buffer
+        breakout_low  = fc_low  - buffer
 
-        # Check breakout
-        if signal == "CALL" and cur_close > breakout_high:
-            return True, (f"FC=breakout↑ close={cur_close:.1f} "
-                          f"above FC_high={fc_high:.1f}+buf={buffer:.1f}")
+        # Breakout: close at or beyond first candle high/low
+        if signal == "CALL" and cur_close >= breakout_high:
+            return True, (f"FC=breakout↑ close=₹{cur_close:.1f} "
+                          f"above FC_high=₹{fc_high:.1f}")
 
-        if signal == "PUT" and cur_close < breakout_low:
-            return True, (f"FC=breakout↓ close={cur_close:.1f} "
-                          f"below FC_low={fc_low:.1f}-buf={buffer:.1f}")
+        if signal == "PUT" and cur_close <= breakout_low:
+            return True, (f"FC=breakout↓ close=₹{cur_close:.1f} "
+                          f"below FC_low=₹{fc_low:.1f}")
 
         # Price still inside first candle range → rangebound
         today_str = str(datetime.now(IST).date())

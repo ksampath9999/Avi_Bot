@@ -3400,13 +3400,19 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             if local_max_profit >= 1000:
 
-                # 🎯 DYNAMIC LOCK
+                # 🎯 DYNAMIC LOCK TIERS:
+                # ₹1,000 – ₹1,499 → lock 80%
+                # ₹1,500 – ₹2,299 → lock 85%
+                # ₹2,300 – ₹2,999 → lock 90%
+                # ₹3,000+          → lock 92%
                 if local_max_profit < 1500:
-                    lock_pct = 0.5
+                    lock_pct = 0.80
+                elif local_max_profit < 2300:
+                    lock_pct = 0.85
                 elif local_max_profit < 3000:
-                    lock_pct = 0.7
+                    lock_pct = 0.90
                 else:
-                    lock_pct = 0.8
+                    lock_pct = 0.92
 
                 lock_level = local_max_profit * lock_pct
 

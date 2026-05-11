@@ -558,7 +558,7 @@ ADX_MIN_VALUE      = 20
 #   Pivot R1 / R2 / S1 / S2 (standard pivot points)
 #   Round numbers (every 50 pts on Nifty, 100 pts on BankNifty/SENSEX)
 # Set False to disable completely.
-USE_SR_FILTER      = True    # True = active | False = disabled
+USE_SR_FILTER      = False   # Disabled
 SR_BLOCK_PCT       = 0.003   # 0.3% proximity — within 72 pts on Nifty 24000
 
 # ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
@@ -1524,7 +1524,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 #   length = 55      (swing entry default in Pine)
 # ──────────────────────────────────────────────────────────────────────────────
 
-USE_HULL_FILTER  = True    # set False to disable completely
+USE_HULL_FILTER  = False   # Temporarily disabled — re-enable after testing
 HULL_MODE        = "Hma"  # "Hma" | "Ehma" | "Thma"
 HULL_LENGTH      = 55     # Pine default for swing entry
 
@@ -4501,6 +4501,9 @@ def nifty_loop():
                     print(f"⏭️ NIFTY carry-over already entered today ({carryover_key}) — skipping", flush=True)
                     time.sleep(10)
                     continue
+            else:
+                # Fresh arrow fired — reset carryover so it can re-enter if needed
+                nifty_loop._carryover_done = None
 
             # ══════════════════════════════════════════════════════════════
             # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)
@@ -5594,6 +5597,9 @@ def sensex_loop():
                 if getattr(sensex_loop, "_carryover_done", None) == carryover_key:
                     time.sleep(10)
                     continue
+            else:
+                # Fresh arrow — reset carryover so re-entry is allowed
+                sensex_loop._carryover_done = None
 
             # ══════════════════════════════════════════════════════════════
             # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)

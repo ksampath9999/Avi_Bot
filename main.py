@@ -1547,7 +1547,8 @@ HULL_MORNING_BYPASS_MINS = 75
 # FIRST_CANDLE_BUFFER_PCT  = small buffer to avoid false breakout triggers
 #   e.g. 0.001 = 0.1% → on Nifty 24000, buffer = 24 pts above/below first candle
 USE_FIRST_CANDLE_FILTER  = True
-FIRST_CANDLE_BUFFER_PCT  = 0.001   # 0.1% buffer beyond the opening range
+FIRST_CANDLE_BUFFER_PCT  = 0.0005   # 0.05% buffer — ~12 pts on Nifty 24000
+                                     # was 0.1% (24 pts) which was too wide
 
 # Per-instrument first candle cache — reset daily
 _first_candle_cache: dict = {}
@@ -1665,7 +1666,8 @@ def check_first_candle_range(signal, df, instrument):
         today_str = str(datetime.now(IST).date())
         alert_key = f"{instrument}_{today_str}_range"
 
-        # Send Telegram alert — throttled to once every 30 minutes per instrument
+        # Throttle: one alert per instrument per 30 min (not per signal direction)
+        alert_key    = f"{instrument}_{today_str}_range"
         _last_sent_ts = _first_candle_alert_sent.get(alert_key, 0)
         _thirty_mins  = 30 * 60   # 1800 seconds
         if time.time() - _last_sent_ts >= _thirty_mins:

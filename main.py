@@ -3189,8 +3189,31 @@ def place_order(symbol, qty, exchange, instrument):
         return filled_price
 
     except Exception as e:
-        print("❌ ORDER ERROR:", str(e))
-        send_message(f"❌ Order error: {e}")
+        err_str = str(e)
+        print("❌ ORDER ERROR:", err_str, flush=True)
+
+        # Always send the raw error alert
+        send_message(f"❌ Order error: {err_str[:200]}")
+
+        # ── IP whitelist error — also send manual order alert ─────────────
+        if "not allowed" in err_str.lower() or ("ip" in err_str.lower() and "allowed" in err_str.lower()):
+            _manual_msg = (
+                f"🚨 IP BLOCKED — PLACE MANUALLY\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 Instrument : {instrument}\n"
+                f"📊 Signal     : {signal if 'signal' in dir() else 'CHECK CHART'}\n"
+                f"🏷️ Symbol     : {symbol}\n"
+                f"💰 Price (LTP): ₹{price if price else 'CHECK KITE'}\n"
+                f"📦 Quantity   : {qty} lots ({get_quantity(qty, exchange) if qty and exchange else 'CHECK'} shares)\n"
+                f"🏦 Exchange   : {exchange}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚡ Open Kite app → place BUY MIS order\n"
+                f"🔧 Fix IP: developers.kite.trade → Profile → IP Whitelist\n"
+                f"   Add: {os.environ.get('RAILWAY_STATIC_IP', 'check Railway logs for current IP')}"
+            )
+            send_message(_manual_msg)
+            print(_manual_msg, flush=True)
+
         return None
         
         

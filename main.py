@@ -1557,8 +1557,8 @@ _first_candle_alert_sent: dict = {}
 
 def get_first_candle(df, instrument):
     """
-    Returns the high and low of the first 30-minute opening range (9:15–9:45 AM).
-    Aggregates all 5-min bars between 9:15 and 9:45 AM into one range.
+    Returns the high and low of the FIRST 5-min candle only (9:15–9:20 AM).
+    This is the opening candle — its high/low forms the reference range.
     Returns (high, low, candle_time) or (None, None, None) if not available.
     """
     global _first_candle_cache
@@ -1581,35 +1581,30 @@ def get_first_candle(df, instrument):
         else:
             df_copy["_dt"] = df_copy["_dt"].dt.tz_convert(IST)
 
-        # Get all 5-min bars within the 9:15–9:45 AM window
+        # Get ONLY the first 5-min candle of today (9:15 AM bar)
         today_bars = df_copy[df_copy["_dt"].dt.date == today]
-        opening_bars = today_bars[
-            (today_bars["_dt"].dt.hour == 9) &
-            (today_bars["_dt"].dt.minute >= 15) &
-            (today_bars["_dt"].dt.minute < 45)
-        ]
-
-        # Need at least 3 bars (9:15, 9:20, 9:25...) — wait until 9:45 AM
-        now_ist = datetime.now(IST)
-        if now_ist.hour == 9 and now_ist.minute < 45:
-            return None, None, None   # window not yet complete
-
-        if len(opening_bars) == 0:
+        if len(today_bars) == 0:
             return None, None, None
 
-        fc_high = float(opening_bars["high"].max())
-        fc_low  = float(opening_bars["low"].min())
-        fc_time = opening_bars["_dt"].iloc[0]
+        first_bar = today_bars.iloc[0]
+        bar_time  = first_bar["_dt"]
+
+        # Must be the 9:15 AM candle — reject anything else
+        if bar_time.hour != 9 or bar_time.minute != 15:
+            return None, None, None
+
+        fc_high = float(first_bar["high"])
+        fc_low  = float(first_bar["low"])
 
         _first_candle_cache[cache_key] = {
             "high": fc_high,
             "low":  fc_low,
-            "time": fc_time
+            "time": bar_time
         }
-        print(f"📊 Opening range 30-min [{instrument}] → "
+        print(f"📊 First 5-min candle [{instrument}] 09:15 → "
               f"High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
               f"Range={fc_high-fc_low:.1f} pts", flush=True)
-        return fc_high, fc_low, fc_time
+        return fc_high, fc_low, bar_time
 
     except Exception as e:
         print(f"⚠️ get_first_candle({instrument}) error: {e}", flush=True)

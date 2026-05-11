@@ -3372,40 +3372,71 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
                 # Skip partial if strong trend
                 if is_market_trending(
-                    CRUDE_TOKEN if instrument == "CRUDE" else (BANKNIFTY_TOKEN if instrument == "BANKNIFTY" else config.NIFTY_TOKEN)
+                    CRUDE_TOKEN      if instrument == "CRUDE"
+                    else BANKNIFTY_TOKEN if instrument == "BANKNIFTY"
+                    else SENSEX_TOKEN    if instrument == "SENSEX"
+                    else config.NIFTY_TOKEN
                 ):
-                    print("🚀 Strong trend — skipping partial booking")
+                    print("🚀 Strong trend — skipping partial booking", flush=True)
                 else:
-                    half_qty = remaining_qty // 2
+                    # Lot-size aware partial exit — must be multiple of lot size
+                    if instrument == "SENSEX":
+                        one_lot = 10
+                    elif instrument == "BANKNIFTY":
+                        one_lot = 30
+                    elif instrument == "CRUDE":
+                        one_lot = 100
+                    else:
+                        one_lot = 65   # NIFTY
 
-                    if half_qty > 0:
+                    total_lots = remaining_qty // one_lot
+                    exit_lots  = max(1, total_lots // 2)
+                    half_qty   = exit_lots * one_lot
+
+                    if half_qty > 0 and half_qty < remaining_qty:
                         exit_position(symbol, half_qty, exchange)
 
                         remaining_qty -= half_qty
                         partial_booked = True
 
-                        # Reset profit lock baseline to current half-qty P&L.
-                        # Without this, local_max_profit stays at full-qty peak,
-                        # so lock_level is unreachable with half qty → exits immediately.
+                        # Reset profit lock baseline to POST-partial P&L
+                        # Use _partial_just_booked flag to prevent local_max_profit
+                        # from being overwritten by the max() on the same tick
                         local_max_profit = profit * remaining_qty
+                        manage_trade._partial_just_booked = True
 
-                        print(f"💰 Partial booked: {symbol} | Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
+                        print(f"💰 Partial booked: {half_qty} units | "
+                              f"Remaining: {remaining_qty} | "
+                              f"Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
+                        send_message(
+                            f"💰 PARTIAL BOOKING\n"
+                            f"📌 {instrument} {signal} → {symbol}\n"
+                            f"📤 Exited {half_qty} units ({exit_lots} lot{'s' if exit_lots>1 else ''})\n"
+                            f"📊 Remaining: {remaining_qty} units\n"
+                            f"💰 P&L so far: ₹{current_pnl:.0f}"
+                        )
 
             # ===============================
             # 💰 GLOBAL PROFIT PROTECTION
             # ===============================
-            
 
-            local_max_profit = max(local_max_profit, current_pnl)
+            # Skip max() update the tick right after partial booking
+            # to prevent the reset from being overwritten
+            if not getattr(manage_trade, "_partial_just_booked", False):
+                local_max_profit = max(local_max_profit, current_pnl)
+            manage_trade._partial_just_booked = False
 
-            if local_max_profit >= 1000:
+            if local_max_profit >= 500:
 
                 # 🎯 DYNAMIC LOCK TIERS:
+                # ₹500  – ₹999  → lock 50%
                 # ₹1,000 – ₹1,499 → lock 80%
                 # ₹1,500 – ₹2,299 → lock 85%
                 # ₹2,300 – ₹2,999 → lock 90%
                 # ₹3,000+          → lock 92%
-                if local_max_profit < 1500:
+                if local_max_profit < 1000:
+                    lock_pct = 0.50
+                elif local_max_profit < 1500:
                     lock_pct = 0.80
                 elif local_max_profit < 2300:
                     lock_pct = 0.85

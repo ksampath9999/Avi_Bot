@@ -1382,7 +1382,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     #   - If price has already broken ABOVE resistance → allow CALL (breakout)
     #   - If price has already broken BELOW support   → allow PUT  (breakdown)
     #
-    # Set USE_SR_FILTER = False to disable.
+    _sr_str = "SR=off"
     if USE_SR_FILTER and df_15m is not None and len(df_15m) >= 30:
         try:
             cur_close = float(df_15m["close"].iloc[-2])
@@ -1524,7 +1524,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 #   length = 55      (swing entry default in Pine)
 # ──────────────────────────────────────────────────────────────────────────────
 
-USE_HULL_FILTER  = False   # Temporarily disabled — re-enable after testing
+USE_HULL_FILTER  = True    # Hull Suite colour must match HalfTrend signal
 HULL_MODE        = "Hma"  # "Hma" | "Ehma" | "Thma"
 HULL_LENGTH      = 55     # Pine default for swing entry
 

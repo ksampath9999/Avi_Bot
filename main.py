@@ -4602,8 +4602,8 @@ def nifty_loop():
                 continue
 
             # ── Before 9:15 AM: market not yet open ──────────────────────────
-            if now_dt.hour == 9 and now_dt.minute < 15:
-                print("⏳ NIFTY: waiting for market open at 9:15 AM...", flush=True)
+            if now_dt.hour == 9 and now_dt.minute < 20:
+                print("⏳ NIFTY: waiting until 9:20 AM — first candle still forming...", flush=True)
                 time.sleep(30)
                 continue
 
@@ -5347,6 +5347,12 @@ def banknifty_loop():
                 time.sleep(60)
                 continue
 
+            # ── Before 9:30 AM: wait for market to stabilise ─────────────────
+            if now_dt.hour == 9 and now_dt.minute < 20:
+                print("⏳ BANKNIFTY: waiting until 9:20 AM — first candle still forming...", flush=True)
+                time.sleep(30)
+                continue
+
             # ── After 3:20 PM: block all NEW entries (force-close time) ─────────
             if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute >= 20):
                 print("🛑 BANKNIFTY past 3:20 PM — no new entries, sleeping until tomorrow 9:00 AM")
@@ -5738,6 +5744,12 @@ def sensex_loop():
                     send_message("🌅 SENSEX: Monday — bot active, waiting for 9:15 AM market open")
                     _sx_wakeup_msg_sent[0] = True
                 time.sleep(60)
+                continue
+
+            # ── Before 9:30 AM: wait for market to stabilise ─────────────────
+            if now_dt.hour == 9 and now_dt.minute < 20:
+                print("⏳ SENSEX: waiting until 9:20 AM — first candle still forming...", flush=True)
+                time.sleep(30)
                 continue
 
             # ── After 3:20 PM: block all NEW entries (force-close time) ─────────
@@ -7324,6 +7336,23 @@ def _kite_day_pnl(instrument):
         wins   = sum(1 for p in filtered if float(p.get("pnl", 0)) > 0)
         losses = sum(1 for p in filtered if float(p.get("pnl", 0)) <= 0)
         count  = len(filtered)
+
+        # Also count currently open position (in net but not yet closed in day)
+        # This ensures redeploy mid-trade doesn't undercount
+        net_pos = positions.get("net", [])
+        for p in net_pos:
+            if p.get("exchange") != target_exch:
+                continue
+            sym = p.get("tradingsymbol", "")
+            if instrument.upper() == "NIFTY" and sym.startswith("BANKNIFTY"):
+                continue
+            if sym_prefix and not sym.startswith(sym_prefix):
+                continue
+            if p.get("quantity", 0) > 0:
+                # Open position — check if already counted in day positions
+                if not any(d.get("tradingsymbol") == sym for d in filtered):
+                    count += 1   # count the open trade
+
         return pnl, wins, losses, count
 
     except Exception as e:

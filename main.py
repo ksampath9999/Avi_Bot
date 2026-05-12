@@ -549,6 +549,13 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # ─────────────────────────────────────────────────────────────────────────────
 USE_ADX_FILTER     = False   # OFF — using first-candle range filter instead
 ADX_MIN_VALUE      = 20
+
+# ── Daily profit target ───────────────────────────────────────────────────────
+# Read from Railway env var DAILY_PROFIT_TARGET so each bot can have its own.
+# Set to 0 to disable. Default = 0 (disabled) if env var not set.
+# Bot 1 (NWW864): set DAILY_PROFIT_TARGET=1000 in Railway Variables
+# Bot 2 (REW397): leave unset or set to 0 for no limit
+DAILY_PROFIT_TARGET = int(os.environ.get("DAILY_PROFIT_TARGET", "0"))
                             # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
                             # only true choppy/sideways (TV ADX would be ~15 or below)
 
@@ -1211,6 +1218,32 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     Returns (passed: bool, reason: str).
     """
     now_ist = datetime.now(IST)
+
+    # ── Daily profit target — stop new entries once hit ───────────────────────
+    if DAILY_PROFIT_TARGET > 0:
+        _combined_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
+                         sensex_daily_pnl + crude_daily_pnl)
+        if _combined_pnl >= DAILY_PROFIT_TARGET:
+            # Send alert once per day
+            _today = datetime.now(IST).strftime("%Y-%m-%d")
+            _tgt_key = f"target_hit_{_today}"
+            if not getattr(apply_entry_filters, "_target_alerted", None) == _tgt_key:
+                apply_entry_filters._target_alerted = _tgt_key
+                try:
+                    send_message(
+                        f"🎯 DAILY TARGET HIT!\n"
+                        f"💰 Combined P&L: ₹{_combined_pnl:.0f}\n"
+                        f"🎉 Target: ₹{DAILY_PROFIT_TARGET:.0f}\n"
+                        f"🛑 No new entries for the rest of the day\n"
+                        f"📊 NIFTY: ₹{nifty_daily_pnl:.0f} | "
+                        f"SENSEX: ₹{sensex_daily_pnl:.0f}"
+                    )
+                except Exception:
+                    pass
+            return False, (
+                f"🎯 Daily target hit — combined P&L Rs.{_combined_pnl:.0f} "
+                f">= target Rs.{DAILY_PROFIT_TARGET:.0f} — no new entries today"
+            )
 
     # ── 0. First candle range filter — rangebound inside-day detection ─────────
     # If price is still inside the 9:15 AM first candle's high/low range,

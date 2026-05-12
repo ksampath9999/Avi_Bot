@@ -3576,7 +3576,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"📌 {instrument} {signal} → {symbol}\n"
                         f"📈 Peak P&L: ₹{local_max_profit:.0f}  |  Current: ₹{current_pnl:.0f}\n"
                         f"🔒 Lock level ({int(lock_pct*100)}%): ₹{lock_level:.0f} — exiting to protect gains\n"
-                        f"⏳ Next entry in 15 min"
+                        f"⏳ Next entry in 5 min"
                     )
                     print("💰 Profit lock triggered — exit")
                     # Record timestamp — loop will wait 15 min before next entry
@@ -4813,7 +4813,7 @@ def nifty_loop():
 
             # ── Profit-lock exit cooldown (15 min) ────────────────────────────
             _pl_exit_ts = _profit_lock_exit_time.get("NIFTY", 0)
-            _pl_wait = 900 - (time.time() - _pl_exit_ts)
+            _pl_wait = 300 - (time.time() - _pl_exit_ts)  # 5 min cooldown after profit lock
             if _pl_wait > 0:
                 print(f"⏳ NIFTY profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
                 with lock:
@@ -5608,7 +5608,7 @@ def banknifty_loop():
 
             # ── Profit-lock exit cooldown (15 min) ────────────────────────────
             _pl_exit_ts = _profit_lock_exit_time.get("BANKNIFTY", 0)
-            _pl_wait = 900 - (time.time() - _pl_exit_ts)
+            _pl_wait = 300 - (time.time() - _pl_exit_ts)  # 5 min cooldown after profit lock
             if _pl_wait > 0:
                 print(f"⏳ BANKNIFTY profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
                 with lock:
@@ -5970,7 +5970,7 @@ def sensex_loop():
 
             # ── Profit-lock exit cooldown (15 min) ────────────────────────────
             _pl_exit_ts = _profit_lock_exit_time.get("SENSEX", 0)
-            _pl_wait = 900 - (time.time() - _pl_exit_ts)
+            _pl_wait = 300 - (time.time() - _pl_exit_ts)  # 5 min cooldown after profit lock
             if _pl_wait > 0:
                 print(f"⏳ SENSEX profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
                 with lock:

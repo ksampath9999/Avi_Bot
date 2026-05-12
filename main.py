@@ -4485,7 +4485,14 @@ def nifty_loop():
                 _curr_trend = int(cached_nifty_ht.iloc[-2]["trend"]) if cached_nifty_ht is not None else -1
                 _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
                 if _active_signal == _curr_sig:
+                    print(f"⏭️ NIFTY HARD GUARD: trade active ({_active_signal}) matches HT ({_curr_sig}) — waiting", flush=True)
                     time.sleep(10)
+                    continue
+                elif _active_signal is None:
+                    # Trade just finished — run_trade_wrapper.finally may still be running
+                    # Wait briefly for it to complete and clear nifty_trade_active
+                    print(f"⏭️ NIFTY HARD GUARD: nifty_trade_active=True but signal=None — finishing cleanup, waiting 2s", flush=True)
+                    time.sleep(2)
                     continue
                 print(f"⚠️ NIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
 
@@ -4631,7 +4638,7 @@ def nifty_loop():
             # ══════════════════════════════════════════════════════════════
             # 🔒  ONE-ORDER-AT-A-TIME GUARD (layers 2 & 3)
             if is_fresh and signal == last_executed_signal_nifty:
-                print(f"⏭️ NIFTY Layer3: fresh {signal} already executed — skipping", flush=True)
+                print(f"⏭️ NIFTY Layer3: fresh {signal} == last_executed={last_executed_signal_nifty} — skipping", flush=True)
                 time.sleep(10)
                 continue
 

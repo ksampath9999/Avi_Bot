@@ -556,6 +556,114 @@ ADX_MIN_VALUE      = 20
 # Bot 1 (NWW864): set DAILY_PROFIT_TARGET=1000 in Railway Variables
 # Bot 2 (REW397): leave unset or set to 0 for no limit
 DAILY_PROFIT_TARGET = int(os.environ.get("DAILY_PROFIT_TARGET", "0"))
+
+_daily_target_exited = False   # flag — exit all trades once per day only
+
+
+def daily_profit_target_monitor():
+    """
+    Background thread — checks combined P&L every 5 seconds.
+    When P&L >= DAILY_PROFIT_TARGET:
+      1. Exit ALL active positions immediately
+      2. Send Telegram alert
+      3. Block new entries for rest of day (via apply_entry_filters check)
+    Runs only when DAILY_PROFIT_TARGET > 0.
+    """
+    global _daily_target_exited
+    global nifty_trade_active, banknifty_trade_active
+    global sensex_trade_active, crude_trade_active
+    global nifty_position, banknifty_position, sensex_position, crude_position
+    global global_trade_active, last_executed_signal_nifty
+    global last_executed_signal_banknifty, last_executed_signal_sensex
+    global last_executed_signal_crude
+
+    if DAILY_PROFIT_TARGET <= 0:
+        return   # disabled — exit thread immediately
+
+    print(f"🎯 Daily profit target monitor started — target: ₹{DAILY_PROFIT_TARGET}", flush=True)
+
+    _last_reset_date = None
+
+    while True:
+        try:
+            time.sleep(5)
+
+            # Reset flag at start of new day
+            _today = datetime.now(IST).date()
+            if _last_reset_date != _today:
+                _daily_target_exited = False
+                _last_reset_date     = _today
+
+            if _daily_target_exited:
+                continue
+
+            # Calculate combined P&L
+            _combined = (nifty_daily_pnl + banknifty_daily_pnl +
+                         sensex_daily_pnl + crude_daily_pnl)
+
+            if _combined < DAILY_PROFIT_TARGET:
+                continue
+
+            # ── Target hit — exit all active trades ──────────────────────
+            _daily_target_exited = True
+            print(f"🎯 DAILY TARGET HIT ₹{_combined:.0f} — exiting all positions", flush=True)
+
+            _exited = []
+
+            for _inst, _pos, _token_flag in [
+                ("NIFTY",     nifty_position,     nifty_trade_active),
+                ("BANKNIFTY", banknifty_position,  banknifty_trade_active),
+                ("SENSEX",    sensex_position,     sensex_trade_active),
+                ("CRUDE",     crude_position,      crude_trade_active),
+            ]:
+                with lock:
+                    _sym = _pos.get("symbol")
+                    _qty = _pos.get("qty", 0)
+                    _exc = _pos.get("exchange")
+                    _active = _pos.get("active", False)
+
+                if _active and _sym and _qty > 0:
+                    print(f"   🔴 Exiting {_inst}: {_sym} qty={_qty}", flush=True)
+                    try:
+                        exit_position(_sym, _qty, _exc)
+                        _exited.append(f"{_inst}: {_sym}")
+                    except Exception as _ex_err:
+                        print(f"   ⚠️ Exit error {_inst}: {_ex_err}", flush=True)
+
+                    with lock:
+                        _pos.update({"symbol": None, "qty": 0,
+                                     "exchange": None, "signal": None,
+                                     "active": False})
+                        if _inst == "NIFTY":
+                            nifty_trade_active = False
+                            last_executed_signal_nifty = None
+                        elif _inst == "BANKNIFTY":
+                            banknifty_trade_active = False
+                            last_executed_signal_banknifty = None
+                        elif _inst == "SENSEX":
+                            sensex_trade_active = False
+                            last_executed_signal_sensex = None
+                        else:
+                            crude_trade_active = False
+                            last_executed_signal_crude = None
+
+            with lock:
+                global_trade_active = (nifty_trade_active or banknifty_trade_active or
+                                       sensex_trade_active or crude_trade_active)
+
+            _exit_summary = "\n".join(_exited) if _exited else "No active positions"
+            send_message(
+                f"🎯 DAILY TARGET HIT — ALL TRADES CLOSED\n"
+                f"💰 Combined P&L: ₹{_combined:.0f}\n"
+                f"🎉 Target: ₹{DAILY_PROFIT_TARGET:.0f}\n"
+                f"📊 NIFTY: ₹{nifty_daily_pnl:.0f} | "
+                f"SENSEX: ₹{sensex_daily_pnl:.0f}\n"
+                f"🔴 Closed:\n{_exit_summary}\n"
+                f"🛑 No new entries for rest of day"
+            )
+
+        except Exception as _mon_err:
+            print(f"⚠️ Target monitor error: {_mon_err}", flush=True)
                             # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
                             # only true choppy/sideways (TV ADX would be ~15 or below)
 
@@ -1220,30 +1328,13 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     now_ist = datetime.now(IST)
 
     # ── Daily profit target — stop new entries once hit ───────────────────────
-    if DAILY_PROFIT_TARGET > 0:
+    if DAILY_PROFIT_TARGET > 0 and _daily_target_exited:
         _combined_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
                          sensex_daily_pnl + crude_daily_pnl)
-        if _combined_pnl >= DAILY_PROFIT_TARGET:
-            # Send alert once per day
-            _today = datetime.now(IST).strftime("%Y-%m-%d")
-            _tgt_key = f"target_hit_{_today}"
-            if not getattr(apply_entry_filters, "_target_alerted", None) == _tgt_key:
-                apply_entry_filters._target_alerted = _tgt_key
-                try:
-                    send_message(
-                        f"🎯 DAILY TARGET HIT!\n"
-                        f"💰 Combined P&L: ₹{_combined_pnl:.0f}\n"
-                        f"🎉 Target: ₹{DAILY_PROFIT_TARGET:.0f}\n"
-                        f"🛑 No new entries for the rest of the day\n"
-                        f"📊 NIFTY: ₹{nifty_daily_pnl:.0f} | "
-                        f"SENSEX: ₹{sensex_daily_pnl:.0f}"
-                    )
-                except Exception:
-                    pass
-            return False, (
-                f"🎯 Daily target hit — combined P&L Rs.{_combined_pnl:.0f} "
-                f">= target Rs.{DAILY_PROFIT_TARGET:.0f} — no new entries today"
-            )
+        return False, (
+            f"🎯 Daily target hit — combined P&L Rs.{_combined_pnl:.0f} "
+            f">= target Rs.{DAILY_PROFIT_TARGET:.0f} — no new entries today"
+        )
 
     # ── 0. First candle range filter — rangebound inside-day detection ─────────
     # If price is still inside the 9:15 AM first candle's high/low range,
@@ -8928,6 +9019,7 @@ if __name__ == "__main__":
             time.sleep(30)   # check every 30 seconds
 
     threading.Thread(target=daily_report_scheduler, daemon=True, name="ReportScheduler").start()
+    threading.Thread(target=daily_profit_target_monitor, daemon=True, name="ProfitTargetMonitor").start()
 
     threading.Thread(target=nifty_loop, daemon=True).start()
 

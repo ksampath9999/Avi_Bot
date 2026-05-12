@@ -3652,10 +3652,14 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         # -----------------------------
         with lock:
             global global_trade_active
-            global nifty_daily_pnl, crude_daily_pnl
-            global nifty_trade_count, crude_trade_count
-            global nifty_daily_wins, nifty_daily_losses
-            global crude_daily_wins, crude_daily_losses
+            global nifty_daily_pnl,     crude_daily_pnl
+            global banknifty_daily_pnl, sensex_daily_pnl
+            global nifty_trade_count,     crude_trade_count
+            global banknifty_trade_count, sensex_trade_count
+            global nifty_daily_wins,     nifty_daily_losses
+            global crude_daily_wins,     crude_daily_losses
+            global banknifty_daily_wins, banknifty_daily_losses
+            global sensex_daily_wins,    sensex_daily_losses
 
             portfolio_pnl += pnl
             daily_pnl += pnl

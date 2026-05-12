@@ -3812,11 +3812,16 @@ def get_open_kite_position(instrument):
         return None   # fail-safe: assume no position rather than blocking forever
 
 
+def _get_lot_size(instrument):
+    """Returns lot size for instrument — used in position restore."""
+    return {"SENSEX": 10, "BANKNIFTY": 30, "CRUDE": 100}.get(instrument, 65)
+
+
 def restore_position_state_from_kite():
     """
     Called once at bot startup.
     If Kite already has open positions (e.g. from a previous session),
-    restore in-memory flags so the bot doesn't place duplicate orders.
+    restore in-memory flags AND start manage_trade so exits/SL/profit-lock work.
     """
     global nifty_position, banknifty_position, sensex_position, crude_position
     global nifty_trade_active, banknifty_trade_active, sensex_trade_active, crude_trade_active
@@ -3834,11 +3839,20 @@ def restore_position_state_from_kite():
         exchange = pos["exchange"]
         signal   = "CALL" if sym.endswith("CE") else "PUT"
 
-        print(f"⚠️ Existing Kite position found on startup: {instrument} {sym} qty={qty}")
+        # Get current LTP as approximate entry price
+        try:
+            _ex = "BFO" if instrument == "SENSEX" else ("MCX" if instrument == "CRUDE" else "NFO")
+            _ltp_data = kite.ltp(f"{_ex}:{sym}")
+            entry_price = float(_ltp_data[f"{_ex}:{sym}"]["last_price"])
+        except Exception:
+            entry_price = 0.0
+
+        print(f"⚠️ Existing Kite position found on startup: {instrument} {sym} qty={qty} entry≈₹{entry_price:.1f}", flush=True)
         send_message(
             f"⚠️ EXISTING POSITION DETECTED ON STARTUP\n"
             f"📌 {instrument}: {sym}  qty={qty}\n"
-            f"🔄 Restoring in-memory state — bot will manage this trade normally"
+            f"💰 Entry≈₹{entry_price:.1f}\n"
+            f"🔄 Restoring — manage_trade started for SL/profit-lock/exit"
         )
 
         with lock:
@@ -3868,6 +3882,20 @@ def restore_position_state_from_kite():
                 last_executed_signal_crude = signal
 
             global_trade_active = True
+
+        # ── Start manage_trade thread for restored position ───────────────
+        # Without this, nifty_trade_active stays True forever and blocks
+        # all new entries. manage_trade will monitor SL, profit-lock, HT exit.
+        import threading
+        _restore_thread = threading.Thread(
+            target=run_trade_wrapper,
+            args=(sym, entry_price, qty // _get_lot_size(instrument),
+                  exchange, instrument, signal, 50, "TREND"),
+            daemon=True,
+            name=f"Restore_{instrument}"
+        )
+        _restore_thread.start()
+        print(f"✅ manage_trade started for restored {instrument} position", flush=True)
 
 
 def restore_daily_state():

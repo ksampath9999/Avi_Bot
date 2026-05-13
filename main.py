@@ -3388,7 +3388,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     local_max_profit = 0
 
     full_symbol = f"{exchange}:{symbol}"
-    actual_qty = get_quantity(qty, exchange)
+    actual_qty    = get_quantity(qty, exchange, instrument)
     remaining_qty = actual_qty
 
     entry_time = time.time()
@@ -6515,6 +6515,11 @@ def reset_daily_pnl():
         _profit_lock_floor = 0.0
         _profit_lock_tier  = 0
         print("🔓 Profit lock reset for new trading day", flush=True)
+
+        # ── Reset daily profit target flag for new day ────────────────────
+        global _daily_target_exited
+        _daily_target_exited = False
+        print("🎯 Daily profit target reset for new trading day", flush=True)
 
         # ── Reset same-strike guard for new day ───────────────────────────
         global _last_exited_symbol

@@ -3389,6 +3389,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     # (old + new after a flip) do not share state.
     exit_done = False
     local_max_profit = 0
+    partial_pnl      = 0.0   # tracks P&L from partial bookings separately
 
     full_symbol = f"{exchange}:{symbol}"
     actual_qty    = get_quantity(qty, exchange, instrument)
@@ -3521,26 +3522,28 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     half_qty   = exit_lots * one_lot
 
                     if half_qty > 0 and half_qty < remaining_qty:
+                        # Calculate partial P&L before exit
+                        _partial_pnl = (profit - entry) * half_qty
                         exit_position(symbol, half_qty, exchange)
 
                         remaining_qty -= half_qty
                         partial_booked = True
+                        partial_pnl   += _partial_pnl   # accumulate partial profits
 
                         # Reset profit lock baseline to POST-partial P&L
-                        # Use _partial_just_booked flag to prevent local_max_profit
-                        # from being overwritten by the max() on the same tick
                         local_max_profit = profit * remaining_qty
                         manage_trade._partial_just_booked = True
 
                         print(f"💰 Partial booked: {half_qty} units | "
                               f"Remaining: {remaining_qty} | "
+                              f"Partial P&L: ₹{_partial_pnl:.0f} | "
                               f"Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
                         send_message(
                             f"💰 PARTIAL BOOKING\n"
                             f"📌 {instrument} {signal} → {symbol}\n"
                             f"📤 Exited {half_qty} units ({exit_lots} lot{'s' if exit_lots>1 else ''})\n"
                             f"📊 Remaining: {remaining_qty} units\n"
-                            f"💰 P&L so far: ₹{current_pnl:.0f}"
+                            f"💰 Partial P&L: ₹{_partial_pnl:.0f} | Total so far: ₹{current_pnl:.0f}"
                         )
 
             # ===============================
@@ -3574,11 +3577,13 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 print(f"💰 Lock Active → Peak: {local_max_profit:.0f}, Lock: {lock_level:.0f}")
 
                 if current_pnl < lock_level:
+                    _total_pnl = current_pnl + partial_pnl
                     send_message(
                         f"💰 PROFIT LOCK EXIT\n"
                         f"📌 {instrument} {signal} → {symbol}\n"
                         f"📈 Peak P&L: ₹{local_max_profit:.0f}  |  Current: ₹{current_pnl:.0f}\n"
                         f"🔒 Lock level ({int(lock_pct*100)}%): ₹{lock_level:.0f} — exiting to protect gains\n"
+                        + (f"💰 Partial booked: ₹{partial_pnl:.0f} | Total trade P&L: ₹{_total_pnl:.0f}\n" if partial_pnl else "") +
                         f"⏳ Next entry in 5 min"
                     )
                     print("💰 Profit lock triggered — exit")
@@ -3840,10 +3845,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             # ── Trade closed Telegram summary ─────────────────────────────
             _combined_pnl = nifty_daily_pnl + banknifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl
+            _total_trade_pnl = pnl + partial_pnl
             send_message(
                 f"{exit_emoji} TRADE CLOSED — {instrument} {signal}\n"
                 f"📌 {symbol}\n"
-                f"💰 P&L : ₹{pnl:+.0f}  ({'PROFIT' if pnl > 0 else 'LOSS'})\n"
+                f"💰 Final P&L : ₹{pnl:+.0f}  ({'PROFIT' if pnl > 0 else 'LOSS'})\n"
+                + (f"💰 Partial   : ₹{partial_pnl:+.0f}  |  Total: ₹{_total_trade_pnl:+.0f}\n" if partial_pnl else "") +
                 f"📊 Entry: ₹{entry:.1f}  |  Exit: ₹{ltp:.1f}\n"
                 f"{'─'*28}\n"
                 f"📅 NIFTY      : ₹{nifty_daily_pnl:+.0f}\n"
@@ -4290,19 +4297,30 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
                       gen_id=None):
     """
     Wrapper around manage_trade that safely clears per-instrument state when the trade ends.
-
-    RACE-CONDITION FIX:
-    After a HalfTrend flip, the loop exits the old trade AND immediately places a new
-    trade in the opposite direction, writing new trade data into the position dict.
-    If we unconditionally clear the position dict in the finally block we would wipe the NEW
-    trade's state.  We guard this by checking that the symbol we were managing is still
-    the current one — if it has already changed (flip happened) we leave state alone.
-
-    gen_id — forwarded to manage_trade so it can self-terminate when superseded.
+    Also enforces the daily trade limit as a final safety net before the trade starts.
     """
     global nifty_active, crude_active
     global nifty_trade_active, crude_trade_active, banknifty_trade_active, sensex_trade_active
     global nifty_position, crude_position, banknifty_position, sensex_position
+
+    # ── Final trade limit safety check before starting ───────────────────────
+    limit_map = {
+        "NIFTY":     (nifty_trade_count,     MAX_NIFTY_TRADES_PER_DAY),
+        "BANKNIFTY": (banknifty_trade_count,  MAX_BANKNIFTY_TRADES_PER_DAY),
+        "SENSEX":    (sensex_trade_count,     MAX_SENSEX_TRADES_PER_DAY),
+        "CRUDE":     (crude_trade_count,      MAX_CRUDE_TRADES_PER_DAY),
+    }
+    _count, _max = limit_map.get(instrument, (0, 99))
+    if _count >= _max:
+        print(f"🔒 {instrument} run_trade_wrapper: trade limit {_count}/{_max} already hit — aborting", flush=True)
+        with lock:
+            if instrument == "NIFTY":      nifty_trade_active = False
+            elif instrument == "BANKNIFTY": banknifty_trade_active = False
+            elif instrument == "SENSEX":    sensex_trade_active = False
+            else:                           crude_trade_active = False
+            global global_trade_active
+            global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+        return
 
     try:
         manage_trade(symbol, price, lot, exchange, instrument, signal, probability, market_type,
@@ -4696,11 +4714,11 @@ def nifty_loop():
             # ── Daily trade limit check ───────────────────────────────────────
             print(f"📊 NIFTY trades today: {nifty_trade_count}/{MAX_NIFTY_TRADES_PER_DAY}", flush=True)
             if nifty_trade_count >= MAX_NIFTY_TRADES_PER_DAY:
-                _msg = f"🔒 NIFTY daily limit reached ({nifty_trade_count}/{MAX_NIFTY_TRADES_PER_DAY} trades) — no more trades today"
-                if last_status != "NIFTY_LIMIT":
-                    print(_msg, flush=True)
+                _lim_key = f"NIFTY_limit_{datetime.now(IST).strftime('%Y-%m-%d')}"
+                if getattr(nifty_loop, "_limit_alerted", None) != _lim_key:
+                    nifty_loop._limit_alerted = _lim_key
+                    print(f"🔒 NIFTY: {nifty_trade_count}/{MAX_NIFTY_TRADES_PER_DAY} trades done for today", flush=True)
                     send_message(f"🔒 NIFTY: {MAX_NIFTY_TRADES_PER_DAY} trades done for today. Resuming tomorrow.")
-                    last_status = "NIFTY_LIMIT"
                 time.sleep(60)
                 continue
 
@@ -4836,15 +4854,24 @@ def nifty_loop():
                 time.sleep(10)
                 continue
 
-            # ── Same-strike guard: block re-entry of the just-exited symbol ──
-            # Only fresh arrows (is_fresh=True) override this block.
-            if symbol == _last_exited_symbol.get("NIFTY") and not is_fresh:
-                print(f"🚫 NIFTY same-strike block: {symbol} was just exited — waiting for new arrow")
+            # ── Same-strike guard: block immediate re-entry of just-exited symbol ──
+            # Only blocks carry-over (is_fresh=False). Fresh arrows always override.
+            # After 5 minutes (profit lock cooldown), allow re-entry on same strike.
+            _sx_exit_ts = _profit_lock_exit_time.get("NIFTY", 0)
+            _sx_exited_sym = _last_exited_symbol.get("NIFTY")
+            _sx_same_strike = (symbol == _sx_exited_sym and not is_fresh)
+            _sx_cooldown_done = (time.time() - _sx_exit_ts) >= 300  # 5 min
+            if _sx_same_strike and not _sx_cooldown_done:
+                print(f"🚫 NIFTY same-strike block: {symbol} — waiting 5 min before re-entry", flush=True)
                 with lock:
                     nifty_trade_active = False
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(30)
                 continue
+            elif _sx_same_strike and _sx_cooldown_done:
+                # 5 min passed — allow re-entry and clear the guard
+                print(f"✅ NIFTY same-strike cooldown done — allowing re-entry on {symbol}", flush=True)
+                _last_exited_symbol.pop("NIFTY", None)
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
@@ -5032,11 +5059,11 @@ def crude_loop():
 
             # ── Daily trade limit check ───────────────────────────────────────
             if crude_trade_count >= MAX_CRUDE_TRADES_PER_DAY:
-                _msg = f"🔒 CRUDE daily limit reached ({crude_trade_count}/{MAX_CRUDE_TRADES_PER_DAY} trades) — no more trades today"
-                if last_status != "CRUDE_LIMIT":
-                    print(_msg, flush=True)
+                _lim_key = f"CRUDE_limit_{datetime.now(IST).strftime('%Y-%m-%d')}"
+                if getattr(crude_loop, "_limit_alerted", None) != _lim_key:
+                    crude_loop._limit_alerted = _lim_key
+                    print(f"🔒 CRUDE: {crude_trade_count}/{MAX_CRUDE_TRADES_PER_DAY} trades done for today", flush=True)
                     send_message(f"🔒 CRUDE: {MAX_CRUDE_TRADES_PER_DAY} trades done for today. Resuming tomorrow.")
-                    last_status = "CRUDE_LIMIT"
                 time.sleep(60)
                 continue
 
@@ -5428,11 +5455,11 @@ def banknifty_loop():
 
             # ── Daily trade limit check ───────────────────────────────────────
             if banknifty_trade_count >= MAX_BANKNIFTY_TRADES_PER_DAY:
-                _msg = f"🔒 BANKNIFTY daily limit reached ({banknifty_trade_count}/{MAX_BANKNIFTY_TRADES_PER_DAY} trades) — no more trades today"
-                if last_status != "BANKNIFTY_LIMIT":
-                    print(_msg, flush=True)
+                _lim_key = f"BANKNIFTY_limit_{datetime.now(IST).strftime('%Y-%m-%d')}"
+                if getattr(banknifty_loop, "_limit_alerted", None) != _lim_key:
+                    banknifty_loop._limit_alerted = _lim_key
+                    print(f"🔒 BANKNIFTY: {banknifty_trade_count}/{MAX_BANKNIFTY_TRADES_PER_DAY} trades done for today", flush=True)
                     send_message(f"🔒 BANKNIFTY: {MAX_BANKNIFTY_TRADES_PER_DAY} trades done for today. Resuming tomorrow.")
-                    last_status = "BANKNIFTY_LIMIT"
                 time.sleep(60)
                 continue
 
@@ -5834,11 +5861,11 @@ def sensex_loop():
 
             # ── Daily trade limit check ───────────────────────────────────────
             if sensex_trade_count >= MAX_SENSEX_TRADES_PER_DAY:
-                _msg = f"🔒 SENSEX daily limit reached ({sensex_trade_count}/{MAX_SENSEX_TRADES_PER_DAY} trades) — no more trades today"
-                if last_status != "SENSEX_LIMIT":
-                    print(_msg, flush=True)
+                _lim_key = f"SENSEX_limit_{datetime.now(IST).strftime('%Y-%m-%d')}"
+                if getattr(sensex_loop, "_limit_alerted", None) != _lim_key:
+                    sensex_loop._limit_alerted = _lim_key
+                    print(f"🔒 SENSEX: {sensex_trade_count}/{MAX_SENSEX_TRADES_PER_DAY} trades done for today", flush=True)
                     send_message(f"🔒 SENSEX: {MAX_SENSEX_TRADES_PER_DAY} trades done for today. Resuming tomorrow.")
-                    last_status = "SENSEX_LIMIT"
                 time.sleep(60)
                 continue
 
@@ -6005,15 +6032,32 @@ def sensex_loop():
                 continue
 
             # ── Same-strike guard ─────────────────────────────────────────────
-            if symbol == _last_exited_symbol.get("SENSEX") and not is_fresh:
-                print(f"🚫 SENSEX same-strike block: {symbol} was just exited — waiting for new arrow")
+            _sx_exited_sym = _last_exited_symbol.get("SENSEX")
+            _sx_same_strike = (symbol == _sx_exited_sym and not is_fresh)
+            _sx_exit_ts     = _profit_lock_exit_time.get("SENSEX", 0)
+            _sx_cooldown_done = (time.time() - _sx_exit_ts) >= 300
+            if _sx_same_strike and not _sx_cooldown_done:
+                print(f"🚫 SENSEX same-strike block: {symbol} — waiting 5 min", flush=True)
                 with lock:
                     sensex_trade_active = False
                     global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(30)
                 continue
+            elif _sx_same_strike and _sx_cooldown_done:
+                print(f"✅ SENSEX same-strike cooldown done — allowing re-entry on {symbol}", flush=True)
+                _last_exited_symbol.pop("SENSEX", None)
 
             filled_price = place_order(symbol, lot, exchange, "SENSEX")
+
+            # ── Double-check trade limit (race condition guard) ───────────────
+            # sensex_trade_count may have incremented while find_option was running
+            if sensex_trade_count >= MAX_SENSEX_TRADES_PER_DAY and not filled_price:
+                print(f"🔒 SENSEX trade limit reached during order — aborting", flush=True)
+                with lock:
+                    sensex_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(10)
+                continue
 
             if filled_price:
                 with lock:
@@ -7341,10 +7385,17 @@ def _kite_day_pnl(instrument):
         if not filtered:
             return 0.0, 0, 0, 0
 
-        pnl    = sum(float(p.get("pnl", 0)) for p in filtered)
-        wins   = sum(1 for p in filtered if float(p.get("pnl", 0)) > 0)
-        losses = sum(1 for p in filtered if float(p.get("pnl", 0)) <= 0)
-        count  = len(filtered)
+        # Group by tradingsymbol — partial bookings create multiple entries
+        # for the same symbol; we count each SYMBOL as one trade, not each entry
+        from collections import defaultdict
+        sym_pnl = defaultdict(float)
+        for p in filtered:
+            sym_pnl[p.get("tradingsymbol", "")] += float(p.get("pnl", 0))
+
+        pnl    = sum(sym_pnl.values())
+        wins   = sum(1 for v in sym_pnl.values() if v > 0)
+        losses = sum(1 for v in sym_pnl.values() if v <= 0)
+        count  = len(sym_pnl)   # unique symbols = unique trades
 
         # Also count currently open position (in net but not yet closed in day)
         # This ensures redeploy mid-trade doesn't undercount

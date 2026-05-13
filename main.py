@@ -4302,6 +4302,9 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
     global nifty_active, crude_active
     global nifty_trade_active, crude_trade_active, banknifty_trade_active, sensex_trade_active
     global nifty_position, crude_position, banknifty_position, sensex_position
+    global global_trade_active
+    global last_executed_signal_nifty, last_executed_signal_crude
+    global last_executed_signal_banknifty, last_executed_signal_sensex
 
     # ── Final trade limit safety check before starting ───────────────────────
     limit_map = {
@@ -4314,11 +4317,10 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
     if _count >= _max:
         print(f"🔒 {instrument} run_trade_wrapper: trade limit {_count}/{_max} already hit — aborting", flush=True)
         with lock:
-            if instrument == "NIFTY":      nifty_trade_active = False
+            if instrument == "NIFTY":       nifty_trade_active = False
             elif instrument == "BANKNIFTY": banknifty_trade_active = False
             elif instrument == "SENSEX":    sensex_trade_active = False
             else:                           crude_trade_active = False
-            global global_trade_active
             global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
         return
 
@@ -4328,10 +4330,6 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
 
     finally:
         with lock:
-            global global_trade_active
-            global last_executed_signal_nifty, last_executed_signal_crude
-            global last_executed_signal_banknifty, last_executed_signal_sensex
-
             if instrument == "NIFTY":
                 pos_dict = nifty_position
             elif instrument == "BANKNIFTY":

@@ -1670,12 +1670,11 @@ HULL_MORNING_BYPASS_MINS = 75
 # USE_FIRST_CANDLE_FILTER = True  → active
 # FIRST_CANDLE_BUFFER_PCT  = small buffer to avoid false breakout triggers
 #   e.g. 0.001 = 0.1% → on Nifty 24000, buffer = 24 pts above/below first candle
-USE_FIRST_CANDLE_FILTER  = False
+USE_FIRST_CANDLE_FILTER  = True
 FIRST_CANDLE_BUFFER_PCT  = 0.0   # No buffer — any close outside first candle range = breakout
 
 # Per-instrument first candle cache — reset daily
-_first_candle_cache: dict = {}
-_first_candle_alert_sent: dict = {}
+_fc_breakout_done: dict = {}   # { "NIFTY_2026-05-14": "PUT", ... } — once broken, always broken
 
 
 def get_first_candle(df, instrument):
@@ -1738,31 +1737,31 @@ def check_first_candle_range(signal, df, instrument):
     """
     Returns (passed: bool, reason: str)
 
-    Checks if the current closed candle (iloc[-2]) close price has broken
-    OUTSIDE the first 5-min candle's high/low range (with buffer).
-
-    CALL signal: close must be ABOVE first_candle_high + buffer → breakout up
-    PUT  signal: close must be BELOW first_candle_low  − buffer → breakout down
-
-    If price is still inside the range → rangebound → block + send Telegram once.
+    Once price breaks the first candle range in ANY direction,
+    the filter is permanently disabled for that instrument for the rest of the day.
+    No re-checking — one breakout = always unlocked.
     """
-    global _first_candle_alert_sent
+    global _first_candle_alert_sent, _fc_breakout_done
 
     if not USE_FIRST_CANDLE_FILTER:
         return True, "FC=off"
 
     try:
-        # ── Time gate: FC range filter only active 9:15 AM – 11:15 AM ──────────
-        # After 11:15 AM the opening range is stale — price has had 2 hours to
-        # establish direction. Keeping it active blocks valid afternoon entries.
         _now_ist = datetime.now(IST)
         _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
-        if _mins_since_open > 120:   # more than 2 hours since open
+        if _mins_since_open > 120:
             return True, f"FC=expired(market open {_mins_since_open} min ago)"
+
+        today_str  = str(_now_ist.date())
+        _break_key = f"{instrument}_{today_str}"
+
+        # ── Already broke out today — permanently pass ────────────────────────
+        if _fc_breakout_done.get(_break_key):
+            return True, f"FC=unlocked(broke {_fc_breakout_done[_break_key]} earlier today)"
+
         fc_high, fc_low, fc_time = get_first_candle(df, instrument)
 
         if fc_high is None or fc_low is None:
-            # First candle not yet available (before 9:20 AM or data issue)
             return True, "FC=N/A"
 
         cur_close = float(df["close"].iloc[-2])
@@ -1771,23 +1770,27 @@ def check_first_candle_range(signal, df, instrument):
         breakout_high = fc_high + buffer
         breakout_low  = fc_low  - buffer
 
-        # Breakout: close at or beyond first candle high/low
-        if signal == "CALL" and cur_close >= breakout_high:
-            return True, (f"FC=breakout↑ close=₹{cur_close:.1f} "
-                          f"above FC_high=₹{fc_high:.1f}")
+        # Breakout detected — lock permanently for today regardless of direction
+        if cur_close >= breakout_high:
+            _fc_breakout_done[_break_key] = "UP"
+            print(f"🔓 FC BREAKOUT [{instrument}] ↑ — permanently unlocked for today", flush=True)
+            if signal == "CALL":
+                return True, f"FC=breakout↑ close=₹{cur_close:.1f} above FC_high=₹{fc_high:.1f}"
+            else:
+                return False, f"FC=broke UP but signal is PUT — waiting for HT to confirm"
 
-        if signal == "PUT" and cur_close <= breakout_low:
-            return True, (f"FC=breakout↓ close=₹{cur_close:.1f} "
-                          f"below FC_low=₹{fc_low:.1f}")
+        if cur_close <= breakout_low:
+            _fc_breakout_done[_break_key] = "DOWN"
+            print(f"🔓 FC BREAKOUT [{instrument}] ↓ — permanently unlocked for today", flush=True)
+            if signal == "PUT":
+                return True, f"FC=breakout↓ close=₹{cur_close:.1f} below FC_low=₹{fc_low:.1f}"
+            else:
+                return False, f"FC=broke DOWN but signal is CALL — waiting for HT to confirm"
 
         # Price still inside first candle range → rangebound
-        today_str = str(datetime.now(IST).date())
-        alert_key = f"{instrument}_{today_str}_range"
-
-        # Throttle: one alert per instrument per 30 min (not per signal direction)
-        alert_key    = f"{instrument}_{today_str}_range"
+        alert_key     = f"{instrument}_{today_str}_range"
         _last_sent_ts = _first_candle_alert_sent.get(alert_key, 0)
-        _thirty_mins  = 30 * 60   # 1800 seconds
+        _thirty_mins  = 30 * 60
         if time.time() - _last_sent_ts >= _thirty_mins:
             _first_candle_alert_sent[alert_key] = time.time()
             msg = (
@@ -6507,6 +6510,7 @@ def reset_daily_pnl():
         # Reset first candle range cache for new day
         _first_candle_cache.clear()
         _first_candle_alert_sent.clear()
+        _fc_breakout_done.clear()
         print("📊 First candle range cache reset for new day", flush=True)
 
         # ── Reset progressive profit lock for new day ─────────────────────

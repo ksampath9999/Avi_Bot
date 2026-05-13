@@ -8961,10 +8961,7 @@ if __name__ == "__main__":
     restore_daily_state()
 
     # ── Mark today as already reset so loops don't wipe restored counters ────
-    # Without this, each loop calls reset_daily_pnl() which sees last_reset_date=None
-    # and resets all counters back to 0 — erasing the restored trade counts.
     from datetime import date as _date
-    global last_reset_date
     last_reset_date = _date.today()
     print(f"📅 last_reset_date set to {last_reset_date} — restored counters protected", flush=True)
 

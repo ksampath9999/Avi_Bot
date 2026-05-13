@@ -1670,7 +1670,7 @@ HULL_MORNING_BYPASS_MINS = 75
 # USE_FIRST_CANDLE_FILTER = True  → active
 # FIRST_CANDLE_BUFFER_PCT  = small buffer to avoid false breakout triggers
 #   e.g. 0.001 = 0.1% → on Nifty 24000, buffer = 24 pts above/below first candle
-USE_FIRST_CANDLE_FILTER  = True
+USE_FIRST_CANDLE_FILTER  = False
 FIRST_CANDLE_BUFFER_PCT  = 0.0   # No buffer — any close outside first candle range = breakout
 
 # Per-instrument first candle cache — reset daily

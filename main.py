@@ -1417,18 +1417,36 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
             _ml_str = f"ML={ml_sig}({ml_conf:.0f}%)"
 
     # ── 7. Hull Suite — colour must match HalfTrend AND band must be wide enough
-    # EXCEPTION: if HalfTrend flipped on a high-volume candle (volume spike),
-    # skip the Hull colour check and enter on HalfTrend alone.
-    # Hull (length=55) is too slow to react to sudden volume-driven moves.
-    # Band width check still applies even on volume spikes.
+    # EXCEPTIONS:
+    # 1. Volume spike — bypass colour check, HalfTrend alone decides
+    # 2. Flip re-entry — HalfTrend just flipped, Hull still catching up → bypass colour
+    # 3. Hull transitioning — returned None from consistency check → bypass colour
+    # Band width check still applies except during morning bypass.
     _hull_str = "Hull=off"
     if USE_HULL_FILTER and df_15m is not None:
         try:
             hull_sig, hval, h2val, bw_pct = get_hull_signal(
                 df_15m, mode=HULL_MODE, length=HULL_LENGTH)
 
-            if hull_sig is None or hval is None:
-                _hull_str = "Hull=N/A"
+            # ── Flip re-entry bypass ──────────────────────────────────────────
+            # When HalfTrend just flipped, Hull (length=55) takes 2-5 candles
+            # to catch up. On a flip re-entry, skip colour check entirely.
+            _is_flip = kwargs.get("is_flip_reentry", False)
+            if _is_flip and hull_sig != signal:
+                print(f"🔄 Hull flip bypass: HT just flipped to {signal}, Hull still {hull_sig} — skipping colour check", flush=True)
+                _hull_str = f"Hull=🔄FLIP-BYPASS(HT={signal},Hull={hull_sig})"
+                # Still check band width below
+                if hull_sig is not None and hval is not None:
+                    _now_ist = datetime.now(IST)
+                    _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
+                    _morning_bypass = (0 <= _mins_since_open <= HULL_MORNING_BYPASS_MINS)
+                    if bw_pct is not None and HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
+                        reason = (f"🌊 Hull filter: band too thin — width={bw_pct*100:.3f}% min {HULL_MIN_BAND_WIDTH_PCT*100:.3f}%")
+                        print(f"🚫 HULL BLOCK: {reason}", flush=True)
+                        return False, reason
+                # Skip rest of Hull check
+            elif hull_sig is None or hval is None:
+                _hull_str = "Hull=N/A(transitioning)"
             else:
                 # ── Band width check — always applies, even on volume spikes ─
                 # EXCEPTION: morning warm-up bypass — Hull band is always narrow
@@ -1474,7 +1492,12 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                         )
 
                 # ── Colour check — only when no volume spike ──────────────────
-                if not _vol_override and hull_sig != signal:
+                if not _vol_override and hull_sig is None:
+                    # Hull is transitioning (just flipped) — treat as bypass
+                    # Don't block based on a single-bar transition
+                    _hull_str = f"Hull=🔄TRANSITIONING — bypassing colour check"
+                    print(f"⚠️ Hull transitioning — bypassing colour check", flush=True)
+                elif not _vol_override and hull_sig != signal:
                     hull_color = "🟢 GREEN" if hull_sig == "CALL" else "🔴 RED"
                     ht_color   = "🟢 GREEN" if signal   == "CALL" else "🔴 RED"
                     reason = (
@@ -1943,21 +1966,21 @@ def hull_suite(df, mode=HULL_MODE, length=HULL_LENGTH):
 
 def get_hull_signal(df_15m, mode=HULL_MODE, length=HULL_LENGTH):
     """
-    Returns the Hull Suite signal on the last CLOSED 15-min candle (iloc[-2]).
+    Returns the Hull Suite signal on the last CLOSED candle (iloc[-2]).
+    Requires Hull colour to be CONSISTENT for at least 2 bars to avoid
+    false signals during transitions (like the chart shows — Hull briefly
+    flips green during a downtrend before resuming red).
 
     Returns: (signal, hull_value, hull_2_value, band_width_pct)
-        signal          : "CALL" | "PUT" | None
-        hull_value      : MHULL  (current bar hull line)
-        hull_2_value    : SHULL  (hull 2 bars ago)
-        band_width_pct  : abs(MHULL - SHULL) / close  — thickness of the band
-                          Small value = thin band = weak/transitioning trend
     """
     try:
         if df_15m is None or len(df_15m) < length + 5:
             return None, None, None, None
 
         ht  = hull_suite(df_15m, mode=mode, length=length)
-        bar = ht.iloc[-2]   # last CLOSED candle — anti-repaint
+
+        bar      = ht.iloc[-2]   # last CLOSED candle
+        prev_bar = ht.iloc[-3]   # candle before that
 
         sig   = bar["hull_signal"]
         hval  = round(float(bar["hull"]),   2)
@@ -1965,6 +1988,15 @@ def get_hull_signal(df_15m, mode=HULL_MODE, length=HULL_LENGTH):
         price = round(float(bar["close"]),  2)
 
         band_width_pct = abs(hval - h2val) / price if price > 0 else 0.0
+
+        # ── Consistency check — both last 2 closed bars must agree ───────────
+        # Prevents false colour flip during transition (your chart scenario):
+        # Hull briefly turns green at bottom of downtrend → would wrongly block PUT
+        prev_sig = prev_bar["hull_signal"]
+        if sig != prev_sig:
+            # Hull just flipped on this bar — treat as transitioning → return None
+            print(f"⚠️ Hull transition detected: prev={prev_sig} → cur={sig} — treating as None", flush=True)
+            return None, hval, h2val, round(band_width_pct, 6)
 
         return sig, hval, h2val, round(band_width_pct, 6)
 

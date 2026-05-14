@@ -1620,7 +1620,22 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _sr_e:
             _sr_str = f"SR=err({_sr_e})"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_sr_str}"
+    # ── Approach 2: Claude API confidence filter ─────────────────────────────
+    _claude_str = "Claude=off"
+    if USE_CLAUDE_FILTER and df_15m is not None:
+        try:
+            _ht_df = kwargs.get("ht_df")
+            _band  = kwargs.get("hull_band_pct", 0)
+            if _ht_df is not None:
+                _ok, _reason, _conf = claude_trade_filter(
+                    signal, instrument, df_15m, _ht_df, _band)
+                _claude_str = f"Claude={_conf}%"
+                if not _ok:
+                    return False, f"🤖 Claude filter: {_reason} (confidence={_conf}%)"
+        except Exception as _ce:
+            _claude_str = f"Claude=err"
+
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_sr_str} | {_claude_str}"
 
 
 
@@ -1674,7 +1689,9 @@ USE_FIRST_CANDLE_FILTER  = True
 FIRST_CANDLE_BUFFER_PCT  = 0.0   # No buffer — any close outside first candle range = breakout
 
 # Per-instrument first candle cache — reset daily
-_fc_breakout_done: dict = {}   # { "NIFTY_2026-05-14": "PUT", ... } — once broken, always broken
+_fc_breakout_done: dict = {}       # { "NIFTY_2026-05-14": "PUT" } — once broken, always broken
+_first_candle_cache: dict = {}     # { "NIFTY_2026-05-14": {high, low, time} }
+_first_candle_alert_sent: dict = {} # throttle — timestamp of last alert per instrument
 
 
 def get_first_candle(df, instrument):
@@ -2191,11 +2208,305 @@ def evaluate_strategies():
 
 def log_trade_full(symbol, entry, exit_price, pnl, instrument, signal, probability):
     import csv
-    # Always write IST timestamp so CSV date filter matches IST EOD report date
     ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     with open(TRADE_LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([ts, instrument, symbol, signal, entry, exit_price, pnl, probability])
+
+
+def _log_trade_settings(instrument, signal, pnl):
+    """
+    Approach 1 — Auto-tuning data collection.
+    Logs current indicator settings alongside trade outcome.
+    Weekly analysis finds which settings produce best win rate.
+    """
+    try:
+        _settings_file = "trade_settings_log.csv"
+        _ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        _row = {
+            "time":                _ts,
+            "instrument":          instrument,
+            "signal":              signal,
+            "pnl":                 round(pnl, 2),
+            "won":                 1 if pnl > 0 else 0,
+            "hull_min_band_pct":   HULL_MIN_BAND_WIDTH_PCT,
+            "hull_morning_bypass": HULL_MORNING_BYPASS_MINS,
+            "fc_buffer_pct":       FIRST_CANDLE_BUFFER_PCT,
+            "hull_length":         HULL_LENGTH,
+            "hull_mode":           HULL_MODE,
+            "profit_lock_min":     1000,
+            "hour_of_day":         datetime.now(IST).hour,
+            "day_of_week":         datetime.now(IST).weekday(),
+        }
+        import csv as _csv
+        _write_header = not os.path.exists(_settings_file)
+        with open(_settings_file, "a", newline="") as _f:
+            _w = _csv.DictWriter(_f, fieldnames=list(_row.keys()))
+            if _write_header:
+                _w.writeheader()
+            _w.writerow(_row)
+    except Exception as _e:
+        print(f"⚠️ _log_trade_settings: {_e}", flush=True)
+
+
+def auto_tune_parameters():
+    """
+    Approach 1 — Auto-tuning.
+    Reads trade_settings_log.csv, finds which parameter combinations
+    produced the best win rate over the last 30 days.
+    Called weekly by a background thread.
+    Returns dict of recommended settings (does NOT apply them automatically —
+    just logs recommendations so you can review and decide).
+    """
+    try:
+        _settings_file = "trade_settings_log.csv"
+        if not os.path.exists(_settings_file):
+            return
+
+        import csv as _csv
+        rows = []
+        with open(_settings_file, "r") as _f:
+            reader = _csv.DictReader(_f)
+            for row in reader:
+                rows.append(row)
+
+        if len(rows) < 10:
+            print("⚠️ Auto-tune: not enough data yet (need 10+ trades)", flush=True)
+            return
+
+        # Filter last 30 days
+        _cutoff = (datetime.now(IST) - timedelta(days=30)).strftime("%Y-%m-%d")
+        rows = [r for r in rows if r["time"] >= _cutoff]
+
+        if not rows:
+            return
+
+        # Analyse by hull_min_band_pct
+        from collections import defaultdict
+        band_stats = defaultdict(lambda: {"wins": 0, "total": 0, "pnl": 0})
+        for r in rows:
+            try:
+                k = r["hull_min_band_pct"]
+                band_stats[k]["total"] += 1
+                band_stats[k]["wins"]  += int(r["won"])
+                band_stats[k]["pnl"]   += float(r["pnl"])
+            except Exception:
+                pass
+
+        # Find best band setting
+        best_band = max(band_stats.items(),
+                        key=lambda x: x[1]["wins"] / max(x[1]["total"], 1))
+
+        # Analyse by hour of day — find worst hours
+        hour_stats = defaultdict(lambda: {"wins": 0, "total": 0})
+        for r in rows:
+            try:
+                h = int(r["hour_of_day"])
+                hour_stats[h]["total"] += 1
+                hour_stats[h]["wins"]  += int(r["won"])
+            except Exception:
+                pass
+
+        worst_hours = [h for h, s in hour_stats.items()
+                       if s["total"] >= 3 and s["wins"] / s["total"] < 0.3]
+
+        total   = len(rows)
+        wins    = sum(int(r["won"]) for r in rows)
+        avg_pnl = sum(float(r["pnl"]) for r in rows) / max(total, 1)
+
+        report = (
+            f"🤖 AUTO-TUNE WEEKLY REPORT\n"
+            f"{'='*30}\n"
+            f"📊 Trades analysed: {total} (last 30 days)\n"
+            f"🏆 Win rate: {wins}/{total} = {wins/max(total,1)*100:.1f}%\n"
+            f"💰 Avg P&L per trade: ₹{avg_pnl:.0f}\n"
+            f"{'='*30}\n"
+            f"⚙️ Best hull_min_band_pct: {best_band[0]} "
+            f"(win rate: {best_band[1]['wins']}/{best_band[1]['total']})\n"
+            + (f"⏰ Worst hours (avoid): {worst_hours}\n" if worst_hours else "") +
+            f"{'='*30}\n"
+            f"Current settings:\n"
+            f"  HULL_MIN_BAND_WIDTH_PCT = {HULL_MIN_BAND_WIDTH_PCT}\n"
+            f"  HULL_MORNING_BYPASS_MINS = {HULL_MORNING_BYPASS_MINS}\n"
+            f"  FIRST_CANDLE_BUFFER_PCT = {FIRST_CANDLE_BUFFER_PCT}"
+        )
+        print(report, flush=True)
+        send_message(report)
+
+    except Exception as _e:
+        print(f"⚠️ auto_tune_parameters: {_e}", flush=True)
+
+
+def auto_tune_scheduler():
+    """Background thread — runs auto_tune_parameters every Sunday at 6 PM."""
+    while True:
+        try:
+            now = datetime.now(IST)
+            # Run every Sunday at 6 PM IST
+            if now.weekday() == 6 and now.hour == 18 and now.minute < 5:
+                print("🤖 Running weekly auto-tune analysis...", flush=True)
+                auto_tune_parameters()
+                time.sleep(300)  # avoid running twice in same 5-min window
+            time.sleep(60)
+        except Exception as _e:
+            print(f"⚠️ auto_tune_scheduler: {_e}", flush=True)
+            time.sleep(60)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🤖  APPROACH 2 — CLAUDE API TRADE FILTER
+# Before placing any order, ask Claude API if the trade looks good.
+# Uses last 5 trades + current indicators as context.
+# ──────────────────────────────────────────────────────────────────────────────
+
+USE_CLAUDE_FILTER    = os.environ.get("USE_CLAUDE_FILTER", "false").lower() == "true"
+CLAUDE_MIN_CONFIDENCE = 65   # minimum confidence % to allow trade
+_claude_filter_cache  = {}   # throttle — one call per instrument per 5 min
+
+
+def _get_recent_trades(instrument, n=5):
+    """Read last N trades for instrument from trade_log.csv."""
+    try:
+        import csv as _csv
+        trades = []
+        if not os.path.exists(TRADE_LOG_FILE):
+            return []
+        with open(TRADE_LOG_FILE, "r") as _f:
+            reader = _csv.DictReader(_f)
+            for row in reader:
+                if row.get("instrument", "").upper() == instrument.upper():
+                    trades.append(row)
+        return trades[-n:] if len(trades) >= n else trades
+    except Exception:
+        return []
+
+
+def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
+    """
+    Approach 2 — Claude API trade filter.
+    Sends current market context to Claude and gets a confidence score.
+    Returns (allowed: bool, reason: str, confidence: int)
+
+    Requires ANTHROPIC_API_KEY env var and USE_CLAUDE_FILTER=true.
+    """
+    if not USE_CLAUDE_FILTER:
+        return True, "Claude filter disabled", 100
+
+    _api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not _api_key:
+        print("⚠️ Claude filter: ANTHROPIC_API_KEY not set — skipping", flush=True)
+        return True, "Claude filter: no API key", 100
+
+    # Throttle — one call per instrument per 5 minutes
+    _cache_key = f"{instrument}_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:-1]}"
+    if _claude_filter_cache.get(_cache_key):
+        cached = _claude_filter_cache[_cache_key]
+        return cached["allowed"], cached["reason"], cached["confidence"]
+
+    try:
+        # ── Pre-check: consecutive losses → block without calling Claude ─────
+        _recent = _get_recent_trades(instrument, n=5)
+        if len(_recent) >= 3:
+            _last3 = [float(t.get("pnl", 0)) for t in _recent[-3:]]
+            if all(p < 0 for p in _last3):
+                _msg = f"3 consecutive losses (₹{_last3[-3]:.0f}, ₹{_last3[-2]:.0f}, ₹{_last3[-1]:.0f}) — strategy not working today"
+                print(f"🤖 Claude pre-check [{instrument}]: BLOCKED — {_msg}", flush=True)
+                send_message(
+                    f"🤖 CLAUDE FILTER BLOCKED\n"
+                    f"📌 {instrument} {signal}\n"
+                    f"📊 Confidence: 0% — pre-check failed\n"
+                    f"💭 {_msg}"
+                )
+                return False, _msg, 0
+
+        # Build context for Claude API call
+        _recent = _get_recent_trades(instrument, n=5)
+        _trade_summary = []
+        for t in _recent:
+            _pnl = float(t.get("pnl", 0))
+            _trade_summary.append(
+                f"  {t.get('time','')[:16]} {t.get('signal','')} → "
+                f"₹{_pnl:+.0f} ({'WIN' if _pnl > 0 else 'LOSS'})"
+            )
+
+        _cur_close = float(df["close"].iloc[-2]) if df is not None and len(df) > 2 else 0
+        _ht_trend  = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
+        _now       = datetime.now(IST).strftime("%H:%M")
+
+        _prompt = f"""You are a strict trading risk filter for an Indian options bot trading {instrument}.
+
+Current situation:
+- Signal: {signal} (PUT or CALL)
+- HalfTrend: {_ht_trend}
+- Hull Suite band width: {hull_band_pct*100:.3f}% (wider = stronger trend, >0.05% is good)
+- Current price: ₹{_cur_close:.1f}
+- Time: {_now} IST
+- Combined daily P&L today: ₹{nifty_daily_pnl + sensex_daily_pnl:.0f}
+
+Last {len(_trade_summary)} trades for {instrument}:
+{chr(10).join(_trade_summary) if _trade_summary else "  No recent trades"}
+
+STRICT RULES — these override everything else:
+1. If last 3 trades are ALL losses → confidence must be below 50 (strategy not working today)
+2. If last 2 trades are consecutive losses → reduce confidence by at least 20
+3. If time is after 2:30 PM IST → reduce confidence by 15 unless Hull band > 0.06%
+4. If Hull band < 0.02% → confidence must be below 40 (trend not confirmed)
+5. Even a very strong technical signal cannot overcome 3 consecutive losses
+
+Based on ALL factors especially recent trade history, should the bot enter a {signal} trade on {instrument}?
+
+Reply in EXACTLY this JSON format (no other text):
+{{"confidence": 75, "allowed": true, "reason": "one short sentence"}}
+
+allowed must be true only if confidence >= {CLAUDE_MIN_CONFIDENCE}"""
+
+        _response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         _api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-haiku-4-5-20251001",   # fast + cheap
+                "max_tokens": 100,
+                "messages":   [{"role": "user", "content": _prompt}]
+            },
+            timeout=8
+        )
+
+        if _response.status_code != 200:
+            print(f"⚠️ Claude API error {_response.status_code} — allowing trade", flush=True)
+            return True, "Claude API error — allowing", 100
+
+        _text = _response.json()["content"][0]["text"].strip()
+        _data = json.loads(_text)
+
+        confidence = int(_data.get("confidence", 50))
+        allowed    = bool(_data.get("allowed", True))
+        reason     = str(_data.get("reason", ""))
+
+        # Cache result
+        _claude_filter_cache[_cache_key] = {
+            "allowed": allowed, "reason": reason, "confidence": confidence
+        }
+
+        print(f"🤖 Claude filter [{instrument} {signal}]: "
+              f"confidence={confidence}% allowed={allowed} — {reason}", flush=True)
+
+        if not allowed:
+            send_message(
+                f"🤖 CLAUDE FILTER BLOCKED\n"
+                f"📌 {instrument} {signal}\n"
+                f"📊 Confidence: {confidence}% (min {CLAUDE_MIN_CONFIDENCE}%)\n"
+                f"💭 {reason}"
+            )
+
+        return allowed, reason, confidence
+
+    except Exception as _e:
+        print(f"⚠️ Claude filter error: {_e} — allowing trade", flush=True)
+        return True, f"Claude filter error: {_e}", 100
 
 
 def get_nifty_fut_token():
@@ -6550,6 +6861,7 @@ def reset_daily_pnl():
         _data_cache_store.clear()   # also flush historical data cache
 
         # Reset first candle range cache for new day
+        global _first_candle_cache, _first_candle_alert_sent, _fc_breakout_done
         _first_candle_cache.clear()
         _first_candle_alert_sent.clear()
         _fc_breakout_done.clear()

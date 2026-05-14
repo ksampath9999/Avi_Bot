@@ -698,7 +698,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Set False to completely stop trading that instrument.
 # The loop stays running (no restart needed) — just skips all entries.
 # Flip back to True to resume immediately on next cycle.
-ENABLE_NIFTY      = True    # ✅ NIFTY trading active
+ENABLE_NIFTY      = False    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
 ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
@@ -1795,9 +1795,15 @@ def check_first_candle_range(signal, df, instrument):
         today_str  = str(_now_ist.date())
         _break_key = f"{instrument}_{today_str}"
 
-        # ── Already broke out today — permanently pass ────────────────────────
-        if _fc_breakout_done.get(_break_key):
-            return True, f"FC=unlocked(broke {_fc_breakout_done[_break_key]} earlier today)"
+        # ── Already broke out today — pass only if signal matches direction ──
+        _broke = _fc_breakout_done.get(_break_key)
+        if _broke:
+            if (_broke == "UP"   and signal == "CALL") or \
+               (_broke == "DOWN" and signal == "PUT"):
+                return True, f"FC=unlocked(broke {_broke} earlier today)"
+            else:
+                return False, (f"FC=broke {_broke} but signal is {signal} — "
+                               f"direction mismatch")
 
         fc_high, fc_low, fc_time = get_first_candle(df, instrument)
 

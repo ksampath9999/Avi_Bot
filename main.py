@@ -625,10 +625,21 @@ def daily_profit_target_monitor():
                 if _active and _sym and _qty > 0:
                     print(f"   🔴 Exiting {_inst}: {_sym} qty={_qty}", flush=True)
                     try:
-                        exit_position(_sym, _qty, _exc)
-                        _exited.append(f"{_inst}: {_sym}")
+                        _ok = exit_position(_sym, _qty, _exc)
+                        if _ok:
+                            _exited.append(f"{_inst}: {_sym}")
+                        else:
+                            _exited.append(f"{_inst}: {_sym} ❌ EXIT FAILED — EXIT MANUALLY!")
+                            send_message(
+                                f"🚨 DAILY TARGET EXIT FAILED\n"
+                                f"📌 {_inst}: {_sym}\n"
+                                f"📦 Qty: {_qty}\n"
+                                f"⚠️ IP may be blocked — exit manually on Kite!\n"
+                                f"🔧 Fix: developers.kite.trade → Profile → IP Whitelist → Clear all"
+                            )
                     except Exception as _ex_err:
                         print(f"   ⚠️ Exit error {_inst}: {_ex_err}", flush=True)
+                        _exited.append(f"{_inst}: {_sym} ❌ ERROR")
 
                     with lock:
                         _pos.update({"symbol": None, "qty": 0,
@@ -668,13 +679,14 @@ def daily_profit_target_monitor():
                             # only true choppy/sideways (TV ADX would be ~15 or below)
 
 # ── Support & Resistance Filter ───────────────────────────────────────────────
-# Blocks entries when price is within SR_BLOCK_PCT of key S&R levels:
-#   PDH / PDL (previous day high/low)
-#   Pivot R1 / R2 / S1 / S2 (standard pivot points)
-#   Round numbers (every 50 pts on Nifty, 100 pts on BankNifty/SENSEX)
-# Set False to disable completely.
-USE_SR_FILTER      = False   # Disabled
+USE_SR_FILTER      = True    # True = active | False = disabled
 SR_BLOCK_PCT       = 0.003   # 0.3% proximity — within 72 pts on Nifty 24000
+
+# Which SR methods to use — enable/disable independently
+SR_USE_PDH_PDL     = False   # PDH/PDL — good but blocks many valid breakouts
+SR_USE_PIVOTS      = False   # Pivot R1/R2/S1/S2 — same issue
+SR_USE_ROUND       = False   # Round numbers — too frequent on 50-pt grid
+SR_USE_ALGO_OI     = True    # Algo SZ/RZ from OI — major institutional levels only
 
 # ── 9/15 EMA Second Signal Source ────────────────────────────────────────────
 # Both HalfTrend AND 9/15 EMA must agree before an order is placed.
@@ -698,7 +710,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Set False to completely stop trading that instrument.
 # The loop stays running (no restart needed) — just skips all entries.
 # Flip back to True to resume immediately on next cycle.
-ENABLE_NIFTY      = False    # ✅ NIFTY trading active
+ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
 ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
@@ -1307,6 +1319,132 @@ def get_ml_signal():
 # Returns (passed: bool, reason: str)
 # Call this right before order placement in nifty_loop / crude_loop.
 # ──────────────────────────────────────────────────────────────────────────────
+_algo_sz_rz_cache = {}   # {instrument: (timestamp, rz_strike, sz_strike)}
+_ALGO_OI_TTL      = 1800  # 30 min cache — OI doesn't change rapidly
+
+
+def _get_algo_sz_rz(instrument, cur_price):
+    """
+    Returns (algo_rz, algo_sz) — the strike prices with highest CALL OI
+    and highest PUT OI for the current expiry.
+
+    algo_rz = max CALL OI strike = institutional resistance (Algo Resistance Zone)
+    algo_sz = max PUT  OI strike = institutional support    (Algo Support Zone)
+
+    Uses Kite's quote API to get OI for all strikes near ATM.
+    Cached for 30 minutes to avoid excessive API calls.
+    """
+    global _algo_sz_rz_cache
+
+    # Check cache
+    _cached = _algo_sz_rz_cache.get(instrument)
+    if _cached and (time.time() - _cached[0]) < _ALGO_OI_TTL:
+        return _cached[1], _cached[2]
+
+    try:
+        # Determine exchange and index name
+        if instrument == "NIFTY":
+            _exchange  = "NFO"
+            _name      = "NIFTY"
+            _step      = 50
+            _atm_range = 10   # scan 10 strikes each side of ATM
+        elif instrument == "BANKNIFTY":
+            _exchange  = "NFO"
+            _name      = "BANKNIFTY"
+            _step      = 100
+            _atm_range = 10
+        elif instrument == "SENSEX":
+            _exchange  = "BFO"
+            _name      = "SENSEX"
+            _step      = 100
+            _atm_range = 10
+        else:
+            return None, None   # CRUDE options OI not relevant
+
+        # Get current expiry instruments
+        _instruments = kite.instruments(_exchange)
+
+        # Find nearest expiry
+        from datetime import date as _date
+        _today = _date.today()
+        _expiries = sorted(set(
+            i["expiry"] for i in _instruments
+            if i["name"] == _name
+            and i["instrument_type"] in ("CE", "PE")
+            and i["expiry"] >= _today
+        ))
+        if not _expiries:
+            return None, None
+        _near_expiry = _expiries[0]
+
+        # Get ATM strike
+        _atm = round(cur_price / _step) * _step
+
+        # Build list of strikes to check (ATM ± range)
+        _strikes = [_atm + (_step * i)
+                    for i in range(-_atm_range, _atm_range + 1)]
+
+        # Filter instruments for near expiry and our strikes
+        _opt = [
+            i for i in _instruments
+            if i["name"] == _name
+            and i["expiry"] == _near_expiry
+            and i["strike"] in _strikes
+            and i["instrument_type"] in ("CE", "PE")
+        ]
+
+        if not _opt:
+            return None, None
+
+        # Fetch OI via quote API (batch)
+        _symbols = [f"{_exchange}:{i['tradingsymbol']}" for i in _opt]
+
+        # Quote in batches of 100 (Kite limit)
+        _quotes = {}
+        for _i in range(0, len(_symbols), 100):
+            _batch = _symbols[_i:_i+100]
+            try:
+                _q = kite.quote(_batch)
+                _quotes.update(_q)
+            except Exception:
+                pass
+
+        # Find max CALL OI and max PUT OI strikes
+        _call_oi = {}  # strike → OI
+        _put_oi  = {}  # strike → OI
+
+        for _inst in _opt:
+            _sym = f"{_exchange}:{_inst['tradingsymbol']}"
+            _q   = _quotes.get(_sym, {})
+            _oi  = _q.get("oi", 0) or 0
+            _strike = _inst["strike"]
+            if _inst["instrument_type"] == "CE":
+                _call_oi[_strike] = _call_oi.get(_strike, 0) + _oi
+            else:
+                _put_oi[_strike]  = _put_oi.get(_strike, 0) + _oi
+
+        if not _call_oi or not _put_oi:
+            return None, None
+
+        # Max CALL OI → Algo RZ (resistance)
+        _algo_rz = max(_call_oi, key=_call_oi.get)
+        # Max PUT  OI → Algo SZ (support)
+        _algo_sz = max(_put_oi,  key=_put_oi.get)
+
+        _top_call = sorted(_call_oi.items(), key=lambda x: -x[1])[:3]
+        _top_put  = sorted(_put_oi.items(),  key=lambda x: -x[1])[:3]
+        print(f"📊 OI [{instrument}] expiry={_near_expiry} | "
+              f"Top CALL OI: {_top_call} | Top PUT OI: {_top_put}", flush=True)
+
+        # Cache result
+        _algo_sz_rz_cache[instrument] = (time.time(), _algo_rz, _algo_sz)
+        return float(_algo_rz), float(_algo_sz)
+
+    except Exception as _e:
+        print(f"⚠️ _get_algo_sz_rz({instrument}): {_e}", flush=True)
+        return None, None
+
+
 def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     """
     All entry filters — each independently controlled by a True/False flag.
@@ -1578,30 +1716,46 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
             support_levels    = []
 
             # PDH → resistance, PDL → support
-            if pdh and pdh > cur_close:
-                resistance_levels.append(("PDH", pdh))
-            if pdl and pdl < cur_close:
-                support_levels.append(("PDL", pdl))
-            if pdc:
-                if pdc > cur_close:
-                    resistance_levels.append(("PDC", pdc))
-                elif pdc < cur_close:
-                    support_levels.append(("PDC", pdc))
+            if SR_USE_PDH_PDL:
+                if pdh and pdh > cur_close:
+                    resistance_levels.append(("PDH", pdh))
+                if pdl and pdl < cur_close:
+                    support_levels.append(("PDL", pdl))
+                if pdc:
+                    if pdc > cur_close:
+                        resistance_levels.append(("PDC", pdc))
+                    elif pdc < cur_close:
+                        support_levels.append(("PDC", pdc))
 
-            # Pivot levels → resistance if above, support if below
-            for _name, _val in [("R1", r1), ("R2", r2), ("S1", s1),
-                                 ("S2", s2), ("Pivot", pivot)]:
-                if _val is None: continue
-                if _val > cur_close:
-                    resistance_levels.append((_name, _val))
-                elif _val < cur_close:
-                    support_levels.append((_name, _val))
+            # Pivot levels
+            if SR_USE_PIVOTS:
+                for _name, _val in [("R1", r1), ("R2", r2), ("S1", s1),
+                                     ("S2", s2), ("Pivot", pivot)]:
+                    if _val is None: continue
+                    if _val > cur_close:
+                        resistance_levels.append((_name, _val))
+                    elif _val < cur_close:
+                        support_levels.append((_name, _val))
 
             # Round numbers
-            if _nearest_round_above > cur_close:
-                resistance_levels.append(("Round", _nearest_round_above))
-            if _nearest_round_below < cur_close:
-                support_levels.append(("Round", _nearest_round_below))
+            if SR_USE_ROUND:
+                if _nearest_round_above > cur_close:
+                    resistance_levels.append(("Round", _nearest_round_above))
+                if _nearest_round_below < cur_close:
+                    support_levels.append(("Round", _nearest_round_below))
+
+            # ── Method 4: Algo SZ/RZ — OI-based institutional levels ─────────
+            if SR_USE_ALGO_OI:
+                try:
+                    _oi_res, _oi_sup = _get_algo_sz_rz(instrument, cur_close)
+                    if _oi_res and _oi_res > cur_close:
+                        resistance_levels.append(("AlgoRZ", _oi_res))
+                        print(f"📊 Algo RZ [{instrument}]: ₹{_oi_res:.0f} (max CALL OI strike)", flush=True)
+                    if _oi_sup and _oi_sup < cur_close:
+                        support_levels.append(("AlgoSZ", _oi_sup))
+                        print(f"📊 Algo SZ [{instrument}]: ₹{_oi_sup:.0f} (max PUT OI strike)", flush=True)
+                except Exception as _oi_err:
+                    print(f"⚠️ OI levels error: {_oi_err}", flush=True)
 
             # ── Find nearest levels ───────────────────────────────────────────
             nearest_res = min(resistance_levels, key=lambda x: x[1]) if resistance_levels else None
@@ -3738,7 +3892,8 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     # (old + new after a flip) do not share state.
     exit_done = False
     local_max_profit = 0
-    partial_pnl      = 0.0   # tracks P&L from partial bookings separately
+    partial_pnl      = 0.0
+    _exit_attempted  = False   # prevents profit lock from re-firing after failed exit
 
     full_symbol = f"{exchange}:{symbol}"
     actual_qty    = get_quantity(qty, exchange, instrument)
@@ -3925,7 +4080,8 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
                 print(f"💰 Lock Active → Peak: {local_max_profit:.0f}, Lock: {lock_level:.0f}")
 
-                if current_pnl < lock_level:
+                if current_pnl < lock_level and not _exit_attempted:
+                    _exit_attempted = True   # prevent re-firing every 1.5s
                     _total_pnl = current_pnl + partial_pnl
                     send_message(
                         f"💰 PROFIT LOCK EXIT\n"
@@ -3970,10 +4126,19 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                                 send_message(
                                     f"🚨 CRITICAL: ALL EXITS FAILED — {symbol}\n"
                                     f"Qty: {remaining_qty}\n"
-                                    f"EXIT MANUALLY NOW on Kite!"
+                                    f"EXIT MANUALLY NOW on Kite!\n"
+                                    f"(This alert will not repeat)"
                                 )
-                                # Don't break — keep monitoring and trying
+                                # Don't break — keep monitoring but don't re-alert
                     else:
+                        pnl = current_pnl
+                        break
+
+                elif current_pnl < lock_level and _exit_attempted and not exit_done:
+                    # Exit was attempted but failed — keep trying silently without alerting
+                    _exit_ok = exit_position(symbol, remaining_qty, exchange)
+                    if _exit_ok:
+                        exit_done = True
                         pnl = current_pnl
                         break
 

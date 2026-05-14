@@ -4537,19 +4537,35 @@ def restore_position_state_from_kite():
         exchange = pos["exchange"]
         signal   = "CALL" if sym.endswith("CE") else "PUT"
 
-        # Get current LTP as approximate entry price
+        # ── Get actual entry price from Kite positions (average_price) ────────
+        # NEVER use LTP as entry — option price changes dramatically intraday.
+        # Kite's positions["net"] contains the actual average buy price.
+        entry_price = 0.0
         try:
-            _ex = "BFO" if instrument == "SENSEX" else ("MCX" if instrument == "CRUDE" else "NFO")
-            _ltp_data = kite.ltp(f"{_ex}:{sym}")
-            entry_price = float(_ltp_data[f"{_ex}:{sym}"]["last_price"])
-        except Exception:
+            _positions = kite.positions()
+            _net = _positions.get("net", [])
+            for _p in _net:
+                if _p.get("tradingsymbol") == sym:
+                    _avg = float(_p.get("average_price", 0))
+                    if _avg > 0:
+                        entry_price = _avg
+                        qty = abs(int(_p.get("quantity", qty)))
+                    break
+            if entry_price == 0.0:
+                # Fallback to LTP only if average_price not found
+                _ex = "BFO" if instrument == "SENSEX" else ("MCX" if instrument == "CRUDE" else "NFO")
+                _ltp_data = kite.ltp(f"{_ex}:{sym}")
+                entry_price = float(_ltp_data[f"{_ex}:{sym}"]["last_price"])
+                print(f"⚠️ average_price not found — using LTP ₹{entry_price:.1f} as fallback", flush=True)
+        except Exception as _ep_err:
+            print(f"⚠️ Could not get entry price: {_ep_err}", flush=True)
             entry_price = 0.0
 
-        print(f"⚠️ Existing Kite position found on startup: {instrument} {sym} qty={qty} entry≈₹{entry_price:.1f}", flush=True)
+        print(f"⚠️ Existing Kite position found on startup: {instrument} {sym} qty={qty} avg_entry=₹{entry_price:.1f}", flush=True)
         send_message(
             f"⚠️ EXISTING POSITION DETECTED ON STARTUP\n"
             f"📌 {instrument}: {sym}  qty={qty}\n"
-            f"💰 Entry≈₹{entry_price:.1f}\n"
+            f"💰 Avg Entry: ₹{entry_price:.1f}\n"
             f"🔄 Restoring — manage_trade started for SL/profit-lock/exit"
         )
 

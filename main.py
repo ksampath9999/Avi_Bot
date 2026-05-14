@@ -698,7 +698,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Set False to completely stop trading that instrument.
 # The loop stays running (no restart needed) — just skips all entries.
 # Flip back to True to resume immediately on next cycle.
-ENABLE_NIFTY      = False    # ✅ NIFTY trading active
+ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
 ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
@@ -3936,14 +3936,46 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"⏳ Next entry in 5 min"
                     )
                     print("💰 Profit lock triggered — exit")
-                    # Record timestamp — loop will wait 15 min before next entry
                     _profit_lock_exit_time[instrument] = time.time()
 
                     if not exit_done:
-                        exit_position(symbol, remaining_qty, exchange)
-
-                    pnl = current_pnl
-                    break
+                        _exit_ok = exit_position(symbol, remaining_qty, exchange)
+                        if _exit_ok:
+                            exit_done = True
+                            pnl = current_pnl
+                            break
+                        else:
+                            # Exit failed — try market order as last resort
+                            print(f"⚠️ Profit lock exit failed — trying MARKET order", flush=True)
+                            try:
+                                kite.place_order(
+                                    variety=kite.VARIETY_REGULAR,
+                                    exchange=exchange,
+                                    tradingsymbol=symbol,
+                                    transaction_type=kite.TRANSACTION_TYPE_SELL,
+                                    quantity=remaining_qty,
+                                    order_type=kite.ORDER_TYPE_MARKET,
+                                    product=kite.PRODUCT_MIS,
+                                )
+                                send_message(
+                                    f"🚨 MARKET ORDER PLACED — {symbol}\n"
+                                    f"Limit exit failed — used MARKET order\n"
+                                    f"Qty: {remaining_qty} | Check Kite for fill price"
+                                )
+                                exit_done = True
+                                pnl = current_pnl
+                                break
+                            except Exception as _me:
+                                print(f"❌ Market order also failed: {_me}", flush=True)
+                                send_message(
+                                    f"🚨 CRITICAL: ALL EXITS FAILED — {symbol}\n"
+                                    f"Qty: {remaining_qty}\n"
+                                    f"EXIT MANUALLY NOW on Kite!"
+                                )
+                                # Don't break — keep monitoring and trying
+                    else:
+                        pnl = current_pnl
+                        break
 
             # ===============================
             # 🧠 ATR BASED TRAILING
@@ -4036,8 +4068,25 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"📊 HT={last_exit['ht']:.2f}"
                     )
                     if not exit_done:
-                        exit_position(symbol, remaining_qty, exchange)
-                        exit_done = True
+                        _exit_ok = exit_position(symbol, remaining_qty, exchange)
+                        if _exit_ok:
+                            exit_done = True
+                        else:
+                            print(f"⚠️ HT flip exit failed — trying market order", flush=True)
+                            try:
+                                kite.place_order(
+                                    variety=kite.VARIETY_REGULAR,
+                                    exchange=exchange,
+                                    tradingsymbol=symbol,
+                                    transaction_type=kite.TRANSACTION_TYPE_SELL,
+                                    quantity=remaining_qty,
+                                    order_type=kite.ORDER_TYPE_MARKET,
+                                    product=kite.PRODUCT_MIS,
+                                )
+                                exit_done = True
+                            except Exception as _me:
+                                print(f"❌ Market order failed: {_me}", flush=True)
+                                send_message(f"🚨 EXIT MANUALLY NOW — {symbol} qty={remaining_qty}")
                     pnl = current_pnl
                     break
 

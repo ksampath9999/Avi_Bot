@@ -2774,12 +2774,15 @@ Current situation:
 Last {len(_trade_summary)} trades for {instrument}:
 {chr(10).join(_trade_summary) if _trade_summary else "  No recent trades"}
 
-STRICT RULES — these override everything else:
-1. If last 3 trades are ALL losses → confidence must be below 50 (strategy not working today)
+STRICT RULES — follow EXACTLY, do not add any rules of your own:
+1. If last 3 trades are ALL losses → confidence must be below 50
 2. If last 2 trades are consecutive losses → reduce confidence by at least 20
-3. If time is after 3:10 PM IST → confidence must be below 50 (only 10 min before force-close, too risky)
-4. If Hull band < 0.02% → confidence must be below 40 (trend not confirmed)
-5. Even a very strong technical signal cannot overcome 3 consecutive losses
+3. If time is after 3:10 PM IST → confidence must be below 50 (force-close at 3:20 PM)
+4. If Hull band < 0.02% → confidence must be below 40
+5. Strong signal cannot overcome 3 consecutive losses
+6. DO NOT apply any time-of-day penalties between 9:20 AM and 3:10 PM
+7. DO NOT reduce confidence based on it being afternoon — only rules 1-5 apply
+8. Hull band above 0.03% is acceptable — do not penalise it unless below 0.02%
 
 Based on ALL factors especially recent trade history, should the bot enter a {signal} trade on {instrument}?
 
@@ -9935,6 +9938,9 @@ if __name__ == "__main__":
     else:
         print("⚠️ CRUDE LOOP SKIPPED")
 
+    _claude_filter_cache.clear()
+    _claude_flip_counter.clear()
+    print("🤖 Claude filter cache cleared on startup", flush=True)
     print("🚀 Trading engine started")
 
     # -----------------------------

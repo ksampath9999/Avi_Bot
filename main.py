@@ -712,7 +712,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Set False to completely stop trading that instrument.
 # The loop stays running (no restart needed) — just skips all entries.
 # Flip back to True to resume immediately on next cycle.
-ENABLE_NIFTY      = False    # ✅ NIFTY trading active
+ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
 ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
@@ -3725,15 +3725,22 @@ def find_option(signal, instrument):
         return best["symbol"], best["price"], lot, exchange
 
     # =====================================
+    # =====================================
     # FALLBACK SEARCH
     # =====================================
     print("⚠️ No ideal candidate — fallback")
 
+    # Get live balance for actual affordability check
+    try:
+        _margin = kite.margins()
+        _seg    = _margin.get("equity", {}).get("available", {})
+        _live   = float(_seg.get("live_balance", 0) or 0)
+    except Exception:
+        _live = balance
+
     fallback = []
 
-    # FIX: same proximity-sort fix as primary search
     for i in opts_sorted[:20]:
-
         try:
             strike = int(i["strike"])
         except:
@@ -3745,9 +3752,13 @@ def find_option(signal, instrument):
         if p is None or p <= 0:
             continue
 
-        # Fallback also respects min_price (CRUDE ≥ ₹10, NIFTY ≥ ₹20)
-        if min_price <= p <= max_price * 1.8:
-            # Liquidity check for fallback too
+        # Fallback: strict max_price cap + actual affordability check
+        _lot_size = {"SENSEX": 20, "BANKNIFTY": 30, "CRUDE": 100}.get(instrument, 65)
+        _cost = p * _lot_size * 1.05   # 5% buffer
+        _affordable = _cost <= _live   # must fit in live balance
+
+        if min_price <= p <= max_price and _affordable:
+            # Liquidity check
             _liquid = True
             try:
                 q = kite.quote([sym])

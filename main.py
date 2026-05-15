@@ -4243,13 +4243,14 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                                     tradingsymbol=symbol,
                                     transaction_type=kite.TRANSACTION_TYPE_SELL,
                                     quantity=remaining_qty,
-                                    order_type=kite.ORDER_TYPE_MARKET,
+                                    order_type=kite.ORDER_TYPE_LIMIT,
+                                    price=round(ltp * 0.94, 1),   # 6% below LTP — aggressive fill
                                     product=kite.PRODUCT_MIS,
                                 )
                                 send_message(
-                                    f"🚨 MARKET ORDER PLACED — {symbol}\n"
-                                    f"Limit exit failed — used MARKET order\n"
-                                    f"Qty: {remaining_qty} | Check Kite for fill price"
+                                    f"🚨 AGGRESSIVE LIMIT EXIT — {symbol}\n"
+                                    f"Price: ₹{round(ltp * 0.94, 1)} (6% below LTP)\n"
+                                    f"Qty: {remaining_qty} | Check Kite for fill"
                                 )
                                 exit_done = True
                                 pnl = current_pnl
@@ -4379,16 +4380,19 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                             setattr(manage_trade, f"_ht_flip_{symbol}", False)
                             break
                         else:
-                            # Exit failed — try market order once
-                            print(f"⚠️ HT flip exit failed — trying market order", flush=True)
+                            # Exit failed — try aggressive limit as last resort
+                            print(f"⚠️ HT flip exit failed — trying aggressive limit order", flush=True)
                             try:
+                                _ltp_now = safe_ltp(f"{exchange}:{symbol}") or ltp
+                                _aggressive_price = max(0.5, round(_ltp_now * 0.94, 1))
                                 kite.place_order(
                                     variety=kite.VARIETY_REGULAR,
                                     exchange=exchange,
                                     tradingsymbol=symbol,
                                     transaction_type=kite.TRANSACTION_TYPE_SELL,
                                     quantity=remaining_qty,
-                                    order_type=kite.ORDER_TYPE_MARKET,
+                                    order_type=kite.ORDER_TYPE_LIMIT,
+                                    price=_aggressive_price,
                                     product=kite.PRODUCT_MIS,
                                 )
                                 exit_done = True
@@ -4900,9 +4904,17 @@ def exit_position(symbol, qty, exchange):
         slippage_pcts = [0.995, 0.990, 0.982, 0.970]   # increasingly aggressive
 
         for attempt, slip in enumerate(slippage_pcts, 1):
-            exit_price = round(ltp * slip, 1)
+            # For very cheap options (< ₹15), use bigger absolute slippage
+            # % slippage on ₹12 = only ₹0.06 which may be below tick size
+            if ltp < 15:
+                exit_price = max(0.5, round(ltp - (attempt * 0.5), 1))   # drop ₹0.5 per attempt
+            elif ltp < 50:
+                exit_price = max(0.5, round(ltp * slip - 0.5, 1))        # extra ₹0.5 buffer
+            else:
+                exit_price = round(ltp * slip, 1)
+
             if exit_price <= 0:
-                exit_price = 0.5   # minimum valid option price on Kite
+                exit_price = 0.5
 
             print(f"🚪 Exit attempt {attempt}/4 — LIMIT @ ₹{exit_price:.1f}  (LTP={ltp:.1f}, slip={slip})")
 
@@ -6966,24 +6978,27 @@ def get_quantity(lots, exchange, instrument=None):
     
 def get_balance(instrument):
     """
-    Returns the live available cash balance from Kite for the given instrument.
-    NIFTY → equity segment
-    CRUDE → commodity segment
+    Returns available balance from Kite.
+    Uses 'cash' (total deposited) for tier selection so open positions
+    don't push you into a cheaper option tier.
+    live_balance is used only for the margin sufficiency check.
     """
     try:
         margin = kite.margins()
-        if instrument == "NIFTY":
-            seg = margin.get("equity", {}).get("available", {})
-        else:
-            seg = margin.get("equity", {}).get("available", {})
+        seg = margin.get("equity", {}).get("available", {})
 
-        # Kite returns live_balance when intraday, cash otherwise
-        balance = seg.get("live_balance") or seg.get("cash") or 0
-        balance = float(balance)
+        # Use cash (total) for tier selection — live_balance drops when trades are open
+        # which wrongly pushes into cheaper option tiers
+        cash         = float(seg.get("cash", 0) or 0)
+        live_balance = float(seg.get("live_balance", 0) or 0)
+
+        # Use whichever is higher — cash reflects total, live_balance reflects free margin
+        balance = max(cash, live_balance)
 
         if balance <= 0:
-            print(f"⚠️ get_balance: zero or negative balance for {instrument}")
+            print(f"⚠️ get_balance: zero balance for {instrument} — cash={cash} live={live_balance}")
 
+        print(f"💳 Balance [{instrument}]: cash=₹{cash:.0f} live=₹{live_balance:.0f} → using ₹{balance:.0f}", flush=True)
         return balance
 
     except Exception as e:

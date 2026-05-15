@@ -712,7 +712,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Set False to completely stop trading that instrument.
 # The loop stays running (no restart needed) — just skips all entries.
 # Flip back to True to resume immediately on next cycle.
-ENABLE_NIFTY      = False    # ✅ NIFTY trading active
+ENABLE_NIFTY      = True    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
 ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
@@ -2678,7 +2678,8 @@ def auto_tune_scheduler():
 
 USE_CLAUDE_FILTER    = os.environ.get("USE_CLAUDE_FILTER", "false").lower() == "true"
 CLAUDE_MIN_CONFIDENCE = 65   # minimum confidence % to allow trade
-_claude_filter_cache  = {}   # throttle — one call per instrument per 5 min
+_claude_filter_cache  = {}   # throttle — one call per instrument per signal per hour
+_claude_flip_counter  = {}   # {instrument: count} — increments on each HT flip to bust cache
 
 
 def _get_recent_trades(instrument, n=5):
@@ -2714,11 +2715,21 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
         print("⚠️ Claude filter: ANTHROPIC_API_KEY not set — skipping", flush=True)
         return True, "Claude filter: no API key", 100
 
-    # Throttle — one call per instrument per 5 minutes
-    _cache_key = f"{instrument}_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:-1]}"
+    # Cache key — one call per instrument per signal per hour per flip
+    # Flip counter ensures each HT direction change gets a fresh Claude evaluation
+    _flip_n    = _claude_flip_counter.get(instrument, 0)
+    _cache_key = f"{instrument}_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H')}_{_flip_n}"
     if _claude_filter_cache.get(_cache_key):
         cached = _claude_filter_cache[_cache_key]
-        return cached["allowed"], cached["reason"], cached["confidence"]
+        # Expire cached blocks after 30 min — conditions may have improved
+        _age = time.time() - cached.get("cached_at", 0)
+        if _age < 300:   # 5 min cache
+            print(f"🤖 Claude cached [{instrument} {signal}]: {cached['confidence']}% "
+                  f"(blocked {_age/60:.1f} min ago) — {cached['reason']}", flush=True)
+            return cached["allowed"], cached["reason"], cached["confidence"]
+        else:
+            _claude_filter_cache.pop(_cache_key, None)
+            print(f"🤖 Claude cache expired [{instrument}] — calling fresh", flush=True)
 
     try:
         # ── Pre-check: consecutive losses → block without calling Claude ─────
@@ -2809,10 +2820,12 @@ allowed must be true only if confidence >= {CLAUDE_MIN_CONFIDENCE}"""
         allowed    = bool(_data.get("allowed", True))
         reason     = str(_data.get("reason", ""))
 
-        # Cache result
-        _claude_filter_cache[_cache_key] = {
-            "allowed": allowed, "reason": reason, "confidence": confidence
-        }
+        # Only cache BLOCKED results for 5 min — rechecked if conditions improve
+        if not allowed:
+            _claude_filter_cache[_cache_key] = {
+                "allowed": allowed, "reason": reason, "confidence": confidence,
+                "cached_at": time.time()
+            }
 
         print(f"🤖 Claude filter [{instrument} {signal}]: "
               f"confidence={confidence}% allowed={allowed} — {reason}", flush=True)
@@ -4943,6 +4956,7 @@ def exit_position(symbol, qty, exchange):
                 print(f"   Order placed: {order_id}")
             except Exception as oe:
                 print(f"   ⚠️ Order placement failed: {oe}")
+                _last_order_err = str(oe)
                 time.sleep(1)
                 continue
 
@@ -4989,11 +5003,13 @@ def exit_position(symbol, qty, exchange):
 
         # All attempts exhausted
         print(f"❌ Exit FAILED after 4 attempts — {symbol}")
+        _ip_blocked = "not allowed" in str(_last_order_err).lower() if '_last_order_err' in dir() else False
         send_message(
             f"🚨 EXIT FAILED — {symbol}\n"
             f"4 limit order attempts exhausted.\n"
             f"Please exit manually immediately!\n"
-            f"Qty: {exit_qty}  |  Last tried price: ₹{round(ltp * slippage_pcts[-1], 1):.1f}"
+            f"Qty: {exit_qty}  |  Last tried price: ₹{round(ltp * slippage_pcts[-1], 1):.1f}\n"
+            + ("⚠️ IP BLOCKED!\nFix: developers.kite.trade\n→ Profile → IP Whitelist → Delete ALL entries" if _ip_blocked else "")
         )
         return False
 
@@ -5536,6 +5552,11 @@ def nifty_loop():
                         global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_nifty = None
                     _just_flipped_nifty = True
+                    # Increment flip counter — next Claude call gets fresh evaluation
+                    _claude_flip_counter["NIFTY"] = _claude_flip_counter.get("NIFTY", 0) + 1
+                    for _k in list(_claude_filter_cache.keys()):
+                        if _k.startswith("NIFTY_"):
+                            _claude_filter_cache.pop(_k, None)
                     time.sleep(3)
             else:
                 with lock:
@@ -6713,6 +6734,11 @@ def sensex_loop():
                     sensex_loop._carryover_done = None
                     sensex_loop._sig_alerted    = None
                     sensex_loop._just_flipped   = True
+                    # Increment flip counter — next Claude call gets fresh evaluation
+                    _claude_flip_counter["SENSEX"] = _claude_flip_counter.get("SENSEX", 0) + 1
+                    for _k in list(_claude_filter_cache.keys()):
+                        if _k.startswith("SENSEX_"):
+                            _claude_filter_cache.pop(_k, None)
                     time.sleep(3)
 
             # ══════════════════════════════════════════════════════════════

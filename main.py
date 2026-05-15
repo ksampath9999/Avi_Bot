@@ -680,7 +680,9 @@ def daily_profit_target_monitor():
 
 # ── Support & Resistance Filter ───────────────────────────────────────────────
 USE_SR_FILTER      = True    # True = active | False = disabled
-SR_BLOCK_PCT       = 0.003   # 0.3% proximity — within 72 pts on Nifty 24000
+SR_BLOCK_PCT       = 0.003   # 0.3% proximity for PDH/PDL/Pivot (when enabled)
+SR_ALGO_BLOCK_PCT  = 0.001   # 0.1% proximity for Algo SZ/RZ — tighter to avoid blocking valid trades
+                               # 0.1% = ~24 pts on Nifty 24000, ~75 pts on SENSEX 75000
 
 # Which SR methods to use — enable/disable independently
 SR_USE_PDH_PDL     = False   # PDH/PDL — good but blocks many valid breakouts
@@ -1763,28 +1765,38 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 
             _sr_blocked = False
 
-            # CALL near resistance → block
-            if signal == "CALL" and nearest_res:
-                _name, _level = nearest_res
-                dist_pct = (_level - cur_close) / cur_close
-                if dist_pct <= SR_BLOCK_PCT:
-                    _sr_blocked = True
-                    reason = (
-                        f"🧱 SR filter: CALL blocked — price ₹{cur_close:.1f} within "
-                        f"{dist_pct*100:.2f}% of {_name} resistance ₹{_level:.1f} — rejection risk"
-                    )
-                    print(f"🚫 SR BLOCK: {reason}", flush=True)
-                    return False, reason
-
-            # PUT near support → block
+            # PUT near support → block (unless price already broke below it)
             if signal == "PUT" and nearest_sup:
                 _name, _level = nearest_sup
+                _pct = SR_ALGO_BLOCK_PCT if "Algo" in _name else SR_BLOCK_PCT
                 dist_pct = (cur_close - _level) / cur_close
-                if dist_pct <= SR_BLOCK_PCT:
+
+                # Special Algo SZ logic: if price already BELOW AlgoSZ → broken support → allow PUT
+                if "Algo" in _name and cur_close < _level:
+                    print(f"✅ Price broke below {_name} ₹{_level:.0f} — PUT allowed (broken support)", flush=True)
+                elif dist_pct <= _pct:
                     _sr_blocked = True
                     reason = (
                         f"🧱 SR filter: PUT blocked — price ₹{cur_close:.1f} within "
                         f"{dist_pct*100:.2f}% of {_name} support ₹{_level:.1f} — bounce risk"
+                    )
+                    print(f"🚫 SR BLOCK: {reason}", flush=True)
+                    return False, reason
+
+            # CALL near resistance → block (unless price already broke above it)
+            if signal == "CALL" and nearest_res:
+                _name, _level = nearest_res
+                _pct = SR_ALGO_BLOCK_PCT if "Algo" in _name else SR_BLOCK_PCT
+                dist_pct = (_level - cur_close) / cur_close
+
+                # Special Algo RZ logic: if price already ABOVE AlgoRZ → broken resistance → allow CALL
+                if "Algo" in _name and cur_close > _level:
+                    print(f"✅ Price broke above {_name} ₹{_level:.0f} — CALL allowed (broken resistance)", flush=True)
+                elif dist_pct <= _pct:
+                    _sr_blocked = True
+                    reason = (
+                        f"🧱 SR filter: CALL blocked — price ₹{cur_close:.1f} within "
+                        f"{dist_pct*100:.2f}% of {_name} resistance ₹{_level:.1f} — rejection risk"
                     )
                     print(f"🚫 SR BLOCK: {reason}", flush=True)
                     return False, reason
@@ -1797,22 +1809,129 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _sr_e:
             _sr_str = f"SR=err({_sr_e})"
 
-    # ── Approach 2: Claude API confidence filter ─────────────────────────────
+    # ── Candle Pattern Confirmation ───────────────────────────────────────────
+    # Analyses the last closed candle (iloc[-2]) for pattern confirmation.
+    # Patterns that CONFIRM the signal → boost confidence
+    # Patterns that CONTRADICT the signal → block entry
+    USE_CANDLE_PATTERN_FILTER = True   # set False to disable
+    _candle_str = "CP=off"
+
+    if USE_CANDLE_PATTERN_FILTER and df_15m is not None and len(df_15m) >= 4:
+        try:
+            _bar  = df_15m.iloc[-2]   # last closed candle
+            _prev = df_15m.iloc[-3]   # candle before that
+
+            _o = float(_bar["open"])
+            _h = float(_bar["high"])
+            _l = float(_bar["low"])
+            _c = float(_bar["close"])
+
+            _range  = _h - _l
+            _body   = abs(_c - _o)
+            _upper  = _h - max(_c, _o)
+            _lower  = min(_c, _o) - _l
+
+            _is_green = _c > _o
+            _is_red   = _c < _o
+
+            # Classify pattern
+            _pattern = "NEUTRAL"
+            _pattern_bias = None   # "BULLISH" or "BEARISH"
+
+            if _range > 0:
+                _body_pct  = _body  / _range
+                _upper_pct = _upper / _range
+                _lower_pct = _lower / _range
+
+                # ── Bearish patterns ──────────────────────────────────────────
+                # Shooting Star: small body at bottom, long upper wick
+                if _upper_pct > 0.55 and _body_pct < 0.3 and _is_red:
+                    _pattern = "ShootingStar"
+                    _pattern_bias = "BEARISH"
+
+                # Bearish Marubozu: big red body, tiny wicks
+                elif _is_red and _body_pct > 0.80:
+                    _pattern = "BearishMarubozu"
+                    _pattern_bias = "BEARISH"
+
+                # Bearish Engulfing: red body engulfs previous green
+                elif (_is_red and float(_prev["close"]) > float(_prev["open"])
+                      and _o > float(_prev["close"])
+                      and _c < float(_prev["open"])):
+                    _pattern = "BearishEngulfing"
+                    _pattern_bias = "BEARISH"
+
+                # ── Bullish patterns ──────────────────────────────────────────
+                # Hammer: small body at top, long lower wick
+                elif _lower_pct > 0.55 and _body_pct < 0.3 and _is_green:
+                    _pattern = "Hammer"
+                    _pattern_bias = "BULLISH"
+
+                # Bullish Marubozu: big green body, tiny wicks
+                elif _is_green and _body_pct > 0.80:
+                    _pattern = "BullishMarubozu"
+                    _pattern_bias = "BULLISH"
+
+                # Bullish Engulfing: green body engulfs previous red
+                elif (_is_green and float(_prev["close"]) < float(_prev["open"])
+                      and _o < float(_prev["close"])
+                      and _c > float(_prev["open"])):
+                    _pattern = "BullishEngulfing"
+                    _pattern_bias = "BULLISH"
+
+                # Doji: open ≈ close, body very small
+                elif _body_pct < 0.1:
+                    _pattern = "Doji"
+                    _pattern_bias = None   # neutral — no block
+
+                # Inside Bar: current H/L inside previous H/L
+                elif (_h <= float(_prev["high"]) and _l >= float(_prev["low"])):
+                    _pattern = "InsideBar"
+                    _pattern_bias = None   # continuation — no block
+
+            # ── Decision ─────────────────────────────────────────────────────
+            if _pattern_bias is not None:
+                _signal_bias = "BULLISH" if signal == "CALL" else "BEARISH"
+
+                if _pattern_bias == _signal_bias:
+                    # Pattern CONFIRMS signal → good entry
+                    _candle_str = f"CP=✅{_pattern}({_pattern_bias})"
+                    print(f"🕯️ Candle pattern CONFIRMS {signal}: {_pattern}", flush=True)
+                else:
+                    # Pattern CONTRADICTS signal → block
+                    _candle_str = f"CP=❌{_pattern}({_pattern_bias}vs{signal})"
+                    reason = (
+                        f"🕯️ Candle pattern contradicts signal — "
+                        f"{_pattern} ({_pattern_bias}) vs {signal} entry"
+                    )
+                    print(f"🚫 CANDLE BLOCK: {reason}", flush=True)
+                    return False, reason
+            else:
+                _candle_str = f"CP={_pattern}"
+
+        except Exception as _cp_e:
+            _candle_str = f"CP=err({_cp_e})"
     _claude_str = "Claude=off"
-    if USE_CLAUDE_FILTER and df_15m is not None:
+    if not USE_CLAUDE_FILTER:
+        _claude_str = "Claude=off(set USE_CLAUDE_FILTER=true in Railway)"
+    elif not os.environ.get("ANTHROPIC_API_KEY", ""):
+        _claude_str = "Claude=no-key"
+    elif df_15m is not None:
         try:
             _ht_df = kwargs.get("ht_df")
             _band  = kwargs.get("hull_band_pct", 0)
-            if _ht_df is not None:
+            if _ht_df is None:
+                _claude_str = "Claude=no-ht-df"
+            else:
                 _ok, _reason, _conf = claude_trade_filter(
                     signal, instrument, df_15m, _ht_df, _band)
                 _claude_str = f"Claude={_conf}%"
                 if not _ok:
                     return False, f"🤖 Claude filter: {_reason} (confidence={_conf}%)"
         except Exception as _ce:
-            _claude_str = f"Claude=err"
+            _claude_str = f"Claude=err({_ce})"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_sr_str} | {_claude_str}"
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_sr_str} | {_candle_str} | {_claude_str}"
 
 
 
@@ -3391,22 +3510,22 @@ def find_option(signal, instrument):
             max_price = 600        # ₹600 × 15 = ₹9,000 per lot
     elif instrument == "SENSEX":
         # SENSEX lot = 20. Strikes move in ₹100 steps.
-        # SENSEX ~75,000-80,000. ATM option ~₹100-500. Lot value = premium × 20.
+        # SENSEX ~75,000. ATM option ~₹100-500. Lot value = premium × 20.
         if balance <= 5000:
-            strike_shift = 3       # ₹300 OTM
-            max_price = 80         # ₹80  × 20 = ₹1,600 per lot
+            strike_shift = 2       # 200 OTM (was 300 — too deep, no candidates)
+            max_price = 120        # ₹120 × 20 = ₹2,400 per lot (was 80 — too tight)
         elif balance <= 10000:
             strike_shift = 2
-            max_price = 130        # ₹130 × 20 = ₹2,600 per lot
+            max_price = 180        # ₹180 × 20 = ₹3,600 per lot
         elif balance <= 20000:
-            strike_shift = 2
-            max_price = 200        # ₹200 × 20 = ₹4,000 per lot
+            strike_shift = 1
+            max_price = 250        # ₹250 × 20 = ₹5,000 per lot
         elif balance <= 35000:
             strike_shift = 1
-            max_price = 300        # ₹300 × 20 = ₹6,000 per lot
+            max_price = 350        # ₹350 × 20 = ₹7,000 per lot
         else:
             strike_shift = 1
-            max_price = 450        # ₹450 × 20 = ₹9,000 per lot
+            max_price = 500        # ₹500 × 20 = ₹10,000 per lot
     else:
         # NIFTY — lot size 15 (updated Apr 2025)
         # 1 lot value = premium * 65
@@ -5371,7 +5490,9 @@ def nifty_loop():
             # ══════════════════════════════════════════════════════════════
             _filter_ok, _filter_reason = apply_entry_filters(
                 signal, "NIFTY", cached_nifty_df, config.NIFTY_TOKEN,
-                is_flip_reentry=_just_flipped_nifty)
+                is_flip_reentry=_just_flipped_nifty,
+                ht_df=cached_nifty_ht,
+                hull_band_pct=get_hull_signal(cached_nifty_df)[3] or 0)
 
             if not _filter_ok:
                 print(f"🚫 NIFTY entry blocked — {_filter_reason}", flush=True)
@@ -5713,7 +5834,9 @@ def crude_loop():
             crude_loop._just_flipped = False
             _filter_ok, _filter_reason = apply_entry_filters(
                 signal, "CRUDE", cached_crude_15m, CRUDE_TOKEN,
-                is_flip_reentry=_just_flipped_crude)
+                is_flip_reentry=_just_flipped_crude,
+                ht_df=cached_crude_ht,
+                hull_band_pct=get_hull_signal(cached_crude_15m)[3] or 0)
 
             if not _filter_ok:
                 print(f"🚫 CRUDE entry blocked — {_filter_reason}", flush=True)
@@ -6117,7 +6240,9 @@ def banknifty_loop():
             banknifty_loop._just_flipped = False
             _filter_ok, _filter_reason = apply_entry_filters(
                 signal, "BANKNIFTY", cached_banknifty_df, BANKNIFTY_TOKEN,
-                is_flip_reentry=_just_flipped_bn)
+                is_flip_reentry=_just_flipped_bn,
+                ht_df=cached_banknifty_ht,
+                hull_band_pct=get_hull_signal(cached_banknifty_df)[3] or 0)
 
             if not _filter_ok:
                 print(f"🚫 BANKNIFTY entry blocked — {_filter_reason}", flush=True)
@@ -6539,7 +6664,9 @@ def sensex_loop():
             sensex_loop._just_flipped = False
             _filter_ok, _filter_reason = apply_entry_filters(
                 signal, "SENSEX", cached_sensex_df, SENSEX_TOKEN,
-                is_flip_reentry=_just_flipped_sx)
+                is_flip_reentry=_just_flipped_sx,
+                ht_df=cached_sensex_ht,
+                hull_band_pct=get_hull_signal(cached_sensex_df)[3] or 0)
 
             if not _filter_ok:
                 print(f"🚫 SENSEX entry blocked — {_filter_reason}", flush=True)

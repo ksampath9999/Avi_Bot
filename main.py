@@ -1,11 +1,16 @@
 import requests
 import time
-import datetime
 import pytz
 import pandas as pd
 import threading
 from kiteconnect import KiteConnect
 import config
+import csv
+import os
+import json
+import re
+import pyotp
+from datetime import datetime, timedelta
 from telegram_bot import send_message as _raw_send_message
 
 def send_message(text):
@@ -20,12 +25,6 @@ def send_message(text):
         _raw_send_message(safe)
     except Exception as _tg_err:
         print(f"⚠️ Telegram send failed: {_tg_err}", flush=True)
-import csv
-import os
-import json
-import re
-import pyotp
-from datetime import datetime, timedelta
 
 # ── FIX: CSV header matches log_trade_full() column order exactly ──
 if not os.path.exists("trade_log.csv"):
@@ -599,7 +598,7 @@ def daily_profit_target_monitor():
 
             # Calculate combined P&L
             _combined = (nifty_daily_pnl + banknifty_daily_pnl +
-                         sensex_daily_pnl + crude_daily_pnl)
+                         finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
 
             if _combined < DAILY_PROFIT_TARGET:
                 continue
@@ -613,6 +612,7 @@ def daily_profit_target_monitor():
             for _inst, _pos, _token_flag in [
                 ("NIFTY",     nifty_position,     nifty_trade_active),
                 ("BANKNIFTY", banknifty_position,  banknifty_trade_active),
+                ("FINNIFTY",  finnifty_position,   finnifty_trade_active),
                 ("SENSEX",    sensex_position,     sensex_trade_active),
                 ("CRUDE",     crude_position,      crude_trade_active),
             ]:
@@ -651,6 +651,9 @@ def daily_profit_target_monitor():
                         elif _inst == "BANKNIFTY":
                             banknifty_trade_active = False
                             last_executed_signal_banknifty = None
+                        elif _inst == "FINNIFTY":
+                            finnifty_trade_active = False
+                            last_executed_signal_finnifty = None
                         elif _inst == "SENSEX":
                             sensex_trade_active = False
                             last_executed_signal_sensex = None
@@ -660,7 +663,7 @@ def daily_profit_target_monitor():
 
             with lock:
                 global_trade_active = (nifty_trade_active or banknifty_trade_active or
-                                       sensex_trade_active or crude_trade_active)
+                                       finnifty_trade_active or sensex_trade_active or crude_trade_active)
 
             _exit_summary = "\n".join(_exited) if _exited else "No active positions"
             send_message(
@@ -695,7 +698,7 @@ SR_USE_ALGO_OI     = True    # Algo SZ/RZ from OI — major institutional levels
 # Applies to both NIFTY and CRUDE on 15-min chart.
 # Set False to disable and trade on HalfTrend signal alone.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_EMA_FILTER     = False   # ✅ ACTIVE — 9/15 EMA must confirm HalfTrend signal
+USE_EMA_FILTER     = False   # OFF — disabled
 
 USE_MTF_FILTER     = False  # 1-hour HalfTrend confirmation (off — HalfTrend already
                             # handles direction; ADX handles the real failure mode)
@@ -707,18 +710,19 @@ VIX_MAX            = 22     # (used only when USE_VIX_FILTER = True)
 USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 
 # ── Instrument Enable / Disable ───────────────────────────────────────────────
-# Set False to completely stop trading that instrument.
-# The loop stays running (no restart needed) — just skips all entries.
-# Flip back to True to resume immediately on next cycle.
-ENABLE_NIFTY      = True    # ✅ NIFTY trading active
-ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
-ENABLE_SENSEX     = True    # ✅ SENSEX trading active
-ENABLE_CRUDE      = False   # ✅ CRUDE trading active
-ENABLE_SWING      = False    # ✅ Swing stock trading active
+# Control each instrument via Railway Variables — no code change needed.
+# Default: NIFTY and SENSEX on, rest off.
+ENABLE_NIFTY      = os.environ.get("ENABLE_NIFTY",      "true").lower()  == "true"
+ENABLE_BANKNIFTY  = os.environ.get("ENABLE_BANKNIFTY",  "false").lower() == "true"
+ENABLE_FINNIFTY   = os.environ.get("ENABLE_FINNIFTY",   "false").lower() == "true"
+ENABLE_SENSEX     = os.environ.get("ENABLE_SENSEX",     "true").lower()  == "true"
+ENABLE_CRUDE      = os.environ.get("ENABLE_CRUDE",      "false").lower() == "true"
+ENABLE_SWING      = os.environ.get("ENABLE_SWING",      "false").lower() == "true"
 
 # ── Daily Trade Limits ────────────────────────────────────────────────────────
 MAX_NIFTY_TRADES_PER_DAY      = 4   # NIFTY:     max 4 trades/day
 MAX_BANKNIFTY_TRADES_PER_DAY  = 4   # BANKNIFTY: max 4 trades/day
+MAX_FINNIFTY_TRADES_PER_DAY   = 4   # FINNIFTY:  max 4 trades/day
 MAX_SENSEX_TRADES_PER_DAY     = 4   # SENSEX:    max 4 trades/day
 MAX_CRUDE_TRADES_PER_DAY      = 3   # CRUDE:     max 3 trades/day
 
@@ -849,6 +853,7 @@ last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
 BANKNIFTY_TOKEN = getattr(config, "BANKNIFTY_TOKEN", None)
 SENSEX_TOKEN    = getattr(config, "SENSEX_TOKEN",    None)
+FINNIFTY_TOKEN  = getattr(config, "FINNIFTY_TOKEN",  None)
 last_log_time = 0
 last_running_signal = None
 performance_log = []
@@ -918,6 +923,15 @@ banknifty_trade_active = False
 last_executed_signal_banknifty = None
 last_exit_time_banknifty = 0
 
+finnifty_position    = {"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False}
+finnifty_trade_active  = False
+last_executed_signal_finnifty = None
+last_exit_time_finnifty = 0
+finnifty_daily_pnl   = 0
+finnifty_daily_wins  = 0
+finnifty_daily_losses = 0
+finnifty_trade_count = 0
+
 sensex_position      = {"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False}
 sensex_trade_active  = False
 last_executed_signal_sensex = None
@@ -927,6 +941,10 @@ last_exit_time_sensex = 0
 last_fetch_banknifty = 0
 cached_banknifty_df  = None
 cached_banknifty_ht  = None
+
+last_fetch_finnifty  = 0
+cached_finnifty_df   = None
+cached_finnifty_ht   = None
 
 last_fetch_sensex    = 0
 cached_sensex_df     = None
@@ -954,6 +972,7 @@ _screener_refresh_date    = None          # date object — re-fetches once per 
 # Each flag flips to True after the first "disabled" print — never prints again.
 _crude_disabled_logged    = False
 _banknifty_disabled_logged = False
+_finnifty_disabled_logged  = False
 _sensex_disabled_logged   = False
 
 # ── Insufficient balance alert rate-limiter ───────────────────────────────────
@@ -1329,11 +1348,16 @@ def _get_algo_sz_rz(instrument, cur_price):
             _exchange  = "NFO"
             _name      = "NIFTY"
             _step      = 50
-            _atm_range = 10   # scan 10 strikes each side of ATM
+            _atm_range = 10
         elif instrument == "BANKNIFTY":
             _exchange  = "NFO"
             _name      = "BANKNIFTY"
             _step      = 100
+            _atm_range = 10
+        elif instrument == "FINNIFTY":
+            _exchange  = "NFO"
+            _name      = "FINNIFTY"
+            _step      = 50
             _atm_range = 10
         elif instrument == "SENSEX":
             _exchange  = "BFO"
@@ -1450,7 +1474,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     # ── Daily profit target — stop new entries once hit ───────────────────────
     if DAILY_PROFIT_TARGET > 0 and _daily_target_exited:
         _combined_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
-                         sensex_daily_pnl + crude_daily_pnl)
+                         finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
         return False, (
             f"🎯 Daily target hit — combined P&L Rs.{_combined_pnl:.0f} "
             f">= target Rs.{DAILY_PROFIT_TARGET:.0f} — no new entries today"
@@ -2748,7 +2772,7 @@ Current situation:
 - Hull Suite band width: {hull_band_pct*100:.3f}% (wider = stronger trend, >0.05% is good)
 - Current price: ₹{_cur_close:.1f}
 - Time: {_now} IST
-- Combined daily P&L today: ₹{nifty_daily_pnl + sensex_daily_pnl:.0f}
+- Combined daily P&L today: ₹{nifty_daily_pnl + banknifty_daily_pnl + finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl:.0f}
 
 Last {len(_trade_summary)} trades for {instrument}:
 {chr(10).join(_trade_summary) if _trade_summary else "  No recent trades"}
@@ -3438,14 +3462,21 @@ def find_option(signal, instrument):
         step = 50
         token = config.NIFTY_TOKEN
         token_symbol = "NSE:NIFTY 50"
-        lot_size = 65            # NIFTY lot size (updated to 15 from Apr 2025)
+        lot_size = 65            # NIFTY lot size = 65
     elif instrument == "BANKNIFTY":
         exchange = "NFO"
         name = "BANKNIFTY"
-        step = 100               # BankNifty strikes move in ₹100 steps
+        step = 100
         token = BANKNIFTY_TOKEN
         token_symbol = "NSE:NIFTY BANK"
-        lot_size = 30            # BankNifty lot size
+        lot_size = 30
+    elif instrument == "FINNIFTY":
+        exchange = "NFO"
+        name = "FINNIFTY"
+        step = 50                # FINNIFTY strikes move in ₹50 steps
+        token = FINNIFTY_TOKEN
+        token_symbol = "NSE:NIFTY FIN SERVICE"
+        lot_size = 60            # FINNIFTY lot size = 60
     elif instrument == "SENSEX":
         exchange = "BFO"         # BSE F&O exchange
         name = "SENSEX"
@@ -3498,23 +3529,40 @@ def find_option(signal, instrument):
             strike_shift = 1
             max_price = 160
     elif instrument == "BANKNIFTY":
-        # BankNifty lot = 15. Strikes move in ₹100 steps.
-        # ATM BankNifty option ~₹100-400. Lot value = premium × 15.
+        # BankNifty lot = 30. Strikes move in ₹100 steps.
         if balance <= 5000:
-            strike_shift = 2      # ₹300 OTM
-            max_price = 120        # ₹120 × 15 = ₹1,800 per lot
+            strike_shift = 2
+            max_price = 120
         elif balance <= 10000:
             strike_shift = 1
-            max_price = 200        # ₹200 × 15 = ₹3,000 per lot
+            max_price = 200
         elif balance <= 20000:
             strike_shift = 1
-            max_price = 300        # ₹300 × 15 = ₹4,500 per lot
+            max_price = 300
         elif balance <= 35000:
             strike_shift = 1
-            max_price = 450        # ₹450 × 15 = ₹6,750 per lot
+            max_price = 450
         else:
             strike_shift = 1
-            max_price = 600        # ₹600 × 15 = ₹9,000 per lot
+            max_price = 600
+    elif instrument == "FINNIFTY":
+        # FINNIFTY lot = 60. Strikes move in ₹50 steps.
+        # FINNIFTY ~23,000. ATM option ~₹50-300. Lot value = premium × 60.
+        if balance <= 5000:
+            strike_shift = 2       # 100 OTM (2 × ₹50 steps)
+            max_price = 60         # ₹60 × 40 = ₹2,400 per lot
+        elif balance <= 10000:
+            strike_shift = 2
+            max_price = 100        # ₹100 × 40 = ₹4,000 per lot
+        elif balance <= 20000:
+            strike_shift = 1
+            max_price = 150        # ₹150 × 40 = ₹6,000 per lot
+        elif balance <= 35000:
+            strike_shift = 1
+            max_price = 220        # ₹220 × 40 = ₹8,800 per lot
+        else:
+            strike_shift = 1
+            max_price = 300        # ₹300 × 40 = ₹12,000 per lot
     elif instrument == "SENSEX":
         # SENSEX lot = 20. Strikes move in ₹100 steps.
         if balance <= 2500:
@@ -3748,7 +3796,7 @@ def find_option(signal, instrument):
             continue
 
         # Fallback: strict max_price cap + actual affordability check
-        _lot_size = {"SENSEX": 20, "BANKNIFTY": 30, "CRUDE": 100}.get(instrument, 65)
+        _lot_size = {"SENSEX": 20, "BANKNIFTY": 30, "FINNIFTY": 60, "CRUDE": 100}.get(instrument, 65)
         _cost = p * _lot_size * 1.05   # 5% buffer
         _affordable = _cost <= _live   # must fit in live balance
 
@@ -4152,9 +4200,11 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 else:
                     # Lot-size aware partial exit — must be multiple of lot size
                     if instrument == "SENSEX":
-                        one_lot = 10
+                        one_lot = 20
                     elif instrument == "BANKNIFTY":
                         one_lot = 30
+                    elif instrument == "FINNIFTY":
+                        one_lot = 60
                     elif instrument == "CRUDE":
                         one_lot = 100
                     else:
@@ -4353,6 +4403,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     # Trend has flipped — check if loop already handled it
                     pos_dict = (nifty_position    if instrument == "NIFTY"
                                 else banknifty_position if instrument == "BANKNIFTY"
+                                else finnifty_position  if instrument == "FINNIFTY"
                                 else sensex_position    if instrument == "SENSEX"
                                 else crude_position)
                     with lock:
@@ -4509,12 +4560,13 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         with lock:
             global global_trade_active
             global nifty_daily_pnl,     crude_daily_pnl
-            global banknifty_daily_pnl, sensex_daily_pnl
+            global banknifty_daily_pnl, finnifty_daily_pnl, sensex_daily_pnl, crude_daily_pnl
             global nifty_trade_count,     crude_trade_count
-            global banknifty_trade_count, sensex_trade_count
+            global banknifty_trade_count, finnifty_trade_count, sensex_trade_count
             global nifty_daily_wins,     nifty_daily_losses
             global crude_daily_wins,     crude_daily_losses
             global banknifty_daily_wins, banknifty_daily_losses
+            global finnifty_daily_wins,  finnifty_daily_losses
             global sensex_daily_wins,    sensex_daily_losses
 
             portfolio_pnl += pnl
@@ -4531,6 +4583,11 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 banknifty_trade_count += 1
                 if pnl > 0: banknifty_daily_wins   += 1
                 else:        banknifty_daily_losses += 1
+            elif instrument == "FINNIFTY":
+                finnifty_daily_pnl += pnl
+                finnifty_trade_count += 1
+                if pnl > 0: finnifty_daily_wins   += 1
+                else:        finnifty_daily_losses += 1
             elif instrument == "SENSEX":
                 sensex_daily_pnl += pnl
                 sensex_trade_count += 1
@@ -4571,7 +4628,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             print(f"✅ {instrument} trade closed — ready for next")
 
             # ── Trade closed Telegram summary ─────────────────────────────
-            _combined_pnl = nifty_daily_pnl + banknifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl
+            _combined_pnl = nifty_daily_pnl + banknifty_daily_pnl + finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl
             _total_trade_pnl = pnl + partial_pnl
             send_message(
                 f"{exit_emoji} TRADE CLOSED — {instrument} {signal}\n"
@@ -4581,6 +4638,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 f"📊 Entry: ₹{entry:.1f}  |  Exit: ₹{ltp:.1f}\n"
                 f"{'─'*28}\n"
                 f"📅 NIFTY      : ₹{nifty_daily_pnl:+.0f}\n"
+                f"📅 FINNIFTY   : ₹{finnifty_daily_pnl:+.0f}\n"
                 f"📅 BANKNIFTY  : ₹{banknifty_daily_pnl:+.0f}\n"
                 f"📅 SENSEX     : ₹{sensex_daily_pnl:+.0f}\n"
                 f"📅 CRUDE      : ₹{crude_daily_pnl:+.0f}\n"
@@ -4676,7 +4734,7 @@ def get_open_kite_position(instrument):
 
 def _get_lot_size(instrument):
     """Returns lot size for instrument — used in position restore."""
-    return {"SENSEX": 10, "BANKNIFTY": 30, "CRUDE": 100}.get(instrument, 65)
+    return {"SENSEX": 20, "BANKNIFTY": 30, "FINNIFTY": 60, "CRUDE": 100}.get(instrument, 65)
 
 
 def restore_position_state_from_kite():
@@ -4685,13 +4743,13 @@ def restore_position_state_from_kite():
     If Kite already has open positions (e.g. from a previous session),
     restore in-memory flags AND start manage_trade so exits/SL/profit-lock work.
     """
-    global nifty_position, banknifty_position, sensex_position, crude_position
-    global nifty_trade_active, banknifty_trade_active, sensex_trade_active, crude_trade_active
+    global nifty_position, banknifty_position, finnifty_position, sensex_position, crude_position
+    global nifty_trade_active, banknifty_trade_active, finnifty_trade_active, sensex_trade_active, crude_trade_active
     global global_trade_active
     global last_executed_signal_nifty, last_executed_signal_banknifty
-    global last_executed_signal_sensex, last_executed_signal_crude
+    global last_executed_signal_finnifty, last_executed_signal_sensex, last_executed_signal_crude
 
-    for instrument in ("NIFTY", "BANKNIFTY", "SENSEX", "CRUDE"):
+    for instrument in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "CRUDE"):
         pos = get_open_kite_position(instrument)
         if pos is None:
             continue
@@ -4735,27 +4793,23 @@ def restore_position_state_from_kite():
 
         with lock:
             if instrument == "NIFTY":
-                nifty_position.update({"symbol": sym, "qty": qty,
-                                       "exchange": exchange, "signal": signal,
-                                       "active": True})
+                nifty_position.update({"symbol": sym, "qty": qty, "exchange": exchange, "signal": signal, "active": True})
                 nifty_trade_active = True
                 last_executed_signal_nifty = signal
             elif instrument == "BANKNIFTY":
-                banknifty_position.update({"symbol": sym, "qty": qty,
-                                           "exchange": exchange, "signal": signal,
-                                           "active": True})
+                banknifty_position.update({"symbol": sym, "qty": qty, "exchange": exchange, "signal": signal, "active": True})
                 banknifty_trade_active = True
                 last_executed_signal_banknifty = signal
+            elif instrument == "FINNIFTY":
+                finnifty_position.update({"symbol": sym, "qty": qty, "exchange": exchange, "signal": signal, "active": True})
+                finnifty_trade_active = True
+                last_executed_signal_finnifty = signal
             elif instrument == "SENSEX":
-                sensex_position.update({"symbol": sym, "qty": qty,
-                                        "exchange": exchange, "signal": signal,
-                                        "active": True})
+                sensex_position.update({"symbol": sym, "qty": qty, "exchange": exchange, "signal": signal, "active": True})
                 sensex_trade_active = True
                 last_executed_signal_sensex = signal
             else:
-                crude_position.update({"symbol": sym, "qty": qty,
-                                       "exchange": exchange, "signal": signal,
-                                       "active": True})
+                crude_position.update({"symbol": sym, "qty": qty, "exchange": exchange, "signal": signal, "active": True})
                 crude_trade_active = True
                 last_executed_signal_crude = signal
 
@@ -4787,6 +4841,7 @@ def restore_daily_state():
     """
     global nifty_trade_count,     nifty_daily_pnl,     nifty_daily_wins,     nifty_daily_losses
     global banknifty_trade_count, banknifty_daily_pnl, banknifty_daily_wins, banknifty_daily_losses
+    global finnifty_trade_count,  finnifty_daily_pnl,  finnifty_daily_wins,  finnifty_daily_losses
     global sensex_trade_count,    sensex_daily_pnl,    sensex_daily_wins,    sensex_daily_losses
     global crude_trade_count,     crude_daily_pnl,     crude_daily_wins,     crude_daily_losses
     global daily_pnl, portfolio_pnl
@@ -4797,6 +4852,7 @@ def restore_daily_state():
     for instrument, prefix in [
         ("NIFTY",     "nifty"),
         ("BANKNIFTY", "banknifty"),
+        ("FINNIFTY",  "finnifty"),
         ("SENSEX",    "sensex"),
         ("CRUDE",     "crude"),
     ]:
@@ -4818,7 +4874,7 @@ def restore_daily_state():
 
     if restored_any:
         # Sync combined daily P&L with restored per-instrument totals
-        daily_pnl = nifty_daily_pnl + banknifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl
+        daily_pnl = nifty_daily_pnl + banknifty_daily_pnl + finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl
         portfolio_pnl = daily_pnl
         print(f"✅ Daily state restored — combined P&L today: ₹{daily_pnl:.0f}", flush=True)
         send_message(
@@ -4826,6 +4882,7 @@ def restore_daily_state():
             f"{'='*28}\n"
             f"📌 NIFTY     : {nifty_trade_count} trades  ₹{nifty_daily_pnl:,.0f}\n"
             f"📌 BANKNIFTY : {banknifty_trade_count} trades  ₹{banknifty_daily_pnl:,.0f}\n"
+            f"📌 FINNIFTY  : {finnifty_trade_count} trades  ₹{finnifty_daily_pnl:,.0f}\n"
             f"📌 SENSEX    : {sensex_trade_count} trades  ₹{sensex_daily_pnl:,.0f}\n"
             f"📌 CRUDE     : {crude_trade_count} trades  ₹{crude_daily_pnl:,.0f}\n"
             f"{'='*28}\n"
@@ -5064,6 +5121,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
     limit_map = {
         "NIFTY":     (nifty_trade_count,     MAX_NIFTY_TRADES_PER_DAY),
         "BANKNIFTY": (banknifty_trade_count,  MAX_BANKNIFTY_TRADES_PER_DAY),
+        "FINNIFTY":  (finnifty_trade_count,   MAX_FINNIFTY_TRADES_PER_DAY),
         "SENSEX":    (sensex_trade_count,     MAX_SENSEX_TRADES_PER_DAY),
         "CRUDE":     (crude_trade_count,      MAX_CRUDE_TRADES_PER_DAY),
     }
@@ -5075,7 +5133,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
             elif instrument == "BANKNIFTY": banknifty_trade_active = False
             elif instrument == "SENSEX":    sensex_trade_active = False
             else:                           crude_trade_active = False
-            global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+            global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
         return
 
     try:
@@ -5132,7 +5190,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
                       f"— flip trade active, not clearing new position state")
 
             # ── Always recompute global_trade_active from all instrument flags ───
-            global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+            global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
 
             
             
@@ -5530,7 +5588,7 @@ def nifty_loop():
                     with lock:
                         nifty_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
                         nifty_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_nifty = None
                     _just_flipped_nifty = True
                     # Increment flip counter — next Claude call gets fresh evaluation
@@ -5597,7 +5655,7 @@ def nifty_loop():
                 print(f"⏳ NIFTY profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
                 with lock:
                     nifty_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(min(_pl_wait, 60))
                 continue
 
@@ -5608,7 +5666,7 @@ def nifty_loop():
                 print(f"❌ NIFTY find_option returned None — no valid option found for {signal}", flush=True)
                 with lock:
                     nifty_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(10)
                 continue
 
@@ -5623,7 +5681,7 @@ def nifty_loop():
                 print(f"🚫 NIFTY same-strike block: {symbol} — waiting 5 min before re-entry", flush=True)
                 with lock:
                     nifty_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(30)
                 continue
             elif _sx_same_strike and _sx_cooldown_done:
@@ -5641,7 +5699,7 @@ def nifty_loop():
                     _nifty_gen_id = _nifty_trade_gen[0]
                     nifty_position.update({
                         "symbol":   symbol,
-                        "qty":      get_quantity(lot, exchange),
+                        "qty":      get_quantity(lot, exchange, "NIFTY"),
                         "exchange": exchange,
                         "signal":   signal,
                         "active":   True,
@@ -5678,7 +5736,7 @@ def nifty_loop():
             else:
                 with lock:
                     nifty_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
             err_str = str(e)
@@ -5875,7 +5933,7 @@ def crude_loop():
                     with lock:
                         crude_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
                         crude_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_crude = None
                     crude_loop._carryover_done = None
                     crude_loop._sig_alerted = None
@@ -5954,7 +6012,7 @@ def crude_loop():
                                                "exchange": None, "signal": None,
                                                "active": False})
                         crude_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_crude = None
                     crude_loop._carryover_done = None
                     crude_loop._sig_alerted = None
@@ -6021,7 +6079,7 @@ def crude_loop():
                     crude_loop._noopt_alerted = _noopt_key
                 with lock:
                     crude_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(30)
                 continue
 
@@ -6035,7 +6093,7 @@ def crude_loop():
                         _crude_gen_id = _crude_trade_gen[0]
                         crude_position.update({
                             "symbol":   symbol,
-                            "qty":      get_quantity(lot, exchange),
+                            "qty":      get_quantity(lot, exchange, "CRUDE"),
                             "exchange": exchange,
                             "signal":   signal,
                             "active":   True,
@@ -6067,11 +6125,11 @@ def crude_loop():
                 else:
                     with lock:
                         crude_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
             else:
                 with lock:
                     crude_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
             err_str = str(e)
@@ -6281,7 +6339,7 @@ def banknifty_loop():
                     with lock:
                         banknifty_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
                         banknifty_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_banknifty = None
                     banknifty_loop._carryover_done = None
                     banknifty_loop._sig_alerted    = None
@@ -6358,7 +6416,7 @@ def banknifty_loop():
                                                    "exchange": None, "signal": None,
                                                    "active": False})
                         banknifty_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_banknifty = None
                     banknifty_loop._carryover_done = None
                     banknifty_loop._sig_alerted    = None
@@ -6411,7 +6469,7 @@ def banknifty_loop():
                 print(f"⏳ BANKNIFTY profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
                 with lock:
                     banknifty_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(min(_pl_wait, 60))
                 continue
 
@@ -6421,7 +6479,7 @@ def banknifty_loop():
             if not symbol or price is None:
                 with lock:
                     banknifty_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(10)
                 continue
 
@@ -6430,7 +6488,7 @@ def banknifty_loop():
                 print(f"🚫 BANKNIFTY same-strike block: {symbol} was just exited — waiting for new arrow")
                 with lock:
                     banknifty_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(30)
                 continue
 
@@ -6473,7 +6531,7 @@ def banknifty_loop():
             else:
                 with lock:
                     banknifty_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
             err_str = str(e)
@@ -6487,6 +6545,411 @@ def banknifty_loop():
                 if get_open_kite_position("BANKNIFTY") is None:
                     with lock:
                         banknifty_trade_active = False
+            except Exception:
+                pass
+
+        time.sleep(10)
+
+
+# =====================================================
+# 📊 SENSEX LOOP (BSE F&O — same session as NIFTY)
+# =====================================================
+
+# =====================================================
+# 📊 FINNIFTY LOOP
+# =====================================================
+
+def finnifty_loop():
+    global last_executed_signal_finnifty, global_trade_active
+    global last_status, last_weak_log_time
+    global last_fetch_finnifty, cached_finnifty_df, cached_finnifty_ht
+    global finnifty_trade_active, finnifty_position
+    global win_streak, loss_streak
+
+    _fn_weekend_msg_sent = [False]
+    _fn_wakeup_msg_sent  = [False]
+
+    while True:
+        try:
+            # ── Instrument kill-switch ────────────────────────────────────────
+            if not ENABLE_FINNIFTY:
+                global _finnifty_disabled_logged
+                if not _finnifty_disabled_logged:
+                    print("⛔ FINNIFTY trading disabled (ENABLE_FINNIFTY=False)", flush=True)
+                    _finnifty_disabled_logged = True
+                time.sleep(60)
+                continue
+
+            now_dt = datetime.now(IST)
+
+            # ── Weekend: sleep and do nothing ────────────────────────────────
+            if now_dt.weekday() >= 5:
+                if not _fn_weekend_msg_sent[0]:
+                    send_message("😴 FINNIFTY: Weekend — bot sleeping until Monday 8:55 AM IST")
+                    _fn_weekend_msg_sent[0] = True
+                    _fn_wakeup_msg_sent[0]  = False
+                time.sleep(300)
+                continue
+
+            # ── Pre-market: before 9:00 AM on weekdays ───────────────────────
+            if now_dt.hour < 9:
+                _fn_weekend_msg_sent[0] = False
+                if not _fn_wakeup_msg_sent[0] and now_dt.weekday() == 0:
+                    send_message("🌅 FINNIFTY: Monday — bot active, waiting for 9:15 AM market open")
+                    _fn_wakeup_msg_sent[0] = True
+                time.sleep(60)
+                continue
+
+            # ── Before 9:30 AM: wait for market to stabilise ─────────────────
+            if now_dt.hour == 9 and now_dt.minute < 20:
+                print("⏳ FINNIFTY: waiting until 9:20 AM — first candle still forming...", flush=True)
+                time.sleep(30)
+                continue
+
+            # ── After 3:20 PM: block all NEW entries (force-close time) ─────────
+            if now_dt.hour > 15 or (now_dt.hour == 15 and now_dt.minute >= 20):
+                print("🛑 FINNIFTY past 3:20 PM — no new entries, sleeping until tomorrow 9:00 AM")
+                time.sleep(60)
+                continue
+
+            # Reset daily stats at start of new trading day
+            reset_daily_pnl()
+
+            # Loss streak cooldown
+            if loss_streak >= 3:
+                print("⚠️ Loss streak >= 3 — pausing FINNIFTY 15 min then resetting streak", flush=True)
+                send_message("❌ FINNIFTY: 3 consecutive losses — pausing 15 min")
+                time.sleep(900)
+                loss_streak = 0
+                print("♻️ FINNIFTY loss streak reset — resuming trading", flush=True)
+                continue
+
+            # ── HARD SAME-DIRECTION GUARD ─────────────────────────────────────
+            with lock:
+                _trade_active  = finnifty_trade_active or finnifty_position["active"]
+                _active_signal = finnifty_position.get("signal")
+            if _trade_active:
+                _curr_trend = int(cached_finnifty_ht.iloc[-2]["trend"]) if cached_finnifty_ht is not None else -1
+                _curr_sig   = "CALL" if _curr_trend == 0 else "PUT"
+                if _active_signal == _curr_sig:
+                    time.sleep(10)
+                    continue
+                print(f"⚠️ BANKNIFTY: open {_active_signal} but HT={_curr_sig} — running flip check", flush=True)
+
+            # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
+            if time.time() - last_fetch_finnifty > 30 or cached_finnifty_df is None:
+                cached_finnifty_df = get_cached_data(FINNIFTY_TOKEN, "5minute", 600)
+                if cached_finnifty_df is not None and len(cached_finnifty_df) >= 120:
+                    cached_finnifty_ht = halftrend_tv(cached_finnifty_df, amplitude=3, channel_deviation=2)
+                last_fetch_finnifty = time.time()
+
+            if cached_finnifty_df is None or len(cached_finnifty_df) < 120 or cached_finnifty_ht is None:
+                time.sleep(10)
+                continue
+
+            ht_df = cached_finnifty_ht
+            current_trend = int(ht_df.iloc[-2]["trend"])
+            print("🧠 FINNIFTY Trend:", "CALL" if current_trend == 0 else "PUT")
+
+            # ── Signal Detection (fresh arrow + carry-over) ───────────────────
+            signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
+
+            arrow_level = None
+            if signal is not None and arrow_idx is not None:
+                arrow_bar = ht_df.iloc[arrow_idx]
+                arrow_level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
+                if is_fresh:
+                    tag = "🟢 FRESH" if signal == "CALL" else "🔴 FRESH"
+                    print(f"{tag} BANKNIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
+                else:
+                    bars_ago = len(ht_df) - arrow_idx - 2
+                    tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
+                    print(f"{tag} BANKNIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
+
+            if signal is None:
+                status = "NO_ARROW_BANKNIFTY"
+                if last_status != status or time.time() - last_weak_log_time > 60:
+                    trend_name = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
+                    print(f"⏸️ BANKNIFTY: trend={trend_name} but no valid arrow in last 120 bars — waiting")
+                    last_status = status
+                    last_weak_log_time = time.time()
+                time.sleep(10)
+                continue
+
+            # ── Daily trade limit check ───────────────────────────────────────
+            if banknifty_trade_count >= MAX_FINNIFTY_TRADES_PER_DAY:
+                _lim_key = f"BANKNIFTY_limit_{datetime.now(IST).strftime('%Y-%m-%d')}"
+                if getattr(banknifty_loop, "_limit_alerted", None) != _lim_key:
+                    finnifty_loop._limit_alerted = _lim_key
+                    print(f"🔒 BANKNIFTY: {banknifty_trade_count}/{MAX_FINNIFTY_TRADES_PER_DAY} trades done for today", flush=True)
+                    send_message(f"🔒 BANKNIFTY: {MAX_FINNIFTY_TRADES_PER_DAY} trades done for today. Resuming tomorrow.")
+                time.sleep(60)
+                continue
+
+            # ── Signal detected — log only, no Telegram ──────────────────────
+            if signal is not None and arrow_idx is not None:
+                arrow_bar = ht_df.iloc[arrow_idx]
+                _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
+                _bars_ago = len(ht_df) - arrow_idx - 2
+                _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
+                print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
+
+            # ── Carry-over: enter only once per day ───────────────────────────
+            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+            carryover_key = f"BANKNIFTY_{signal}_{today_str}"
+            if not is_fresh:
+                if getattr(banknifty_loop, "_carryover_done", None) == carryover_key:
+                    time.sleep(10)
+                    continue
+
+            # ══════════════════════════════════════════════════════════════
+            # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)
+            # ══════════════════════════════════════════════════════════════
+            _htf_ok, _htf_reason = check_htf_filter(signal, FINNIFTY_TOKEN)
+            if not _htf_ok:
+                print(f"📐 BANKNIFTY HTF block — {_htf_reason}", flush=True)
+                _hkey = f"BANKNIFTY_htf_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(banknifty_loop, "_htf_alerted", None) != _hkey:
+                    send_message(f"📐 BANKNIFTY HTF BLOCK\n{_htf_reason}")
+                    banknifty_loop._htf_alerted = _hkey
+                time.sleep(30)
+                continue
+            print(f"   {_htf_reason}", flush=True)
+
+            # ══════════════════════════════════════════════════════════════
+            # 🔒  LAYER 1 — Kite flip detection (BEFORE filters)
+            # ══════════════════════════════════════════════════════════════
+            _kite_pos_cache.pop("FINNIFTY", None)
+            kite_pos = get_open_kite_position("FINNIFTY")
+            if kite_pos:
+                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
+                if kite_sig == signal:
+                    with lock:
+                        if not finnifty_position["active"]:
+                            finnifty_position.update({"symbol": kite_pos["symbol"], "qty": kite_pos["qty"],
+                                                       "exchange": kite_pos["exchange"], "signal": kite_sig, "active": True})
+                            finnifty_trade_active = True
+                    time.sleep(10)
+                    continue
+                else:
+                    print(f"🔁 FINNIFTY FLIP (Kite): {kite_sig} → {signal}", flush=True)
+                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"], kite_pos["exchange"])
+                    if exit_ok:
+                        send_message(f"🔁 FINNIFTY flip exit\nClosed: {kite_sig} ({kite_pos['symbol']})\nNew signal: {signal}")
+                        _kite_pos_cache.pop("FINNIFTY", None)
+                    else:
+                        print("⚠️ FINNIFTY flip exit failed — retrying", flush=True)
+                        time.sleep(5)
+                        continue
+                    with lock:
+                        finnifty_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
+                        finnifty_trade_active = False
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
+                        last_executed_signal_finnifty = None
+                    finnifty_loop._carryover_done = None
+                    finnifty_loop._sig_alerted    = None
+                    finnifty_loop._just_flipped   = True
+                    time.sleep(3)
+            else:
+                with lock:
+                    if finnifty_position["active"]:
+                        finnifty_position.update({"symbol": None, "qty": 0, "exchange": None, "signal": None, "active": False})
+                        finnifty_trade_active = False
+
+            # ══════════════════════════════════════════════════════════════
+            # 📊  STRATEGY FILTERS (entry only — flip handled above)
+            # ══════════════════════════════════════════════════════════════
+            _just_flipped_bn = getattr(banknifty_loop, "_just_flipped", False)
+            finnifty_loop._just_flipped = False
+            _filter_ok, _filter_reason = apply_entry_filters(
+                signal, "FINNIFTY", cached_finnifty_df, FINNIFTY_TOKEN,
+                is_flip_reentry=_just_flipped_bn,
+                ht_df=cached_finnifty_ht,
+                hull_band_pct=get_hull_signal(cached_finnifty_df)[3] or 0)
+
+            if not _filter_ok:
+                print(f"🚫 FINNIFTY entry blocked — {_filter_reason}", flush=True)
+                _fkey = f"FINNIFTY_f_{datetime.now(IST).strftime('%Y-%m-%d_%H%M')[:13]}_{_filter_reason[:30]}"
+                if getattr(banknifty_loop, "_filter_alerted", None) != _fkey:
+                    try:
+                        send_message(f"🚫 FINNIFTY ORDER BLOCKED\n{_filter_reason}")
+                        finnifty_loop._filter_alerted = _fkey
+                    except Exception as _e:
+                        print(f"⚠️ Filter alert send failed: {_e}", flush=True)
+                time.sleep(30)
+                continue
+            print(f"   {_filter_reason}", flush=True)
+
+            # ══════════════════════════════════════════════════════════════
+            # 🔒  ONE-ORDER-AT-A-TIME GUARD (layers 2 & 3)
+            if kite_pos:
+                kite_sig = "CALL" if kite_pos["symbol"].endswith("CE") else "PUT"
+
+                if kite_sig == signal:
+                    with lock:
+                        if not finnifty_position["active"]:
+                            finnifty_position.update({
+                                "symbol":   kite_pos["symbol"],
+                                "qty":      kite_pos["qty"],
+                                "exchange": kite_pos["exchange"],
+                                "signal":   kite_sig,
+                                "active":   True,
+                            })
+                            finnifty_trade_active = True
+                    time.sleep(10)
+                    continue
+
+                else:
+                    # Open position in opposite direction → flip
+                    print(f"🔁 FINNIFTY FLIP (Kite): {kite_sig} → {signal}")
+                    exit_ok = exit_position(kite_pos["symbol"], kite_pos["qty"],
+                                            kite_pos["exchange"])
+                    if exit_ok:
+                        send_message(
+                            f"🔁 FINNIFTY flip exit\n"
+                            f"Closed: {kite_sig} ({kite_pos['symbol']})\n"
+                            f"New signal: {signal}"
+                        )
+                        _kite_pos_cache.pop("FINNIFTY", None)
+                    else:
+                        print("⚠️ FINNIFTY flip exit failed — retrying next tick")
+                        time.sleep(5)
+                        continue
+
+                    with lock:
+                        finnifty_position.update({"symbol": None, "qty": 0,
+                                                   "exchange": None, "signal": None,
+                                                   "active": False})
+                        finnifty_trade_active = False
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
+                        last_executed_signal_finnifty = None
+                    finnifty_loop._carryover_done = None
+                    finnifty_loop._sig_alerted    = None
+                    finnifty_loop._just_flipped   = True   # ← skip Hull on re-entry
+                    time.sleep(3)
+
+            else:
+                # No live Kite position — sync in-memory if drifted
+                with lock:
+                    if finnifty_position["active"]:
+                        print("⚠️ FINNIFTY in-memory says active but Kite shows no position — resetting")
+                        finnifty_position.update({"symbol": None, "qty": 0,
+                                                   "exchange": None, "signal": None,
+                                                   "active": False})
+                        finnifty_trade_active = False
+
+            # Layer 2 — in-memory flag (fast path)
+            with lock:
+                pos_active = finnifty_position["active"]
+                pos_signal = finnifty_position["signal"]
+
+            if pos_active and pos_signal == signal:
+                time.sleep(10)
+                continue
+
+            # Layer 3 — duplicate prevention for same fresh signal
+            if is_fresh and signal == last_executed_signal_finnifty:
+                time.sleep(10)
+                continue
+
+            # ══════════════════════════════════════════════════════════════
+            # 🚀  ENTRY — all guards passed, place the order
+            # ══════════════════════════════════════════════════════════════
+            with lock:
+                if finnifty_trade_active:
+                    already_active = True
+                else:
+                    already_active = False
+                    finnifty_trade_active = True
+                    global_trade_active = True
+
+            if already_active:
+                time.sleep(10)
+                continue
+
+            # ── Profit-lock exit cooldown (15 min) ────────────────────────────
+            _pl_exit_ts = _profit_lock_exit_time.get("FINNIFTY", 0)
+            _pl_wait = 300 - (time.time() - _pl_exit_ts)  # 5 min cooldown after profit lock
+            if _pl_wait > 0:
+                print(f"⏳ FINNIFTY profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
+                with lock:
+                    finnifty_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(min(_pl_wait, 60))
+                continue
+
+            print(f"🧠 FINNIFTY entering: {signal}")
+            symbol, price, lot, exchange = find_option(signal, "FINNIFTY")
+
+            if not symbol or price is None:
+                with lock:
+                    finnifty_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(10)
+                continue
+
+            # ── Same-strike guard ─────────────────────────────────────────────
+            if symbol == _last_exited_symbol.get("FINNIFTY") and not is_fresh:
+                print(f"🚫 FINNIFTY same-strike block: {symbol} was just exited — waiting for new arrow")
+                with lock:
+                    finnifty_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
+                time.sleep(30)
+                continue
+
+            filled_price = place_order(symbol, lot, exchange, "FINNIFTY")
+
+            if filled_price:
+                with lock:
+                    _finnifty_trade_gen[0] += 1
+                    _bn_gen_id = _finnifty_trade_gen[0]
+                    finnifty_position.update({
+                        "symbol":   symbol,
+                        "qty":      get_quantity(lot, exchange, "FINNIFTY"),
+                        "exchange": exchange,
+                        "signal":   signal,
+                        "active":   True,
+                    })
+                    last_executed_signal_finnifty = signal
+
+                _kite_pos_cache.pop("FINNIFTY", None)
+
+                # Always mark carryover_done so carry-over re-entry is blocked
+                finnifty_loop._carryover_done = carryover_key
+
+                if not is_fresh:
+                    send_message(
+                        f"♻️ BANKNIFTY carry-over entry\n"
+                        f"Signal: {signal} (trend continuing)\n"
+                        f"{symbol} @ ₹{filled_price}"
+                    )
+                else:
+                    send_message(f"🆕 BANKNIFTY {signal} entry\n{symbol} @ ₹{filled_price}")
+
+                threading.Thread(
+                    target=run_trade_wrapper,
+                    args=(symbol, filled_price, lot, exchange, "FINNIFTY", signal, 0, "TREND"),
+                    kwargs={"gen_id": _bn_gen_id},
+                    daemon=True
+                ).start()
+                print(f"🎯 FINNIFTY Trade: {symbol} @ ₹{filled_price}  lots={lot}  gen={_bn_gen_id}")
+            else:
+                with lock:
+                    finnifty_trade_active = False
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
+
+        except Exception as e:
+            err_str = str(e)
+            print("❌ FINNIFTY LOOP ERROR:", err_str, flush=True)
+            if any(x in err_str.lower() for x in ["token", "403", "unauthorized", "invalid api key"]):
+                _tk = f"BN_auth_{datetime.now(IST).strftime('%Y-%m-%d_%H')}"
+                if getattr(banknifty_loop, "_token_alerted", None) != _tk:
+                    finnifty_loop._token_alerted = _tk
+                    send_message(f"❌ FINNIFTY: Kite auth error — token expired\nError: {err_str[:150]}\nAction: Redeploy or whitelist IP")
+            try:
+                if get_open_kite_position("FINNIFTY") is None:
+                    with lock:
+                        finnifty_trade_active = False
             except Exception:
                 pass
 
@@ -6710,7 +7173,7 @@ def sensex_loop():
                                                 "exchange": None, "signal": None,
                                                 "active": False})
                         sensex_trade_active = False
-                        global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                        global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_sensex = None
                     sensex_loop._carryover_done = None
                     sensex_loop._sig_alerted    = None
@@ -6786,7 +7249,7 @@ def sensex_loop():
                 print(f"⏳ SENSEX profit-lock cooldown — {int(_pl_wait)}s remaining before next entry", flush=True)
                 with lock:
                     sensex_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(min(_pl_wait, 60))
                 continue
 
@@ -6796,7 +7259,7 @@ def sensex_loop():
             if not symbol or price is None:
                 with lock:
                     sensex_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(10)
                 continue
 
@@ -6809,7 +7272,7 @@ def sensex_loop():
                 print(f"🚫 SENSEX same-strike block: {symbol} — waiting 5 min", flush=True)
                 with lock:
                     sensex_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(30)
                 continue
             elif _sx_same_strike and _sx_cooldown_done:
@@ -6824,7 +7287,7 @@ def sensex_loop():
                 print(f"🔒 SENSEX trade limit reached during order — aborting", flush=True)
                 with lock:
                     sensex_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(10)
                 continue
 
@@ -6864,7 +7327,7 @@ def sensex_loop():
             else:
                 with lock:
                     sensex_trade_active = False
-                    global_trade_active = nifty_trade_active or banknifty_trade_active or sensex_trade_active or crude_trade_active
+                    global_trade_active = nifty_trade_active or banknifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
 
         except Exception as e:
             err_str = str(e)
@@ -6984,14 +7447,13 @@ def confirm_entry(token, signal, df=None):
         return False
     
 def get_quantity(lots, exchange, instrument=None):
-    if exchange == "MCX":          # CRUDE OIL
-        return lots * 1
-    if instrument == "BANKNIFTY":
-        return lots * 15           # BankNifty lot size = 15
-    if instrument == "SENSEX":
-        return lots * 20           # SENSEX lot size = 20
-    if exchange in ("NFO", "BFO"): # NIFTY — current lot size = 65
-        return lots * 65
+    """Returns total shares for given lots based on instrument lot size."""
+    if exchange == "MCX":              return lots * 100   # CRUDE OIL
+    if instrument == "BANKNIFTY":      return lots * 30    # BankNifty lot = 30
+    if instrument == "FINNIFTY":       return lots * 60    # FinNifty lot = 60
+    if instrument == "SENSEX":         return lots * 20    # SENSEX lot = 20
+    if instrument == "NIFTY":          return lots * 65    # NIFTY lot = 65
+    if exchange in ("NFO", "BFO"):     return lots * 65    # default NFO/BFO
     return lots
     
 def get_balance(instrument):
@@ -7287,10 +7749,11 @@ def reset_daily_pnl():
         max_drawdown = 0
 
         # ── Per-instrument reset ─────────────────────────────────────────
-        global nifty_daily_pnl, banknifty_daily_pnl, sensex_daily_pnl, crude_daily_pnl
-        global nifty_trade_count, banknifty_trade_count, sensex_trade_count, crude_trade_count
+        global nifty_daily_pnl, banknifty_daily_pnl, finnifty_daily_pnl, sensex_daily_pnl, crude_daily_pnl
+        global nifty_trade_count, banknifty_trade_count, finnifty_trade_count, sensex_trade_count, crude_trade_count
         global nifty_daily_wins, nifty_daily_losses
         global banknifty_daily_wins, banknifty_daily_losses
+        global finnifty_daily_wins, finnifty_daily_losses
         global sensex_daily_wins, sensex_daily_losses
         global crude_daily_wins, crude_daily_losses
         global _last_no_signal_alert_nifty, _last_no_signal_alert_banknifty
@@ -7300,16 +7763,20 @@ def reset_daily_pnl():
 
         nifty_daily_pnl = 0
         banknifty_daily_pnl = 0
+        finnifty_daily_pnl = 0
         sensex_daily_pnl = 0
         crude_daily_pnl = 0
         nifty_trade_count = 0
         banknifty_trade_count = 0
+        finnifty_trade_count = 0
         sensex_trade_count = 0
         crude_trade_count = 0
         nifty_daily_wins = 0
         nifty_daily_losses = 0
         banknifty_daily_wins = 0
         banknifty_daily_losses = 0
+        finnifty_daily_wins = 0
+        finnifty_daily_losses = 0
         sensex_daily_wins = 0
         sensex_daily_losses = 0
         crude_daily_wins = 0
@@ -7924,7 +8391,6 @@ def choose_best_strategy(df, token):
 
     return signal, market_type        
         
-from datetime import datetime, timedelta
 
 _data_cache_store: dict = {}   # { (token, interval): (timestamp, df) }  — populated by get_cached_data
 _DATA_CACHE_TTL = 20           # seconds — re-fetch if older than this
@@ -8078,15 +8544,17 @@ def send_daily_report():
             "NIFTY",     nifty_daily_pnl,     nifty_daily_wins,     nifty_daily_losses,     nifty_trade_count)
         bn_pnl, bn_wins, bn_losses, bn_count = _best_day_pnl(
             "BANKNIFTY", banknifty_daily_pnl, banknifty_daily_wins, banknifty_daily_losses, banknifty_trade_count)
+        fn_pnl, fn_wins, fn_losses, fn_count = _best_day_pnl(
+            "FINNIFTY",  finnifty_daily_pnl,  finnifty_daily_wins,  finnifty_daily_losses,  finnifty_trade_count)
         sx_pnl, sx_wins, sx_losses, sx_count = _best_day_pnl(
             "SENSEX",    sensex_daily_pnl,    sensex_daily_wins,    sensex_daily_losses,    sensex_trade_count)
         c_pnl,  c_wins,  c_losses,  c_count  = _best_day_pnl(
             "CRUDE",     crude_daily_pnl,     crude_daily_wins,     crude_daily_losses,     crude_trade_count)
 
-        total_pnl    = n_pnl + bn_pnl + sx_pnl + c_pnl
-        total_trades = n_count + bn_count + sx_count + c_count
-        total_wins   = n_wins  + bn_wins  + sx_wins  + c_wins
-        total_losses = n_losses + bn_losses + sx_losses + c_losses
+        total_pnl    = n_pnl + bn_pnl + fn_pnl + sx_pnl + c_pnl
+        total_trades = n_count + bn_count + fn_count + sx_count + c_count
+        total_wins   = n_wins  + bn_wins  + fn_wins  + sx_wins  + c_wins
+        total_losses = n_losses + bn_losses + fn_losses + sx_losses + c_losses
         win_rate     = (total_wins / total_trades * 100) if total_trades > 0 else 0
 
         def _section(label, pnl, wins, losses, count):
@@ -8109,6 +8577,7 @@ def send_daily_report():
             f"{'='*30}"
             + _section("NIFTY",     n_pnl,  n_wins,  n_losses,  n_count)
             + _section("BANKNIFTY", bn_pnl, bn_wins, bn_losses, bn_count)
+            + _section("FINNIFTY",  fn_pnl, fn_wins, fn_losses, fn_count)
             + _section("SENSEX",    sx_pnl, sx_wins, sx_losses, sx_count)
             + _section("CRUDE OIL", c_pnl,  c_wins,  c_losses,  c_count) +
             f"\n{'='*30}\n"
@@ -9822,6 +10291,7 @@ if __name__ == "__main__":
                     _nifty_eod_sent[0]       = False
                     _banknifty_eod_sent[0]   = False
                     _sensex_eod_sent[0]      = False
+                    daily_report_scheduler._finnifty_eod_sent = False
                     _swing_eod_sent[0]       = False
                     _stockopt_eod_sent[0]    = False
                     _crude_eod_sent[0]       = False
@@ -9845,10 +10315,28 @@ if __name__ == "__main__":
                     send_nifty_eod_report()
                     _nifty_eod_sent[0] = True
 
-                # 3:32 PM — BankNifty EOD report (same session as NIFTY)
+                # 3:32 PM — BankNifty EOD report
                 if now.hour == 15 and now.minute == 32 and not _banknifty_eod_sent[0]:
                     send_banknifty_eod_report()
                     _banknifty_eod_sent[0] = True
+
+                # 3:32 PM (30s later) — FINNIFTY EOD report
+                if now.hour == 15 and now.minute == 32 and now.second >= 30 and not getattr(daily_report_scheduler, "_finnifty_eod_sent", False):
+                    try:
+                        fn_pnl_r, fn_w, fn_l, fn_c = _kite_day_pnl("FINNIFTY")
+                        emoji = "✅" if fn_pnl_r >= 0 else "❌"
+                        _today_str = datetime.now(IST).strftime("%d %b %Y")
+                        _wr = f"{fn_w/max(fn_c,1)*100:.0f}%"
+                        send_message(
+                            f"{emoji} FINNIFTY SESSION CLOSED\n"
+                            f"📅 {_today_str}\n"
+                            f"💰 Net P&L    : Rs.{fn_pnl_r:,.0f}\n"
+                            f"📊 Trades     : {fn_c}  ({fn_w} wins  {fn_l} losses)\n"
+                            f"🎯 Win Rate   : {_wr}"
+                        )
+                    except Exception as _fe:
+                        print(f"⚠️ FINNIFTY EOD report error: {_fe}", flush=True)
+                    daily_report_scheduler._finnifty_eod_sent = True
 
                 # 3:33 PM — SENSEX EOD report (same session as NIFTY/BANKNIFTY)
                 if now.hour == 15 and now.minute == 33 and not _sensex_eod_sent[0]:
@@ -9890,6 +10378,12 @@ if __name__ == "__main__":
         print(f"✅ BANKNIFTY loop started (token={BANKNIFTY_TOKEN})", flush=True)
     else:
         print("❌ BANKNIFTY LOOP SKIPPED — BANKNIFTY_TOKEN missing from config.py", flush=True)
+
+    if FINNIFTY_TOKEN:
+        threading.Thread(target=finnifty_loop, daemon=True).start()
+        print(f"✅ FINNIFTY loop started (token={FINNIFTY_TOKEN})", flush=True)
+    else:
+        print("❌ FINNIFTY LOOP SKIPPED — FINNIFTY_TOKEN missing from config.py", flush=True)
 
     if SENSEX_TOKEN:
         threading.Thread(target=sensex_loop, daemon=True).start()

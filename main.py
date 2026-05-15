@@ -675,8 +675,6 @@ def daily_profit_target_monitor():
 
         except Exception as _mon_err:
             print(f"⚠️ Target monitor error: {_mon_err}", flush=True)
-                            # TV shows 16.94 → Kite gives ~13.6; threshold=12 filters
-                            # only true choppy/sideways (TV ADX would be ~15 or below)
 
 # ── Support & Resistance Filter ───────────────────────────────────────────────
 USE_SR_FILTER      = True    # True = active | False = disabled
@@ -787,8 +785,6 @@ trade_in_progress_nifty = False
 trade_in_progress_crude = False
 
 # 🔥 TREND MEMORY (NEW)
-last_trend_nifty = None
-last_trend_crude = None
 
 global_trade_active = False
 
@@ -804,14 +800,11 @@ MAX_DRAWDOWN = -3000   # adjust based on capital
 win_streak = 0
 loss_streak = 0
 
-last_signal_nifty = None
-last_signal_crude = None
 
 last_trade_time_nifty = 0
 last_trade_time_crude = 0
 
 SIGNAL_COOLDOWN = 90  
-alert_sent = False
 last_analysis_time = 0
 
 portfolio_pnl = 0
@@ -839,7 +832,6 @@ LTP_TTL = 3  # seconds
 quote_cache = {}
 QUOTE_TTL = 3
 
-CRUDE_TOKEN = None
 NIFTY_FUT_TOKEN = None
 
 ml_cache = {"time": 0, "data": None}
@@ -851,7 +843,6 @@ last_exit_time_crude = 0
 last_exit_time_nifty = 0
 REENTRY_COOLDOWN = 600  # 10 min
 CRUDE_SYMBOL = None
-pyramid_done = False
 
 TRADE_LOG_FILE = "trade_log.csv"
 last_executed_signal_crude = None
@@ -879,12 +870,6 @@ strategy_log = {
     "NORMAL": []
 }
 
-strategy_status = {
-    "TREND": True,
-    "SIDEWAYS": True,
-    "VOLATILE": True,
-    "NORMAL": True
-}
 
 strategy_weights = {
     "TREND": 1.0,
@@ -912,7 +897,6 @@ nifty_trade_count     = 0
 banknifty_trade_count = 0
 sensex_trade_count    = 0
 crude_trade_count     = 0
-last_reset_day = None
 
 # Per-instrument daily P&L tracking
 nifty_daily_pnl      = 0
@@ -1090,14 +1074,10 @@ def prepare_indicators(df):
     df["ema20"] = df["close"].ewm(span=20).mean()
 
     return df
-import pandas as pd
-import numpy as np
-
 # ======================================
 # TRUE TradingView ATR (Wilder RMA)
 # ta.atr(period)
 # ======================================
-import numpy as np
 
 def ATR(df, period=100):
     high = df["high"]
@@ -2295,7 +2275,6 @@ def get_hull_signal(df_15m, mode=HULL_MODE, length=HULL_LENGTH):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-import pandas as pd
 import numpy as np
 
 def halftrend_tv(df, amplitude=2, channel_deviation=2):
@@ -5159,7 +5138,6 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
             
 def analyze_performance():
 
-    import pandas as pd
 
     try:
         df = pd.read_csv(TRADE_LOG_FILE)
@@ -7630,7 +7608,6 @@ def get_ml_cached():
 # ELITE SIGNAL (NEW)
 # -----------------------------
 def elite_signal(df):
-    import pandas as pd
     
     if "vwap" not in df.columns:
         df = prepare_indicators(df)
@@ -7948,7 +7925,6 @@ def choose_best_strategy(df, token):
     return signal, market_type        
         
 from datetime import datetime, timedelta
-import pandas as pd
 
 _data_cache_store: dict = {}   # { (token, interval): (timestamp, df) }  — populated by get_cached_data
 _DATA_CACHE_TTL = 20           # seconds — re-fetch if older than this

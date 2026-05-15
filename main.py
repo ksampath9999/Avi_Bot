@@ -1813,10 +1813,16 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     # Analyses the last closed candle (iloc[-2]) for pattern confirmation.
     # Patterns that CONFIRM the signal → boost confidence
     # Patterns that CONTRADICT the signal → block entry
-    USE_CANDLE_PATTERN_FILTER = True   # set False to disable
+    USE_CANDLE_PATTERN_FILTER = os.environ.get("USE_CANDLE_FILTER", "true").lower() == "true"
     _candle_str = "CP=off"
 
-    if USE_CANDLE_PATTERN_FILTER and df_15m is not None and len(df_15m) >= 4:
+    # Skip candle pattern on flip re-entry — the candle that caused the flip
+    # is always in the OLD direction, not the new one. Checking it would
+    # always block the re-entry incorrectly.
+    _is_flip = kwargs.get("is_flip_reentry", False)
+    if _is_flip:
+        _candle_str = "CP=skip(flip-reentry)"
+    elif USE_CANDLE_PATTERN_FILTER and df_15m is not None and len(df_15m) >= 4:
         try:
             _bar  = df_15m.iloc[-2]   # last closed candle
             _prev = df_15m.iloc[-3]   # candle before that
@@ -3510,10 +3516,12 @@ def find_option(signal, instrument):
             max_price = 600        # ₹600 × 15 = ₹9,000 per lot
     elif instrument == "SENSEX":
         # SENSEX lot = 20. Strikes move in ₹100 steps.
-        # SENSEX ~75,000. ATM option ~₹100-500. Lot value = premium × 20.
-        if balance <= 5000:
-            strike_shift = 2       # 200 OTM (was 300 — too deep, no candidates)
-            max_price = 120        # ₹120 × 20 = ₹2,400 per lot (was 80 — too tight)
+        if balance <= 2500:
+            strike_shift = 3       # 300 OTM — cheaper option
+            max_price = 60         # ₹60 × 20 = ₹1,200 per lot
+        elif balance <= 5000:
+            strike_shift = 2       # 200 OTM
+            max_price = 120        # ₹120 × 20 = ₹2,400 per lot
         elif balance <= 10000:
             strike_shift = 2
             max_price = 180        # ₹180 × 20 = ₹3,600 per lot

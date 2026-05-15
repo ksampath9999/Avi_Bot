@@ -712,7 +712,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Set False to completely stop trading that instrument.
 # The loop stays running (no restart needed) — just skips all entries.
 # Flip back to True to resume immediately on next cycle.
-ENABLE_NIFTY      = True    # ✅ NIFTY trading active
+ENABLE_NIFTY      = False    # ✅ NIFTY trading active
 ENABLE_BANKNIFTY  = False   # ✅ BANKNIFTY trading active
 ENABLE_SENSEX     = True    # ✅ SENSEX trading active
 ENABLE_CRUDE      = False   # ✅ CRUDE trading active
@@ -2797,6 +2797,12 @@ allowed must be true only if confidence >= {CLAUDE_MIN_CONFIDENCE}"""
             return True, "Claude API error — allowing", 100
 
         _text = _response.json()["content"][0]["text"].strip()
+        if not _text:
+            print(f"⚠️ Claude returned empty response — allowing trade", flush=True)
+            return True, "Claude empty response — allowing", 100
+
+        # Strip markdown code blocks if present
+        _text = _text.replace("```json", "").replace("```", "").strip()
         _data = json.loads(_text)
 
         confidence = int(_data.get("confidence", 50))
@@ -4351,19 +4357,29 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         break
 
                     new_dir = "CALL" if current_ht_trend == 0 else "PUT"
-                    print(f"🔄 {instrument} HalfTrend FLIP → was {signal}, now {new_dir} — exiting", flush=True)
-                    send_message(
-                        f"🔄 HALFTREND FLIP EXIT\n"
-                        f"📌 {instrument}: {signal} → {new_dir}\n"
-                        f"🏷️ {symbol}\n"
-                        f"💰 P&L: ₹{current_pnl:.0f}  |  LTP: ₹{ltp:.1f}\n"
-                        f"📊 HT={last_exit['ht']:.2f}"
-                    )
+
+                    # Only alert and attempt exit once — prevent spam
+                    if not getattr(manage_trade, f"_ht_flip_{symbol}", False):
+                        setattr(manage_trade, f"_ht_flip_{symbol}", True)
+                        print(f"🔄 {instrument} HalfTrend FLIP → was {signal}, now {new_dir} — exiting", flush=True)
+                        send_message(
+                            f"🔄 HALFTREND FLIP EXIT\n"
+                            f"📌 {instrument}: {signal} → {new_dir}\n"
+                            f"🏷️ {symbol}\n"
+                            f"💰 P&L: ₹{current_pnl:.0f}  |  LTP: ₹{ltp:.1f}\n"
+                            f"📊 HT={last_exit['ht']:.2f}"
+                        )
+
                     if not exit_done:
                         _exit_ok = exit_position(symbol, remaining_qty, exchange)
                         if _exit_ok:
                             exit_done = True
+                            pnl = current_pnl
+                            # Clear flag on successful exit
+                            setattr(manage_trade, f"_ht_flip_{symbol}", False)
+                            break
                         else:
+                            # Exit failed — try market order once
                             print(f"⚠️ HT flip exit failed — trying market order", flush=True)
                             try:
                                 kite.place_order(
@@ -4376,11 +4392,22 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                                     product=kite.PRODUCT_MIS,
                                 )
                                 exit_done = True
+                                pnl = current_pnl
+                                setattr(manage_trade, f"_ht_flip_{symbol}", False)
+                                break
                             except Exception as _me:
                                 print(f"❌ Market order failed: {_me}", flush=True)
-                                send_message(f"🚨 EXIT MANUALLY NOW — {symbol} qty={remaining_qty}")
-                    pnl = current_pnl
-                    break
+                                if not getattr(manage_trade, f"_ht_mkt_alerted_{symbol}", False):
+                                    setattr(manage_trade, f"_ht_mkt_alerted_{symbol}", True)
+                                    send_message(
+                                        f"🚨 EXIT MANUALLY NOW — {symbol}\n"
+                                        f"qty={remaining_qty}\n"
+                                        f"(This alert will not repeat)"
+                                    )
+                                # Don't break — keep trying silently next tick
+                    else:
+                        pnl = current_pnl
+                        break
 
             except Exception as e:
                 print(f"HT exit error [{instrument}]: {e}", flush=True)

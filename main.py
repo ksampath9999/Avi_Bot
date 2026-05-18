@@ -4051,11 +4051,19 @@ def update_streak(pnl):
 
 def update_exit_time(instrument):
     global last_exit_time_nifty, last_exit_time_crude
+    global last_exit_time_banknifty, last_exit_time_finnifty, last_exit_time_sensex
 
+    now = time.time()
     if instrument == "NIFTY":
-        last_exit_time_nifty = time.time()
+        last_exit_time_nifty = now
+    elif instrument == "BANKNIFTY":
+        last_exit_time_banknifty = now
+    elif instrument == "FINNIFTY":
+        last_exit_time_finnifty = now
+    elif instrument == "SENSEX":
+        last_exit_time_sensex = now
     else:
-        last_exit_time_crude = time.time()
+        last_exit_time_crude = now
 
 # -----------------------------
 # TRADE MGMT
@@ -4078,6 +4086,10 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global max_drawdown, last_exit_time_nifty, last_exit_time_crude
     global nifty_active, crude_active
     global last_exit_reason
+    global nifty_trade_active, banknifty_trade_active, finnifty_trade_active
+    global sensex_trade_active, crude_trade_active
+    global nifty_position, banknifty_position, finnifty_position
+    global sensex_position, crude_position
     # exit_done is intentionally LOCAL so two concurrent manage_trade threads
     # (old + new after a flip) do not share state.
     exit_done = False
@@ -4569,8 +4581,8 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
         # -----------------------------
         with lock:
             global global_trade_active
-            global nifty_daily_pnl,     crude_daily_pnl
-            global banknifty_daily_pnl, finnifty_daily_pnl, sensex_daily_pnl, crude_daily_pnl
+            global nifty_daily_pnl,     sensex_daily_pnl
+            global banknifty_daily_pnl, finnifty_daily_pnl, crude_daily_pnl
             global nifty_trade_count,     crude_trade_count
             global banknifty_trade_count, finnifty_trade_count, sensex_trade_count
             global nifty_daily_wins,     nifty_daily_losses

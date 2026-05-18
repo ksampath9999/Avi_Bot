@@ -898,11 +898,13 @@ last_exit_reason = None
 # on a position it no longer owns.
 _nifty_trade_gen     = [0]
 _banknifty_trade_gen = [0]
+_finnifty_trade_gen  = [0]
 _sensex_trade_gen    = [0]
 _crude_trade_gen     = [0]
 
 nifty_trade_count     = 0
 banknifty_trade_count = 0
+finnifty_trade_count  = 0
 sensex_trade_count    = 0
 crude_trade_count     = 0
 
@@ -1050,11 +1052,10 @@ crude_trade_active = False
 
 def is_nifty_trading_time():
     now = datetime.now(IST)
-
     return (
-        (now.hour == 9 and now.minute >= 30) or   # entries only from 9:30 AM
+        (now.hour == 9 and now.minute >= 20) or   # entries from 9:20 AM
         (9 < now.hour < 15) or
-        (now.hour == 15 and now.minute <= 30)
+        (now.hour == 15 and now.minute < 20)
     )
 
 

@@ -3569,24 +3569,25 @@ def find_option(signal, instrument):
             max_price = 300        # ₹300 × 40 = ₹12,000 per lot
     elif instrument == "SENSEX":
         # SENSEX lot = 20. Strikes move in ₹100 steps.
+        # SENSEX ~74,000. 200pt OTM option costs ~₹150-250. Lot cost = premium × 20.
         if balance <= 2500:
-            strike_shift = 3       # 300 OTM — cheaper option
-            max_price = 60         # ₹60 × 20 = ₹1,200 per lot
+            strike_shift = 4       # 400 OTM — cheaper deep OTM
+            max_price = 80         # ₹80 × 20 = ₹1,600 per lot
         elif balance <= 5000:
-            strike_shift = 2       # 200 OTM
-            max_price = 120        # ₹120 × 20 = ₹2,400 per lot
+            strike_shift = 3       # 300 OTM
+            max_price = 150        # ₹150 × 20 = ₹3,000 per lot
         elif balance <= 10000:
-            strike_shift = 2
-            max_price = 180        # ₹180 × 20 = ₹3,600 per lot
+            strike_shift = 2       # 200 OTM
+            max_price = 220        # ₹220 × 20 = ₹4,400 per lot
         elif balance <= 20000:
-            strike_shift = 1
-            max_price = 250        # ₹250 × 20 = ₹5,000 per lot
+            strike_shift = 1       # 100 OTM
+            max_price = 350        # ₹350 × 20 = ₹7,000 per lot
         elif balance <= 35000:
             strike_shift = 1
-            max_price = 350        # ₹350 × 20 = ₹7,000 per lot
+            max_price = 500        # ₹500 × 20 = ₹10,000 per lot
         else:
             strike_shift = 1
-            max_price = 500        # ₹500 × 20 = ₹10,000 per lot
+            max_price = 700        # ₹700 × 20 = ₹14,000 per lot
     else:
         # NIFTY — lot size 15 (updated Apr 2025)
         # 1 lot value = premium * 65

@@ -4610,16 +4610,42 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     pnl = current_pnl
                     break
 
-            # 🚀 Smart time exit (only if NO momentum)
-            #if time.time() - entry_time > 900:
-                
-            #    if abs(ltp - entry) < entry * 0.003:
-            #        pnl = profit * remaining_qty
-            #        if not exit_done:
-            #            exit_position(symbol, remaining_qty, exchange)
-            #            exit_done = True
-            #        send_message(f"⏱ No momentum exit\n{symbol}")
-            #        break
+            # ================================================================
+            # ⏱️ THETA DECAY EXIT — exit if trade held too long with no momentum
+            # Options lose value rapidly after 90 min due to time decay.
+            # Only exits if:
+            #   1. Trade held > 90 min
+            #   2. P&L is flat or slightly negative (no momentum)
+            #   3. Profit lock NOT already triggered (that handles profit case)
+            # ================================================================
+            _trade_age_mins = (time.time() - entry_time) / 60
+            _USE_TIME_EXIT  = True    # set False to disable
+            _TIME_EXIT_MINS = 90      # exit after 90 min if no momentum
+            _MOMENTUM_PCT   = 0.10    # option must have moved >10% to stay in trade
+
+            if (_USE_TIME_EXIT
+                    and not exit_done
+                    and _trade_age_mins >= _TIME_EXIT_MINS
+                    and local_max_profit < 1000):    # profit lock not active
+                _moved_pct = abs(ltp - entry) / entry if entry > 0 else 0
+                if _moved_pct < _MOMENTUM_PCT:
+                    print(f"⏱️ THETA EXIT: {_trade_age_mins:.0f} min held, "
+                          f"option moved only {_moved_pct*100:.1f}% — decay risk", flush=True)
+                    send_message(
+                        f"⏱️ THETA DECAY EXIT\n"
+                        f"📌 {instrument} {signal} → {symbol}\n"
+                        f"🕐 Held: {_trade_age_mins:.0f} minutes (>{_TIME_EXIT_MINS} min)\n"
+                        f"📊 Option moved only {_moved_pct*100:.1f}% — no momentum\n"
+                        f"💰 P&L: ₹{current_pnl:.0f}\n"
+                        f"💡 Exiting to avoid theta decay erosion\n"
+                        f"♻️ Will re-enter immediately if signal still active"
+                    )
+                    _te_ok = exit_position(symbol, remaining_qty, exchange)
+                    if not _te_ok:
+                        send_message(f"🚨 THETA EXIT FAILED — EXIT {symbol} MANUALLY")
+                    exit_done = True
+                    pnl = current_pnl
+                    break
 
             time.sleep(1.5)
 

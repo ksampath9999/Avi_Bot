@@ -4189,7 +4189,18 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     f"💰 P&L: ₹{_pnl_now:.0f}\n"
                     f"🚪 Exiting to avoid overnight / weekend hold"
                 )
-                exit_position(symbol, remaining_qty, exchange)
+                _fc_ok = exit_position(symbol, remaining_qty, exchange)
+                if not _fc_ok:
+                    # Check if already gone
+                    try:
+                        _net_fc = kite.positions().get("net", [])
+                        _fc_open = any(p.get("tradingsymbol") == symbol and p.get("quantity", 0) > 0 for p in _net_fc)
+                    except Exception:
+                        _fc_open = False
+                    if not _fc_open:
+                        print(f"✅ {symbol} not in positions — already exited", flush=True)
+                    else:
+                        send_message(f"🚨 FORCE CLOSE FAILED — EXIT {symbol} qty={remaining_qty} MANUALLY NOW")
                 pnl = _pnl_now
                 break
 
@@ -4234,29 +4245,32 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     half_qty   = exit_lots * one_lot
 
                     if half_qty > 0 and half_qty < remaining_qty:
-                        # Calculate partial P&L before exit
-                        _partial_pnl = (profit - entry) * half_qty
-                        exit_position(symbol, half_qty, exchange)
+                        # Calculate partial P&L: profit = ltp - entry (already computed above)
+                        _partial_pnl = profit * half_qty
+                        _exit_ok_partial = exit_position(symbol, half_qty, exchange)
 
-                        remaining_qty -= half_qty
-                        partial_booked = True
-                        partial_pnl   += _partial_pnl   # accumulate partial profits
+                        if _exit_ok_partial:
+                            remaining_qty -= half_qty
+                            partial_booked = True
+                            partial_pnl   += _partial_pnl
 
-                        # Reset profit lock baseline to POST-partial P&L
-                        local_max_profit = profit * remaining_qty
-                        manage_trade._partial_just_booked = True
+                            # Reset profit lock baseline to POST-partial P&L
+                            local_max_profit = profit * remaining_qty
+                            manage_trade._partial_just_booked = True
 
-                        print(f"💰 Partial booked: {half_qty} units | "
-                              f"Remaining: {remaining_qty} | "
-                              f"Partial P&L: ₹{_partial_pnl:.0f} | "
-                              f"Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
-                        send_message(
-                            f"💰 PARTIAL BOOKING\n"
-                            f"📌 {instrument} {signal} → {symbol}\n"
-                            f"📤 Exited {half_qty} units ({exit_lots} lot{'s' if exit_lots>1 else ''})\n"
-                            f"📊 Remaining: {remaining_qty} units\n"
-                            f"💰 Partial P&L: ₹{_partial_pnl:.0f} | Total so far: ₹{current_pnl:.0f}"
-                        )
+                            print(f"💰 Partial booked: {half_qty} units | "
+                                  f"Remaining: {remaining_qty} | "
+                                  f"Partial P&L: ₹{_partial_pnl:.0f} | "
+                                  f"Lock baseline reset to ₹{local_max_profit:.0f}", flush=True)
+                            send_message(
+                                f"💰 PARTIAL BOOKING\n"
+                                f"📌 {instrument} {signal} → {symbol}\n"
+                                f"📤 Exited {half_qty} units ({exit_lots} lot{'s' if exit_lots>1 else ''})\n"
+                                f"📊 Remaining: {remaining_qty} units\n"
+                                f"💰 Partial P&L: ₹{_partial_pnl:.0f} | Total so far: ₹{current_pnl:.0f}"
+                            )
+                        else:
+                            print(f"⚠️ Partial booking exit failed — skipping partial", flush=True)
 
             # ===============================
             # 💰 GLOBAL PROFIT PROTECTION
@@ -4344,12 +4358,29 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         break
 
                 elif current_pnl < lock_level and _exit_attempted and not exit_done:
-                    # Exit was attempted but failed — keep trying silently without alerting
-                    _exit_ok = exit_position(symbol, remaining_qty, exchange)
-                    if _exit_ok:
+                    # Exit was attempted but failed — re-check if position still open
+                    try:
+                        _net = kite.positions().get("net", [])
+                        _still_open = any(
+                            p.get("tradingsymbol") == symbol and p.get("quantity", 0) > 0
+                            for p in _net
+                        )
+                    except Exception:
+                        _still_open = True  # assume still open if API fails
+
+                    if not _still_open:
+                        # Position gone — manually exited or already filled
+                        print(f"✅ {symbol} no longer in Kite positions — treating as exited", flush=True)
                         exit_done = True
                         pnl = current_pnl
                         break
+                    else:
+                        # Still open — retry exit silently
+                        _exit_ok = exit_position(symbol, remaining_qty, exchange)
+                        if _exit_ok:
+                            exit_done = True
+                            pnl = current_pnl
+                            break
 
             # ===============================
             # 🧠 ATR BASED TRAILING
@@ -4489,10 +4520,24 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                                         f"qty={remaining_qty}\n"
                                         f"(This alert will not repeat)"
                                     )
-                                # Don't break — keep trying silently next tick
-                    else:
-                        pnl = current_pnl
-                        break
+                        # Don't break — keep monitoring silently
+                        # But first check if position still exists
+                        try:
+                            _net2 = kite.positions().get("net", [])
+                            _still_open2 = any(
+                                p.get("tradingsymbol") == symbol and p.get("quantity", 0) > 0
+                                for p in _net2
+                            )
+                        except Exception:
+                            _still_open2 = True
+
+                        if not _still_open2:
+                            print(f"✅ {symbol} no longer open — treating as manually exited", flush=True)
+                            setattr(manage_trade, f"_ht_flip_{symbol}", False)
+                            setattr(manage_trade, f"_ht_mkt_alerted_{symbol}", False)
+                            exit_done = True
+                            pnl = current_pnl
+                            break
 
             except Exception as e:
                 print(f"HT exit error [{instrument}]: {e}", flush=True)
@@ -4537,7 +4582,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                             f"💔 P&L: ₹{current_pnl:.0f}\n"
                             f"📊 Entry: ₹{entry:.1f}  |  Peak: ₹{peak:.1f}"
                         )
-                        exit_position(symbol, remaining_qty, exchange)
+                        _sl_ok = exit_position(symbol, remaining_qty, exchange)
+                        if not _sl_ok:
+                            send_message(f"🚨 SL EXIT FAILED — EXIT {symbol} MANUALLY NOW")
                         exit_done = True
                         pnl = current_pnl
                         break
@@ -4556,7 +4603,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"📉 Entry: ₹{entry:.1f}  |  Exit LTP: ₹{ltp:.1f}\n"
                         f"📊 Hard SL = {sl_pct_lbl} of option premium × qty"
                     )
-                    exit_position(symbol, remaining_qty, exchange)
+                    _hsl_ok = exit_position(symbol, remaining_qty, exchange)
+                    if not _hsl_ok:
+                        send_message(f"🚨 HARD SL EXIT FAILED — EXIT {symbol} MANUALLY NOW")
                     exit_done = True
                     pnl = current_pnl
                     break
@@ -4991,12 +5040,19 @@ def exit_position(symbol, qty, exchange):
         slippage_pcts = [0.995, 0.990, 0.982, 0.970]   # increasingly aggressive
 
         for attempt, slip in enumerate(slippage_pcts, 1):
+            # Re-fetch LTP on each attempt — price moves during retries
+            try:
+                _fresh_ltp = safe_ltp(f"{exchange}:{symbol}")
+                if _fresh_ltp and _fresh_ltp > 0:
+                    ltp = _fresh_ltp
+            except Exception:
+                pass  # keep using last known ltp
+
             # For very cheap options (< ₹15), use bigger absolute slippage
-            # % slippage on ₹12 = only ₹0.06 which may be below tick size
             if ltp < 15:
-                exit_price = max(0.5, round(ltp - (attempt * 0.5), 1))   # drop ₹0.5 per attempt
+                exit_price = max(0.5, round(ltp - (attempt * 0.5), 1))
             elif ltp < 50:
-                exit_price = max(0.5, round(ltp * slip - 0.5, 1))        # extra ₹0.5 buffer
+                exit_price = max(0.5, round(ltp * slip - 0.5, 1))
             else:
                 exit_price = round(ltp * slip, 1)
 
@@ -5018,9 +5074,14 @@ def exit_position(symbol, qty, exchange):
                 )
                 print(f"   Order placed: {order_id}")
             except Exception as oe:
-                print(f"   ⚠️ Order placement failed: {oe}")
                 _last_order_err = str(oe)
-                time.sleep(1)
+                print(f"   ⚠️ Order placement failed: {oe}")
+                # If timeout — wait longer before retry
+                if "timed out" in _last_order_err.lower() or "timeout" in _last_order_err.lower():
+                    print(f"   ⏳ Timeout detected — waiting 3s before retry", flush=True)
+                    time.sleep(3)
+                else:
+                    time.sleep(1)
                 continue
 
             # Wait up to 3 seconds for fill confirmation
@@ -8635,8 +8696,20 @@ def _kite_day_pnl(instrument):
     Returns (pnl, wins, losses, trade_count).
     Wins/losses counted per distinct option symbol traded.
     """
-    exchange_map = {"NIFTY": "NFO", "BANKNIFTY": "NFO", "SENSEX": "BFO", "CRUDE": "MCX"}
-    prefix_map   = {"NIFTY": "NIFTY", "BANKNIFTY": "BANKNIFTY", "SENSEX": "SENSEX", "CRUDE": None}
+    exchange_map = {
+        "NIFTY":     "NFO",
+        "BANKNIFTY": "NFO",
+        "FINNIFTY":  "NFO",
+        "SENSEX":    "BFO",
+        "CRUDE":     "MCX",
+    }
+    prefix_map = {
+        "NIFTY":     "NIFTY",
+        "BANKNIFTY": "BANKNIFTY",
+        "FINNIFTY":  "FINNIFTY",
+        "SENSEX":    "SENSEX",
+        "CRUDE":     None,
+    }
 
     try:
         positions    = kite.positions()
@@ -8649,9 +8722,16 @@ def _kite_day_pnl(instrument):
             if p.get("exchange") != target_exch:
                 continue
             sym = p.get("tradingsymbol", "")
-            # Distinguish NIFTY vs BANKNIFTY (both on NFO)
-            if instrument.upper() == "NIFTY" and sym.startswith("BANKNIFTY"):
-                continue
+            # Distinguish NFO instruments (NIFTY vs BANKNIFTY vs FINNIFTY)
+            if instrument.upper() == "NIFTY":
+                if sym.startswith("BANKNIFTY") or sym.startswith("FINNIFTY"):
+                    continue
+            if instrument.upper() == "BANKNIFTY":
+                if not sym.startswith("BANKNIFTY"):
+                    continue
+            if instrument.upper() == "FINNIFTY":
+                if not sym.startswith("FINNIFTY"):
+                    continue
             if sym_prefix and not sym.startswith(sym_prefix):
                 continue
             filtered.append(p)
@@ -8660,7 +8740,6 @@ def _kite_day_pnl(instrument):
             return 0.0, 0, 0, 0
 
         # Group by tradingsymbol — partial bookings create multiple entries
-        # for the same symbol; we count each SYMBOL as one trade, not each entry
         from collections import defaultdict
         sym_pnl = defaultdict(float)
         for p in filtered:
@@ -8671,21 +8750,23 @@ def _kite_day_pnl(instrument):
         losses = sum(1 for v in sym_pnl.values() if v <= 0)
         count  = len(sym_pnl)   # unique symbols = unique trades
 
-        # Also count currently open position (in net but not yet closed in day)
-        # This ensures redeploy mid-trade doesn't undercount
+        # Also count open position if not already in day positions
         net_pos = positions.get("net", [])
         for p in net_pos:
             if p.get("exchange") != target_exch:
                 continue
             sym = p.get("tradingsymbol", "")
-            if instrument.upper() == "NIFTY" and sym.startswith("BANKNIFTY"):
+            if instrument.upper() == "NIFTY":
+                if sym.startswith("BANKNIFTY") or sym.startswith("FINNIFTY"):
+                    continue
+            if instrument.upper() == "BANKNIFTY" and not sym.startswith("BANKNIFTY"):
+                continue
+            if instrument.upper() == "FINNIFTY" and not sym.startswith("FINNIFTY"):
                 continue
             if sym_prefix and not sym.startswith(sym_prefix):
                 continue
-            if p.get("quantity", 0) > 0:
-                # Open position — check if already counted in day positions
-                if not any(d.get("tradingsymbol") == sym for d in filtered):
-                    count += 1   # count the open trade
+            if p.get("quantity", 0) > 0 and sym not in sym_pnl:
+                count += 1   # open trade not yet in day positions
 
         return pnl, wins, losses, count
 

@@ -4794,26 +4794,39 @@ def get_open_kite_position(instrument):
             return cached_result
 
     try:
-        exchange_map = {"NIFTY": "NFO", "BANKNIFTY": "NFO", "SENSEX": "BFO", "CRUDE": "MCX"}
-        # Symbol prefix to distinguish NIFTY vs BANKNIFTY (both NFO options)
-        prefix_map   = {"NIFTY": "NIFTY", "BANKNIFTY": "BANKNIFTY", "SENSEX": "SENSEX", "CRUDE": None}
+        exchange_map = {
+            "NIFTY":     "NFO",
+            "BANKNIFTY": "NFO",
+            "FINNIFTY":  "NFO",
+            "SENSEX":    "BFO",
+            "CRUDE":     "MCX",
+        }
+        prefix_map = {
+            "NIFTY":     "NIFTY",
+            "BANKNIFTY": "BANKNIFTY",
+            "FINNIFTY":  "FINNIFTY",
+            "SENSEX":    "SENSEX",
+            "CRUDE":     None,
+        }
         target_exchange = exchange_map.get(instrument)
         sym_prefix      = prefix_map.get(instrument)
 
         positions = kite.positions().get("net", [])
         for p in positions:
-            # Only consider positions with non-zero open quantity
             if p.get("quantity", 0) == 0:
                 continue
             if p.get("exchange") != target_exchange:
                 continue
-            # Must be an option (CE or PE)
             sym = p.get("tradingsymbol", "")
             if not (sym.endswith("CE") or sym.endswith("PE")):
                 continue
-            # For NFO instruments, check symbol prefix to separate NIFTY from BANKNIFTY
-            if sym_prefix and not sym.startswith(sym_prefix):
-                continue
+            # Strictly match prefix — NIFTY must NOT match BANKNIFTY or FINNIFTY
+            if sym_prefix:
+                if not sym.startswith(sym_prefix):
+                    continue
+                # Extra check for NIFTY — exclude BANKNIFTY and FINNIFTY
+                if instrument == "NIFTY" and (sym.startswith("BANKNIFTY") or sym.startswith("FINNIFTY")):
+                    continue
 
             result = {
                 "symbol":   sym,

@@ -998,6 +998,10 @@ _profit_lock_tier  = 0    # 0 = none, 1 = 80%, 2 = 85%, 3 = 90%
 # After exiting, the symbol is stored here.  The loop blocks re-entry of the
 # exact same symbol until a NEW arrow fires (is_fresh=True) or trend flips.
 _last_exited_symbol = {}   # instrument -> str e.g. "NIFTY2650523900PE"
+_blocked_strikes    = {    # strikes blocked after max-loss exit — cleared daily
+    "NIFTY": set(), "BANKNIFTY": set(), "FINNIFTY": set(),
+    "SENSEX": set(), "CRUDE": set()
+}
 
 # ── Profit-lock exit cooldown ─────────────────────────────────────────────────
 # After a per-trade profit lock exit, block new entries for 15 minutes to avoid
@@ -3439,6 +3443,7 @@ def get_crude_fut_symbol():
 # OPTION SELECTOR
 # -----------------------------
 def find_option(signal, instrument):
+    global _blocked_strikes
     print("🔍 Entered find_option")
 
     # =====================================
@@ -3676,6 +3681,13 @@ def find_option(signal, instrument):
             continue
 
         sym = f"{exchange}:{i['tradingsymbol']}"
+        tradingsym = i['tradingsymbol']
+
+        # ── Block strikes stopped out by max-loss today ───────────────────────
+        if tradingsym in _blocked_strikes.get(instrument, set()):
+            print(f"   🚫 Strike blocked (max-loss exit today): {tradingsym}", flush=True)
+            continue
+
         p = safe_ltp(sym)
 
         if p is None or p <= 0:
@@ -3795,6 +3807,11 @@ def find_option(signal, instrument):
             continue
 
         sym = f"{exchange}:{i['tradingsymbol']}"
+
+        # Block max-loss strikes in fallback too
+        if i['tradingsymbol'] in _blocked_strikes.get(instrument, set()):
+            continue
+
         p = safe_ltp(sym)
 
         if p is None or p <= 0:
@@ -4092,6 +4109,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global sensex_trade_active, crude_trade_active
     global nifty_position, banknifty_position, finnifty_position
     global sensex_position, crude_position
+    global _blocked_strikes
     # exit_done is intentionally LOCAL so two concurrent manage_trade threads
     # (old + new after a flip) do not share state.
     exit_done = False
@@ -4609,6 +4627,31 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     exit_done = True
                     pnl = current_pnl
                     break
+
+            # ================================================================
+            # 💔 MAX LOSS EXIT — exit immediately if loss hits ₹1,600
+            # Per-instrument only — NIFTY loss exits NIFTY, SENSEX exits SENSEX
+            # Blocks same strike from re-entry for rest of day
+            # ================================================================
+            MAX_LOSS_PER_TRADE = 1600
+
+            if not exit_done and current_pnl <= -MAX_LOSS_PER_TRADE:
+                print(f"💔 MAX LOSS ₹{current_pnl:.0f} <= -₹{MAX_LOSS_PER_TRADE} — exiting {symbol}", flush=True)
+                send_message(
+                    f"💔 MAX LOSS EXIT — ₹{MAX_LOSS_PER_TRADE} LIMIT HIT\n"
+                    f"📌 {instrument} {signal} → {symbol}\n"
+                    f"📉 Loss: ₹{current_pnl:.0f}\n"
+                    f"📊 Entry: ₹{entry:.1f}  |  LTP: ₹{ltp:.1f}\n"
+                    f"🚫 {symbol} blocked for rest of day — same strike won't re-enter"
+                )
+                _ml_ok = exit_position(symbol, remaining_qty, exchange)
+                if not _ml_ok:
+                    send_message(f"🚨 MAX LOSS EXIT FAILED — EXIT {symbol} MANUALLY NOW")
+                # Block this exact strike for rest of day
+                _blocked_strikes[instrument].add(symbol)
+                exit_done = True
+                pnl = current_pnl
+                break
 
             # ================================================================
             # ⏱️ THETA DECAY EXIT — exit if trade held too long with no momentum
@@ -7944,8 +7987,11 @@ def reset_daily_pnl():
         print("🎯 Daily profit target reset for new trading day", flush=True)
 
         # ── Reset same-strike guard for new day ───────────────────────────
-        global _last_exited_symbol
+        global _last_exited_symbol, _blocked_strikes
         _last_exited_symbol.clear()
+        for _inst in _blocked_strikes:
+            _blocked_strikes[_inst].clear()
+        print("🔓 Blocked strikes cleared for new trading day", flush=True)
 
         last_reset_date = today
         

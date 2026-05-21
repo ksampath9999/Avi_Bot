@@ -596,9 +596,18 @@ def daily_profit_target_monitor():
             if _daily_target_exited:
                 continue
 
-            # Calculate combined P&L
+            # Calculate combined P&L — closed trades + live unrealised
             _combined = (nifty_daily_pnl + banknifty_daily_pnl +
                          finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
+
+            # Add live unrealised P&L from currently open positions
+            try:
+                _net_positions = kite.positions().get("net", [])
+                for _p in _net_positions:
+                    if _p.get("quantity", 0) > 0:
+                        _combined += float(_p.get("pnl", 0) or 0)
+            except Exception as _lp_err:
+                print(f"⚠️ Live P&L fetch error: {_lp_err}", flush=True)
 
             if _combined < DAILY_PROFIT_TARGET:
                 continue
@@ -1002,6 +1011,15 @@ _blocked_strikes    = {    # strikes blocked after max-loss exit — cleared dai
     "NIFTY": set(), "BANKNIFTY": set(), "FINNIFTY": set(),
     "SENSEX": set(), "CRUDE": set()
 }
+# Whipsaw detection — track recent flip timestamps per instrument
+_flip_timestamps    = {    # {instrument: [timestamp, ...]} — last N flip times
+    "NIFTY": [], "BANKNIFTY": [], "FINNIFTY": [], "SENSEX": [], "CRUDE": []
+}
+WHIPSAW_WINDOW_SECS  = 1800   # 30-min window
+WHIPSAW_MAX_FLIPS    = 3      # if >= 3 flips in 30 min → whipsaw detected
+WHIPSAW_PAUSE_SECS   = 1800   # pause 30 min after whipsaw detected
+USE_WHIPSAW_FILTER   = os.environ.get("USE_WHIPSAW_FILTER", "true").lower() == "true"
+_whipsaw_pause_until = {}    # {instrument: timestamp}
 
 # ── Profit-lock exit cooldown ─────────────────────────────────────────────────
 # After a per-trade profit lock exit, block new entries for 15 minutes to avoid
@@ -1459,6 +1477,53 @@ def _get_algo_sz_rz(instrument, cur_price):
         return None, None
 
 
+def record_flip_and_check_whipsaw(instrument):
+    """
+    Records a HalfTrend flip timestamp for the instrument.
+    Returns (is_whipsaw, pause_remaining_secs).
+    If >= WHIPSAW_MAX_FLIPS flips in WHIPSAW_WINDOW_SECS → whipsaw detected.
+    """
+    global _flip_timestamps, _whipsaw_pause_until
+
+    if not USE_WHIPSAW_FILTER:
+        return False, 0   # disabled — no whipsaw detection
+
+    now = time.time()
+
+    # Check if currently in whipsaw pause
+    pause_until = _whipsaw_pause_until.get(instrument, 0)
+    if now < pause_until:
+        return True, int(pause_until - now)
+
+    # Record this flip
+    _flip_timestamps[instrument].append(now)
+
+    # Remove flips outside the window
+    _flip_timestamps[instrument] = [
+        t for t in _flip_timestamps[instrument]
+        if now - t <= WHIPSAW_WINDOW_SECS
+    ]
+
+    flip_count = len(_flip_timestamps[instrument])
+    print(f"🔄 {instrument} flip #{flip_count} in last {WHIPSAW_WINDOW_SECS//60} min", flush=True)
+
+    # Whipsaw detected
+    if flip_count >= WHIPSAW_MAX_FLIPS:
+        _whipsaw_pause_until[instrument] = now + WHIPSAW_PAUSE_SECS
+        _flip_timestamps[instrument].clear()  # reset after pause set
+        print(f"⚠️ WHIPSAW DETECTED [{instrument}]: {flip_count} flips in "
+              f"{WHIPSAW_WINDOW_SECS//60} min — pausing {WHIPSAW_PAUSE_SECS//60} min", flush=True)
+        send_message(
+            f"⚠️ WHIPSAW DETECTED — {instrument}\n"
+            f"📊 {flip_count} arrow flips in {WHIPSAW_WINDOW_SECS//60} minutes\n"
+            f"🛑 Choppy market — pausing entries for {WHIPSAW_PAUSE_SECS//60} minutes\n"
+            f"⏰ Resuming at {datetime.fromtimestamp(now + WHIPSAW_PAUSE_SECS, IST).strftime('%H:%M')} IST"
+        )
+        return True, WHIPSAW_PAUSE_SECS
+
+    return False, 0
+
+
 def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     """
     All entry filters — each independently controlled by a True/False flag.
@@ -1478,6 +1543,16 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     Returns (passed: bool, reason: str).
     """
     now_ist = datetime.now(IST)
+
+    # ── Whipsaw guard — pause entries if too many flips in short window ───────
+    if USE_WHIPSAW_FILTER:
+        _ws_pause = _whipsaw_pause_until.get(instrument, 0)
+        if time.time() < _ws_pause:
+            _mins_left = int((_ws_pause - time.time()) / 60) + 1
+            return False, (
+                f"⚠️ Whipsaw pause — choppy market detected, "
+                f"waiting {_mins_left} more min before new entries"
+            )
 
     # ── Daily profit target — stop new entries once hit ───────────────────────
     if DAILY_PROFIT_TARGET > 0 and _daily_target_exited:
@@ -3965,7 +4040,7 @@ def place_order(symbol, qty, exchange, instrument):
             f"📥 Order placed: {symbol}\n"
             f"   Price: ₹{price:.1f}  |  Qty: {quantity}  |  Lots: {qty}\n"
             f"   Total deployed: ₹{price * quantity:,.0f}\n"
-            f"   Max risk (25% SL): ₹{price * 0.25 * quantity:,.0f}"
+            f"   Max risk (45% SL): ₹{price * 0.45 * quantity:,.0f}"
         )
 
         filled_price = None
@@ -4127,27 +4202,21 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     ltp = entry
 
     # 🔥 CORE RISK MODEL — Two-tier SL
-    # Tier 1: 25% from entry — first touch → expand (spike/wick buffer, don't exit)
-    # Tier 2: 45% from entry — second touch → exit immediately
-    SL_TIER1 = 0.25   # initial SL
-    SL_TIER2 = 0.45   # expanded SL if tier-1 touched by single candle spike
-    risk = entry * SL_TIER1
-    sl_expanded = False   # True once tier-1 fires and we widen to tier-2
+    # Single 45% SL — exit immediately when option drops 45% from entry
+    SL_TIER2 = 0.45
+    risk = entry * SL_TIER2
+    sl   = entry - risk   # exit if option premium drops 45%
+    peak = entry          # track highest option premium reached
 
     # Bot always BUYS options (CE or PE).
     # P&L = option_price_now - entry_price (same formula for both CE and PE).
-    # SL fires when option premium drops below entry - risk (same for both).
-    sl   = entry - risk   # exit if option premium drops by risk %
-    peak = entry          # track highest option premium reached
-
-    # sl and spike_sl are always below entry (buying options → loss = premium drop)
-    _spike_sl = entry * (1 - SL_TIER2)   # entry - 45%
+    # SL fires when option premium drops below entry - risk.
+    _spike_sl = sl   # same level — single tier
     send_message(
         f"🚀 NEW TRADE ENTERED\n"
         f"📌 {instrument} {signal} → {symbol}\n"
         f"💰 Entry: ₹{entry:.1f}  |  Qty: {actual_qty}\n"
-        f"🛑 Initial SL : ₹{sl:.1f}  (entry − 25%)\n"
-        f"🛡️ Spike SL   : ₹{_spike_sl:.1f}  (entry − 45%, only if 25% wicked)\n"
+        f"🛑 SL: ₹{sl:.1f}  (entry − 45%)\n"
         f"📊 Deployed: ₹{entry * actual_qty:,.0f}"
     )
 
@@ -4426,24 +4495,18 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # ===============================
             # 🚀 ATR TRAILING (ADAPTIVE)
             # ===============================
-            # IMPORTANT: freeze trailing when sl_expanded=True.
-            # After tier-1 SL fires we widen to 45% (entry - 45%).
-            # Without this guard, the ATR trail immediately recalculates
-            # sl from peak (~entry level) and overwrites the 45% expansion,
-            # causing a tier-2 exit 1.5 s later instead of giving real room.
             trail_multiplier = 1.2
             old_sl = sl
 
-            if not sl_expanded:
-                # Normal trailing: SL rises as option premium rises
-                sl = max(sl, peak - (atr_value * trail_multiplier))
-                if abs(sl - old_sl) > entry * 0.005:
-                    print(f"📈 {instrument} trailing SL: ₹{old_sl:.1f} → ₹{sl:.1f}  P&L: ₹{current_pnl:.0f}", flush=True)
+            # Normal trailing: SL rises as option premium rises
+            sl = max(sl, peak - (atr_value * trail_multiplier))
+            if abs(sl - old_sl) > entry * 0.005:
+                print(f"📈 {instrument} trailing SL: ₹{old_sl:.1f} → ₹{sl:.1f}  P&L: ₹{current_pnl:.0f}", flush=True)
 
             # ===============================
             # 🔥 STRONG TREND MODE (LET PROFITS RUN)
             # ===============================
-            if current_pnl >= 3000 and not sl_expanded:
+            if current_pnl >= 3000:
                 sl = max(sl, peak - (atr_value * 0.8))
 
             # 🔥 HALFTREND EXIT — fires when arrow flips on closed candle
@@ -4564,70 +4627,29 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # 🛑 STOP LOSS EXITS  (checked in priority order every 1.5 s)
             # ================================================================
 
-            # ── 1 & 2. Stop Loss (controlled by USE_STOP_LOSS flag) ──────────
-            # Set USE_STOP_LOSS = True to re-enable at any time.
-            # Profit-lock above is always active regardless of this flag.
+            # ── Stop Loss — Single 45% tier ──────────────────────────────────
+            # Set USE_STOP_LOSS = True to enable.
+            # Exits immediately when option premium drops 45% from entry.
             if USE_STOP_LOSS:
-                # ── 1. Trailing SL — Two-tier spike protection ───────────────
-                # Tier 1 (25%): first touch → expand to 45% (don't exit)
-                # Tier 2 (45%): confirmed move → exit immediately
-                # Always buying options → SL fires when premium drops below sl level
+                sl = entry * (1 - SL_TIER2)   # 45% of entry price
                 trailing_hit = ltp <= sl
 
                 if trailing_hit and not exit_done:
-                    if not sl_expanded:
-                        # Tier 1 touched: widen SL to 45%, stay in trade
-                        sl_expanded = True
-                        risk = entry * SL_TIER2
-                        sl = entry - risk   # new SL = entry - 45%
-                        print(f"⚠️ SL TIER-1 TOUCHED (25%) — expanding to 45% | new SL=₹{sl:.1f}  LTP=₹{ltp:.1f}", flush=True)
-                        send_message(
-                            f"⚠️ SL SPIKE BUFFER — {instrument} {signal}\n"
-                            f"📌 {symbol}\n"
-                            f"📉 LTP: ₹{ltp:.1f} touched 25% SL\n"
-                            f"🛡️ Expanding SL to 45% → ₹{sl:.1f}\n"
-                            f"💔 P&L so far: ₹{current_pnl:.0f}"
-                        )
-                        # Do NOT break — continue monitoring at 45% SL
-                    else:
-                        # Tier 2 (45%) confirmed: exit now
-                        last_exit_reason = "TRAILING_SL"
-                        print(f"🛑 TRAILING SL HIT (45%) | LTP={ltp:.1f}  SL={sl:.1f}", flush=True)
-                        send_message(
-                            f"🛑 TRAILING SL HIT — EXITING\n"
-                            f"📌 {instrument} {signal} → {symbol}\n"
-                            f"📉 LTP: ₹{ltp:.1f}  |  SL (45%): ₹{sl:.1f}\n"
-                            f"💔 P&L: ₹{current_pnl:.0f}\n"
-                            f"📊 Entry: ₹{entry:.1f}  |  Peak: ₹{peak:.1f}"
-                        )
-                        _sl_ok = exit_position(symbol, remaining_qty, exchange)
-                        if not _sl_ok:
-                            send_message(f"🚨 SL EXIT FAILED — EXIT {symbol} MANUALLY NOW")
-                        exit_done = True
-                        pnl = current_pnl
-                        break
-
-                # ── 2. Hard SL safety net ────────────────────────────────────
-                # Fires if trailing SL misses (e.g. gap-down open).
-                max_loss = risk * remaining_qty
-                if current_pnl <= -max_loss and not exit_done:
-                    last_exit_reason = "HARD_SL"
-                    sl_pct_lbl = "45%" if sl_expanded else "25%"
-                    print(f"🛑 HARD SL HIT ({sl_pct_lbl}) | Loss: ₹{current_pnl:.0f} / Limit: ₹{-max_loss:.0f}", flush=True)
+                    last_exit_reason = "TRAILING_SL"
+                    print(f"🛑 SL HIT (45%) | entry=₹{entry:.1f} SL=₹{sl:.1f} LTP=₹{ltp:.1f}", flush=True)
                     send_message(
-                        f"🛑 HARD STOP LOSS HIT — EXITING\n"
+                        f"🛑 STOP LOSS HIT — EXITING\n"
                         f"📌 {instrument} {signal} → {symbol}\n"
-                        f"💔 Loss: ₹{current_pnl:.0f}  |  SL limit: ₹{-max_loss:.0f}\n"
-                        f"📉 Entry: ₹{entry:.1f}  |  Exit LTP: ₹{ltp:.1f}\n"
-                        f"📊 Hard SL = {sl_pct_lbl} of option premium × qty"
+                        f"📉 LTP: ₹{ltp:.1f}  |  SL (45%): ₹{sl:.1f}\n"
+                        f"💔 P&L: ₹{current_pnl:.0f}\n"
+                        f"📊 Entry: ₹{entry:.1f}  |  Loss: {((ltp-entry)/entry*100):.1f}%"
                     )
-                    _hsl_ok = exit_position(symbol, remaining_qty, exchange)
-                    if not _hsl_ok:
-                        send_message(f"🚨 HARD SL EXIT FAILED — EXIT {symbol} MANUALLY NOW")
+                    _sl_ok = exit_position(symbol, remaining_qty, exchange)
+                    if not _sl_ok:
+                        send_message(f"🚨 SL EXIT FAILED — EXIT {symbol} MANUALLY NOW")
                     exit_done = True
                     pnl = current_pnl
                     break
-
             # ================================================================
             # 💔 MAX LOSS EXIT — exit immediately if loss hits ₹1,600
             # Per-instrument only — NIFTY loss exits NIFTY, SENSEX exits SENSEX
@@ -5768,6 +5790,7 @@ def nifty_loop():
                         global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                         last_executed_signal_nifty = None
                     _just_flipped_nifty = True
+                    record_flip_and_check_whipsaw("NIFTY")
                     # Increment flip counter — next Claude call gets fresh evaluation
                     _claude_flip_counter["NIFTY"] = _claude_flip_counter.get("NIFTY", 0) + 1
                     for _k in list(_claude_filter_cache.keys()):
@@ -6926,6 +6949,7 @@ def finnifty_loop():
                     finnifty_loop._carryover_done = None
                     finnifty_loop._sig_alerted    = None
                     finnifty_loop._just_flipped   = True
+                    record_flip_and_check_whipsaw("FINNIFTY")
                     time.sleep(3)
             else:
                 with lock:
@@ -7355,6 +7379,7 @@ def sensex_loop():
                     sensex_loop._carryover_done = None
                     sensex_loop._sig_alerted    = None
                     sensex_loop._just_flipped   = True
+                    record_flip_and_check_whipsaw("SENSEX")
                     # Increment flip counter — next Claude call gets fresh evaluation
                     _claude_flip_counter["SENSEX"] = _claude_flip_counter.get("SENSEX", 0) + 1
                     for _k in list(_claude_filter_cache.keys()):
@@ -7670,7 +7695,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     Logic:
       1. Fetch live available balance from Kite.
       2. Risk amount = balance * RISK_PCT (5% by default).
-      3. SL is assumed at 25% of option premium (i.e. exit if premium drops 25%).
+      3. SL is set at 45% of option premium (i.e. exit if premium drops 45%).
       4. risk_per_lot = SL_points * lot_size
       5. lots = floor(risk_amount / risk_per_lot)
       6. Hard cap: total trade value (premium * lot_size * lots) <= MAX_CAPITAL_PCT of balance.
@@ -7991,7 +8016,10 @@ def reset_daily_pnl():
         _last_exited_symbol.clear()
         for _inst in _blocked_strikes:
             _blocked_strikes[_inst].clear()
-        print("🔓 Blocked strikes cleared for new trading day", flush=True)
+        for _inst in _flip_timestamps:
+            _flip_timestamps[_inst].clear()
+        _whipsaw_pause_until.clear()
+        print("🔓 Blocked strikes + whipsaw state cleared for new trading day", flush=True)
 
         last_reset_date = today
         
@@ -10643,7 +10671,7 @@ if __name__ == "__main__":
             f"   Hours     : 3:30 PM – 11:25 PM IST | Lot: 100 qty\n"
             f"\n"
             f"⚙️ Signal : HalfTrend + Hull Suite (5-min candles)\n"
-            f"⚙️ SL     : 25% → 45% two-tier (disabled by default)\n"
+            f"⚙️ SL     : 45% single-tier (enable USE_STOP_LOSS=True)\n"
             f"⚙️ Target : HalfTrend flip exit | Profit lock from ₹1,000\n"
             f"⚙️ Flip   : Immediate exit + re-entry on arrow reversal\n"
             f"\n"

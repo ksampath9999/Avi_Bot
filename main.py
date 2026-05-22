@@ -597,17 +597,25 @@ def daily_profit_target_monitor():
                 continue
 
             # Calculate combined P&L — closed trades + live unrealised
-            _combined = (nifty_daily_pnl + banknifty_daily_pnl +
-                         finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
+            _closed_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
+                           finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
+            _combined   = _closed_pnl
+            _live_pnl   = 0.0
 
             # Add live unrealised P&L from currently open positions
             try:
                 _net_positions = kite.positions().get("net", [])
                 for _p in _net_positions:
                     if _p.get("quantity", 0) > 0:
-                        _combined += float(_p.get("pnl", 0) or 0)
+                        _live_pnl += float(_p.get("pnl", 0) or 0)
+                _combined += _live_pnl
             except Exception as _lp_err:
                 print(f"⚠️ Live P&L fetch error: {_lp_err}", flush=True)
+
+            if _live_pnl != 0 or _closed_pnl != 0:
+                print(f"🎯 Target monitor: closed=₹{_closed_pnl:.0f} + "
+                      f"live=₹{_live_pnl:.0f} = combined=₹{_combined:.0f} "
+                      f"/ target=₹{DAILY_PROFIT_TARGET}", flush=True)
 
             if _combined < DAILY_PROFIT_TARGET:
                 continue

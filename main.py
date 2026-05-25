@@ -556,7 +556,10 @@ ADX_MIN_VALUE      = 20
 # Bot 2 (REW397): leave unset or set to 0 for no limit
 DAILY_PROFIT_TARGET = int(os.environ.get("DAILY_PROFIT_TARGET", "0"))
 
-_daily_target_exited = False   # flag — exit all trades once per day only
+# Profit protection mode — after daily target hit, allow new trades
+# but stop if P&L drops below the target (protect the gains)
+USE_PROFIT_PROTECTION = os.environ.get("USE_PROFIT_PROTECTION", "false").lower() == "true"
+_profit_protection_floor = 0.0   # set when target first hit
 
 
 def daily_profit_target_monitor():
@@ -568,7 +571,7 @@ def daily_profit_target_monitor():
       3. Block new entries for rest of day (via apply_entry_filters check)
     Runs only when DAILY_PROFIT_TARGET > 0.
     """
-    global _daily_target_exited
+    global _daily_target_exited, _profit_protection_floor
     global nifty_trade_active, banknifty_trade_active, finnifty_trade_active
     global sensex_trade_active, crude_trade_active
     global nifty_position, banknifty_position, finnifty_position, sensex_position, crude_position
@@ -593,16 +596,15 @@ def daily_profit_target_monitor():
                 _daily_target_exited = False
                 _last_reset_date     = _today
 
-            if _daily_target_exited:
-                continue
+            if _daily_target_exited and not USE_PROFIT_PROTECTION:
+                continue   # normal mode — target hit, skip everything
 
-            # Calculate combined P&L — closed trades + live unrealised
+            # ── Calculate combined P&L — closed trades + live unrealised ─────
             _closed_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
                            finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
             _combined   = _closed_pnl
             _live_pnl   = 0.0
 
-            # Add live unrealised P&L from currently open positions
             try:
                 _net_positions = kite.positions().get("net", [])
                 for _p in _net_positions:
@@ -617,11 +619,67 @@ def daily_profit_target_monitor():
                       f"live=₹{_live_pnl:.0f} = combined=₹{_combined:.0f} "
                       f"/ target=₹{DAILY_PROFIT_TARGET}", flush=True)
 
+            # ── PROFIT PROTECTION MODE ────────────────────────────────────────
+            # After target hit: allow new trades but stop if P&L drops below floor
+            if _daily_target_exited and USE_PROFIT_PROTECTION:
+                # Dynamic trailing floor — rises as profit grows, never drops
+                # Floor = max(DAILY_PROFIT_TARGET, peak_combined * 0.85)
+                # This protects 85% of peak profit achieved after target hit
+                if _combined > _profit_protection_floor:
+                    # New high — raise floor to lock in 85% of new peak
+                    _new_floor = max(
+                        DAILY_PROFIT_TARGET,           # never below original target
+                        _combined * 0.85               # 85% of current peak
+                    )
+                    if _new_floor > _profit_protection_floor:
+                        print(f"🛡️ Protection floor raised: ₹{_profit_protection_floor:.0f} → ₹{_new_floor:.0f} "
+                              f"(85% of ₹{_combined:.0f})", flush=True)
+                        _profit_protection_floor = _new_floor
+
+                if _combined < _profit_protection_floor:
+                    # P&L dropped below floor — exit all and stop
+                    print(f"🛡️ PROFIT PROTECTION: combined ₹{_combined:.0f} dropped below "
+                          f"floor ₹{_profit_protection_floor:.0f} — stopping all trades", flush=True)
+                    send_message(
+                        f"🛡️ PROFIT PROTECTION TRIGGERED\n"
+                        f"💰 Combined P&L: ₹{_combined:.0f} (live included)\n"
+                        f"🔒 Floor: ₹{_profit_protection_floor:.0f}\n"
+                        f"📉 P&L dropped below protection floor\n"
+                        f"🛑 Exiting all positions — no more trades today"
+                    )
+                    # Exit all open positions
+                    for _inst, _pos, _ in [
+                        ("NIFTY",     nifty_position,     nifty_trade_active),
+                        ("BANKNIFTY", banknifty_position,  banknifty_trade_active),
+                        ("FINNIFTY",  finnifty_position,   finnifty_trade_active),
+                        ("SENSEX",    sensex_position,     sensex_trade_active),
+                        ("CRUDE",     crude_position,      crude_trade_active),
+                    ]:
+                        with lock:
+                            _sym = _pos.get("symbol")
+                            _qty = _pos.get("qty", 0)
+                            _exc = _pos.get("exchange")
+                            _active = _pos.get("active", False)
+                        if _active and _sym and _qty > 0:
+                            print(f"   🔴 Protection exit {_inst}: {_sym}", flush=True)
+                            _ep_ok = exit_position(_sym, _qty, _exc)
+                            if not _ep_ok:
+                                send_message(f"🚨 PROTECTION EXIT FAILED — EXIT {_sym} MANUALLY")
+                    # Hard stop — block all new entries permanently today
+                    _daily_target_exited       = True
+                    _profit_protection_floor   = 0.0   # reset so apply_entry_filters blocks
+                    continue
+                else:
+                    # Still above floor — allow new trades
+                    print(f"🛡️ Protection: ₹{_combined:.0f} > floor ₹{_profit_protection_floor:.0f} ✅", flush=True)
+                    continue
+
+            # ── First time target hit ─────────────────────────────────────────
             if _combined < DAILY_PROFIT_TARGET:
                 continue
 
-            # ── Target hit — exit all active trades ──────────────────────
             _daily_target_exited = True
+            _profit_protection_floor = DAILY_PROFIT_TARGET   # protect the target amount
             print(f"🎯 DAILY TARGET HIT ₹{_combined:.0f} — exiting all positions", flush=True)
 
             _exited = []
@@ -683,18 +741,28 @@ def daily_profit_target_monitor():
                                        finnifty_trade_active or sensex_trade_active or crude_trade_active)
 
             _exit_summary = "\n".join(_exited) if _exited else "No active positions"
-            send_message(
-                f"🎯 DAILY TARGET HIT — ALL TRADES CLOSED\n"
-                f"💰 Combined P&L: ₹{_combined:.0f}\n"
-                f"🎉 Target: ₹{DAILY_PROFIT_TARGET:.0f}\n"
-                f"📊 NIFTY:     ₹{nifty_daily_pnl:.0f}\n"
-                f"📊 BANKNIFTY: ₹{banknifty_daily_pnl:.0f}\n"
-                f"📊 FINNIFTY:  ₹{finnifty_daily_pnl:.0f}\n"
-                f"📊 SENSEX:    ₹{sensex_daily_pnl:.0f}\n"
-                f"📊 CRUDE:     ₹{crude_daily_pnl:.0f}\n"
-                f"🔴 Closed:\n{_exit_summary}\n"
-                f"🛑 No new entries for rest of day"
-            )
+
+            if USE_PROFIT_PROTECTION:
+                send_message(
+                    f"🎯 DAILY TARGET HIT ₹{_combined:.0f}\n"
+                    f"🛡️ PROFIT PROTECTION MODE ON\n"
+                    f"🔒 Floor: ₹{_profit_protection_floor:.0f} — new trades allowed\n"
+                    f"⚠️ Will stop if combined drops below ₹{_profit_protection_floor:.0f}\n"
+                    f"🔴 Closed:\n{_exit_summary}"
+                )
+            else:
+                send_message(
+                    f"🎯 DAILY TARGET HIT — ALL TRADES CLOSED\n"
+                    f"💰 Combined P&L: ₹{_combined:.0f}\n"
+                    f"🎉 Target: ₹{DAILY_PROFIT_TARGET:.0f}\n"
+                    f"📊 NIFTY:     ₹{nifty_daily_pnl:.0f}\n"
+                    f"📊 BANKNIFTY: ₹{banknifty_daily_pnl:.0f}\n"
+                    f"📊 FINNIFTY:  ₹{finnifty_daily_pnl:.0f}\n"
+                    f"📊 SENSEX:    ₹{sensex_daily_pnl:.0f}\n"
+                    f"📊 CRUDE:     ₹{crude_daily_pnl:.0f}\n"
+                    f"🔴 Closed:\n{_exit_summary}\n"
+                    f"🛑 No new entries for rest of day"
+                )
 
         except Exception as _mon_err:
             print(f"⚠️ Target monitor error: {_mon_err}", flush=True)
@@ -821,8 +889,15 @@ last_loss_time = None
 last_reset_date = None
 
 MAX_DRAWDOWN = -3000   # adjust based on capital
-win_streak = 0
-loss_streak = 0
+win_streak  = 0
+loss_streak = 0   # global — kept for backward compat only
+# Per-instrument consecutive loss counters — independent for each instrument
+_loss_streak = {
+    "NIFTY": 0, "BANKNIFTY": 0, "FINNIFTY": 0, "SENSEX": 0, "CRUDE": 0
+}
+_win_streak = {
+    "NIFTY": 0, "BANKNIFTY": 0, "FINNIFTY": 0, "SENSEX": 0, "CRUDE": 0
+}
 
 
 last_trade_time_nifty = 0
@@ -1564,12 +1639,15 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 
     # ── Daily profit target — stop new entries once hit ───────────────────────
     if DAILY_PROFIT_TARGET > 0 and _daily_target_exited:
-        _combined_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
-                         finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
-        return False, (
-            f"🎯 Daily target hit — combined P&L Rs.{_combined_pnl:.0f} "
-            f">= target Rs.{DAILY_PROFIT_TARGET:.0f} — no new entries today"
-        )
+        if USE_PROFIT_PROTECTION and _profit_protection_floor > 0:
+            pass   # protection mode active — monitor handles floor, allow new entries
+        else:
+            _combined_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
+                             finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
+            return False, (
+                f"🎯 Daily target hit — combined P&L Rs.{_combined_pnl:.0f} "
+                f">= target Rs.{DAILY_PROFIT_TARGET:.0f} — no new entries today"
+            )
 
     # ── 0. First candle range filter — rangebound inside-day detection ─────────
     # If price is still inside the 9:15 AM first candle's high/low range,
@@ -3177,7 +3255,8 @@ def can_trade():
         return False
 
     # 🚫 Losing streak control — do NOT sleep here; let the loop handle the pause
-    if loss_streak >= 3:
+    _inst_streak = _loss_streak.get(instrument, loss_streak)
+    if _inst_streak >= 3:
         return False
 
     return True
@@ -4139,16 +4218,22 @@ def place_order(symbol, qty, exchange, instrument):
         return None
         
         
-def update_streak(pnl):
-    global win_streak, loss_streak, last_loss_time
+def update_streak(pnl, instrument=None):
+    global win_streak, loss_streak, last_loss_time, _loss_streak, _win_streak
 
     if pnl > 0:
         win_streak += 1
         loss_streak = 0
+        if instrument and instrument in _loss_streak:
+            _win_streak[instrument]  += 1
+            _loss_streak[instrument]  = 0
     else:
         loss_streak += 1
         win_streak = 0
         last_loss_time = time.time()
+        if instrument and instrument in _loss_streak:
+            _loss_streak[instrument] += 1
+            _win_streak[instrument]   = 0
 
 
 def update_exit_time(instrument):
@@ -4771,7 +4856,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 if pnl > 0: crude_daily_wins   += 1
                 else:        crude_daily_losses += 1
 
-            update_streak(pnl)
+            update_streak(pnl, instrument)
             update_exit_time(instrument)
 
             # 🔥 FLIP RACE CONDITION FIX:
@@ -5656,7 +5741,7 @@ def nifty_loop():
             reset_daily_pnl()
 
             # Loss streak cooldown — pause then RESET (same fix as CRUDE).
-            if loss_streak >= 3:
+            if _loss_streak["NIFTY"] >= 3:
                 print("⚠️ Loss streak >= 3 — pausing NIFTY 15 min then resetting streak", flush=True)
                 send_message("❌ NIFTY: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)   # 15-minute cooldown
@@ -6019,7 +6104,7 @@ def crude_loop():
             # Loss streak cooldown — pause then RESET so CRUDE can resume trading.
             # Without reset, bot loops on this check forever (streak never clears
             # unless a trade wins, but no trades are placed = permanent deadlock).
-            if loss_streak >= 3:
+            if _loss_streak["CRUDE"] >= 3:
                 print("⚠️ Loss streak >= 3 — pausing CRUDE 15 min then resetting streak", flush=True)
                 send_message("❌ CRUDE: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)   # 15-minute cooldown
@@ -6419,7 +6504,7 @@ def banknifty_loop():
             reset_daily_pnl()
 
             # Loss streak cooldown
-            if loss_streak >= 3:
+            if _loss_streak["BANKNIFTY"] >= 3:
                 print("⚠️ Loss streak >= 3 — pausing BANKNIFTY 15 min then resetting streak", flush=True)
                 send_message("❌ BANKNIFTY: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)
@@ -6824,7 +6909,7 @@ def finnifty_loop():
             reset_daily_pnl()
 
             # Loss streak cooldown
-            if loss_streak >= 3:
+            if _loss_streak["FINNIFTY"] >= 3:
                 print("⚠️ Loss streak >= 3 — pausing FINNIFTY 15 min then resetting streak", flush=True)
                 send_message("❌ FINNIFTY: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)
@@ -7226,7 +7311,7 @@ def sensex_loop():
             reset_daily_pnl()
 
             # Loss streak cooldown
-            if loss_streak >= 3:
+            if _loss_streak["SENSEX"] >= 3:
                 print("⚠️ Loss streak >= 3 — pausing SENSEX 15 min then resetting streak", flush=True)
                 send_message("❌ SENSEX: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)
@@ -7779,10 +7864,11 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
         lots = int(lots * 1.15)
         print(f"📈 Win streak {win_streak} → slight scale up to {lots} lots")
 
-    if loss_streak >= 3:
+    _streak = _loss_streak.get(instrument, loss_streak) if instrument else loss_streak
+    if _streak >= 3:
         lots = 1
-        print(f"🛑 Loss streak {loss_streak} → forced to 1 lot")
-    elif loss_streak >= 2:
+        print(f"🛑 Loss streak {_streak} → forced to 1 lot")
+    elif _streak >= 2:
         lots = max(1, int(lots * 0.6))
         print(f"⚠️ Loss streak {loss_streak} → scale down to {lots} lots")
 
@@ -8015,12 +8101,16 @@ def reset_daily_pnl():
         print("🔓 Profit lock reset for new trading day", flush=True)
 
         # ── Reset daily profit target flag for new day ────────────────────
-        global _daily_target_exited
-        _daily_target_exited = False
+        global _daily_target_exited, _profit_protection_floor
+        _daily_target_exited     = False
+        _profit_protection_floor = 0.0
         print("🎯 Daily profit target reset for new trading day", flush=True)
 
         # ── Reset same-strike guard for new day ───────────────────────────
-        global _last_exited_symbol, _blocked_strikes
+        global _loss_streak, _win_streak
+        for _inst in _loss_streak:
+            _loss_streak[_inst] = 0
+            _win_streak[_inst]  = 0
         _last_exited_symbol.clear()
         for _inst in _blocked_strikes:
             _blocked_strikes[_inst].clear()
@@ -10546,18 +10636,21 @@ if __name__ == "__main__":
                     ).start()
                     _screener_refresh_sent[0] = True
 
+                # ── EOD Reports — weekdays only (Mon=0 to Fri=4) ──────────────
+                _is_weekday = now.weekday() < 5
+
                 # 3:31 PM — Nifty EOD report
-                if now.hour == 15 and now.minute == 31 and not _nifty_eod_sent[0]:
+                if _is_weekday and now.hour == 15 and now.minute == 31 and not _nifty_eod_sent[0]:
                     send_nifty_eod_report()
                     _nifty_eod_sent[0] = True
 
                 # 3:32 PM — BankNifty EOD report
-                if now.hour == 15 and now.minute == 32 and not _banknifty_eod_sent[0]:
+                if _is_weekday and now.hour == 15 and now.minute == 32 and not _banknifty_eod_sent[0]:
                     send_banknifty_eod_report()
                     _banknifty_eod_sent[0] = True
 
                 # 3:32 PM (30s later) — FINNIFTY EOD report
-                if now.hour == 15 and now.minute == 32 and now.second >= 30 and not getattr(daily_report_scheduler, "_finnifty_eod_sent", False):
+                if _is_weekday and now.hour == 15 and now.minute == 32 and now.second >= 30 and not getattr(daily_report_scheduler, "_finnifty_eod_sent", False):
                     try:
                         fn_pnl_r, fn_w, fn_l, fn_c = _kite_day_pnl("FINNIFTY")
                         emoji = "✅" if fn_pnl_r >= 0 else "❌"
@@ -10575,27 +10668,27 @@ if __name__ == "__main__":
                     daily_report_scheduler._finnifty_eod_sent = True
 
                 # 3:33 PM — SENSEX EOD report (same session as NIFTY/BANKNIFTY)
-                if now.hour == 15 and now.minute == 33 and not _sensex_eod_sent[0]:
+                if _is_weekday and now.hour == 15 and now.minute == 33 and not _sensex_eod_sent[0]:
                     send_sensex_eod_report()
                     _sensex_eod_sent[0] = True
 
                 # 3:34 PM — Swing trade summary
-                if now.hour == 15 and now.minute == 34 and not _swing_eod_sent[0]:
+                if _is_weekday and now.hour == 15 and now.minute == 34 and not _swing_eod_sent[0]:
                     send_swing_eod_report()
                     _swing_eod_sent[0] = True
 
                 # 3:35 PM — Stock options summary
-                if now.hour == 15 and now.minute == 35 and not _stockopt_eod_sent[0]:
+                if _is_weekday and now.hour == 15 and now.minute == 35 and not _stockopt_eod_sent[0]:
                     send_stock_options_eod_report()
                     _stockopt_eod_sent[0] = True
 
                 # 11:31 PM — Crude EOD report (after force-close at 11:25 PM, all trades done)
-                if now.hour == 23 and now.minute == 31 and not _crude_eod_sent[0]:
+                if _is_weekday and now.hour == 23 and now.minute == 31 and not _crude_eod_sent[0]:
                     send_crude_eod_report()
                     _crude_eod_sent[0] = True
 
                 # 11:32 PM — Combined daily report (all instruments together)
-                if now.hour == 23 and now.minute == 32 and not _full_report_sent[0]:
+                if _is_weekday and now.hour == 23 and now.minute == 32 and not _full_report_sent[0]:
                     send_daily_report()
                     _full_report_sent[0] = True
 

@@ -4050,11 +4050,11 @@ def place_order(symbol, qty, exchange, instrument):
     now = datetime.now(IST)
 
     if exchange in ("NFO", "BFO") and not (
-        (now.hour == 9 and now.minute >= 30) or   # no orders before 9:30 AM
+        (now.hour == 9 and now.minute >= 20) or   # no orders before 9:20 AM
         (9 < now.hour < 15) or
-        (now.hour == 15 and now.minute <= 30)
+        (now.hour == 15 and now.minute < 20)
     ):
-        print("🚫 Market closed or before 9:30 AM — skipping order")
+        print("🚫 Market closed or before 9:20 AM — skipping order")
         return None
 
     # 🚫 STRICT OPTION ONLY (REPLACE THIS BLOCK)
@@ -4123,12 +4123,7 @@ def place_order(symbol, qty, exchange, instrument):
             product="MIS" if exchange in ("NFO", "BFO") else "NRML"
         )
 
-        send_message(
-            f"📥 Order placed: {symbol}\n"
-            f"   Price: ₹{price:.1f}  |  Qty: {quantity}  |  Lots: {qty}\n"
-            f"   Total deployed: ₹{price * quantity:,.0f}\n"
-            f"   Max risk (45% SL): ₹{price * 0.45 * quantity:,.0f}"
-        )
+        print(f"   Order ID: {order_id} — waiting for fill...", flush=True)
 
         filled_price = None
 
@@ -4148,7 +4143,7 @@ def place_order(symbol, qty, exchange, instrument):
                         filled_price = o["average_price"]
                         break
                     elif o["status"] in ["CANCELLED", "REJECTED"]:
-                        print("❌ Order rejected/cancelled")
+                        print(f"❌ Order {o['status']} — will retry with fresh LTP")
                         return None
 
             if filled_price:
@@ -4176,9 +4171,16 @@ def place_order(symbol, qty, exchange, instrument):
                 kite.cancel_order(variety="regular", order_id=order_id)
             except:
                 pass
-
-            send_message(f"❌ Order cancelled: {symbol}")
+            print(f"⚠️ Order not filled — cancelled {symbol}", flush=True)
             return None
+
+        # ✅ FILLED — now send single confirmation message
+        send_message(
+            f"📥 Order placed: {symbol}\n"
+            f"   Price: ₹{filled_price:.1f}  |  Qty: {quantity}  |  Lots: {qty}\n"
+            f"   Total deployed: ₹{filled_price * quantity:,.0f}\n"
+            f"   Max risk (45% SL): ₹{filled_price * 0.45 * quantity:,.0f}"
+        )
 
         # Log slippage for reference only — no exit triggered.
         # Cheap options (₹20–₹50) have bid-ask spreads of ₹0.50–₹1.50 which

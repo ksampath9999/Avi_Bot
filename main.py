@@ -5773,8 +5773,8 @@ def nifty_loop():
             if _loss_streak["NIFTY"] >= 3:
                 print("⚠️ Loss streak >= 3 — pausing NIFTY 15 min then resetting streak", flush=True)
                 send_message("❌ NIFTY: 3 consecutive losses — pausing 15 min")
-                time.sleep(900)   # 15-minute cooldown
-                loss_streak = 0   # reset so trading can resume
+                time.sleep(900)
+                _loss_streak["NIFTY"] = 0
                 print("♻️ NIFTY loss streak reset — resuming trading", flush=True)
                 continue
 
@@ -6140,7 +6140,7 @@ def crude_loop():
                 print("⚠️ Loss streak >= 3 — pausing CRUDE 15 min then resetting streak", flush=True)
                 send_message("❌ CRUDE: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)   # 15-minute cooldown
-                loss_streak = 0   # reset so trading can resume after cooldown
+                _loss_streak["CRUDE"] = 0
                 print("♻️ CRUDE loss streak reset — resuming trading", flush=True)
                 continue
 
@@ -6543,7 +6543,7 @@ def banknifty_loop():
                 print("⚠️ Loss streak >= 3 — pausing BANKNIFTY 15 min then resetting streak", flush=True)
                 send_message("❌ BANKNIFTY: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)
-                loss_streak = 0
+                _loss_streak["BANKNIFTY"] = 0
                 print("♻️ BANKNIFTY loss streak reset — resuming trading", flush=True)
                 continue
 
@@ -6951,7 +6951,7 @@ def finnifty_loop():
                 print("⚠️ Loss streak >= 3 — pausing FINNIFTY 15 min then resetting streak", flush=True)
                 send_message("❌ FINNIFTY: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)
-                loss_streak = 0
+                _loss_streak["FINNIFTY"] = 0
                 print("♻️ FINNIFTY loss streak reset — resuming trading", flush=True)
                 continue
 
@@ -7356,7 +7356,7 @@ def sensex_loop():
                 print("⚠️ Loss streak >= 3 — pausing SENSEX 15 min then resetting streak", flush=True)
                 send_message("❌ SENSEX: 3 consecutive losses — pausing 15 min")
                 time.sleep(900)
-                loss_streak = 0
+                _loss_streak["SENSEX"] = 0
                 print("♻️ SENSEX loss streak reset — resuming trading", flush=True)
                 continue
 

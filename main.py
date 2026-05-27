@@ -590,11 +590,30 @@ def daily_profit_target_monitor():
         try:
             time.sleep(5)
 
-            # Reset flag at start of new day
-            _today = datetime.now(IST).date()
+            now_ist = datetime.now(IST)
+
+            # Only run during market hours (9:15 AM to 3:30 PM weekdays)
+            # Prevents midnight/weekend false triggers
+            if now_ist.weekday() >= 5:
+                continue   # weekend — skip
+            _hour, _min = now_ist.hour, now_ist.minute
+            _in_market = (
+                (_hour == 9  and _min >= 15) or
+                (9 < _hour < 15) or
+                (_hour == 15 and _min <= 35)
+            )
+            if not _in_market:
+                continue   # outside market hours — skip
+
+            # Reset flag at start of new trading day
+            _today = now_ist.date()
             if _last_reset_date != _today:
-                _daily_target_exited = False
-                _last_reset_date     = _today
+                _daily_target_exited     = False
+                _profit_protection_floor = 0.0
+                daily_profit_target_monitor._protection_triggered = False
+                _last_reset_date         = _today
+                print(f"🎯 Target monitor: new day reset at {now_ist.strftime('%H:%M')}", flush=True)
+                continue   # skip this tick — let daily P&L vars reset first
 
             if _daily_target_exited and not USE_PROFIT_PROTECTION:
                 continue   # normal mode — target hit, skip everything
@@ -623,31 +642,35 @@ def daily_profit_target_monitor():
             # After target hit: allow new trades but stop if P&L drops below floor
             if _daily_target_exited and USE_PROFIT_PROTECTION:
                 # Dynamic trailing floor — rises as profit grows, never drops
-                # Floor = max(DAILY_PROFIT_TARGET, peak_combined * 0.85)
-                # This protects 85% of peak profit achieved after target hit
                 if _combined > _profit_protection_floor:
-                    # New high — raise floor to lock in 85% of new peak
                     _new_floor = max(
-                        DAILY_PROFIT_TARGET,           # never below original target
-                        _combined * 0.85               # 85% of current peak
+                        DAILY_PROFIT_TARGET,
+                        _combined * 0.85
                     )
                     if _new_floor > _profit_protection_floor:
-                        print(f"🛡️ Protection floor raised: ₹{_profit_protection_floor:.0f} → ₹{_new_floor:.0f} "
-                              f"(85% of ₹{_combined:.0f})", flush=True)
+                        print(f"🛡️ Protection floor raised: ₹{_profit_protection_floor:.0f} → ₹{_new_floor:.0f}", flush=True)
                         _profit_protection_floor = _new_floor
 
                 if _combined < _profit_protection_floor:
-                    # P&L dropped below floor — exit all and stop
-                    print(f"🛡️ PROFIT PROTECTION: combined ₹{_combined:.0f} dropped below "
-                          f"floor ₹{_profit_protection_floor:.0f} — stopping all trades", flush=True)
+                    # Already triggered — hard stop, no more checks needed
+                    if getattr(daily_profit_target_monitor, '_protection_triggered', False):
+                        # Already alerted — just block entries silently
+                        _daily_target_exited       = True
+                        USE_PROFIT_PROTECTION_flag = False
+                        time.sleep(5)
+                        continue
+
+                    # First time protection triggers — alert once and exit
+                    daily_profit_target_monitor._protection_triggered = True
+                    print(f"🛡️ PROFIT PROTECTION: combined ₹{_combined:.0f} < floor ₹{_profit_protection_floor:.0f}", flush=True)
                     send_message(
                         f"🛡️ PROFIT PROTECTION TRIGGERED\n"
                         f"💰 Combined P&L: ₹{_combined:.0f} (live included)\n"
                         f"🔒 Floor: ₹{_profit_protection_floor:.0f}\n"
                         f"📉 P&L dropped below protection floor\n"
-                        f"🛑 Exiting all positions — no more trades today"
+                        f"🛑 Exiting all positions — no more trades today\n"
+                        f"(This alert will not repeat)"
                     )
-                    # Exit all open positions
                     for _inst, _pos, _ in [
                         ("NIFTY",     nifty_position,     nifty_trade_active),
                         ("BANKNIFTY", banknifty_position,  banknifty_trade_active),
@@ -665,12 +688,10 @@ def daily_profit_target_monitor():
                             _ep_ok = exit_position(_sym, _qty, _exc)
                             if not _ep_ok:
                                 send_message(f"🚨 PROTECTION EXIT FAILED — EXIT {_sym} MANUALLY")
-                    # Hard stop — block all new entries permanently today
-                    _daily_target_exited       = True
-                    _profit_protection_floor   = 0.0   # reset so apply_entry_filters blocks
+                    _daily_target_exited     = True
+                    _profit_protection_floor = 0.0
                     continue
                 else:
-                    # Still above floor — allow new trades
                     print(f"🛡️ Protection: ₹{_combined:.0f} > floor ₹{_profit_protection_floor:.0f} ✅", flush=True)
                     continue
 
@@ -4271,6 +4292,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global global_trade_active
     global daily_pnl, trade_count, last_loss_time
     global win_streak, loss_streak
+    global _daily_target_exited, _profit_protection_floor
+    global _whipsaw_pause_until, _flip_timestamps
+    global _loss_streak, _win_streak, _blocked_strikes
     global portfolio_pnl, peak_portfolio, risk_off
     global max_drawdown, last_exit_time_nifty, last_exit_time_crude
     global nifty_active, crude_active
@@ -5691,6 +5715,9 @@ def nifty_loop():
     global last_fetch_nifty, cached_nifty_df, cached_nifty_ht
     global nifty_trade_active, nifty_position
     global win_streak, loss_streak
+    global _daily_target_exited, _profit_protection_floor
+    global _whipsaw_pause_until, _flip_timestamps
+    global _loss_streak, _win_streak, _blocked_strikes
 
     _nifty_weekend_msg_sent = [False]   # send "sleeping" msg only once per weekend
     _nifty_wakeup_msg_sent  = [False]   # send "waking up" msg only once per Monday
@@ -6062,6 +6089,9 @@ def crude_loop():
     global last_fetch_crude, cached_crude_15m, cached_crude_ht
     global crude_trade_active
     global win_streak, loss_streak
+    global _daily_target_exited, _profit_protection_floor
+    global _whipsaw_pause_until, _flip_timestamps
+    global _loss_streak, _win_streak, _blocked_strikes
 
     _crude_weekend_msg_sent = [False]
 
@@ -6455,6 +6485,9 @@ def banknifty_loop():
     global last_fetch_banknifty, cached_banknifty_df, cached_banknifty_ht
     global banknifty_trade_active, banknifty_position
     global win_streak, loss_streak
+    global _daily_target_exited, _profit_protection_floor
+    global _whipsaw_pause_until, _flip_timestamps
+    global _loss_streak, _win_streak, _blocked_strikes
 
     _bn_weekend_msg_sent = [False]
     _bn_wakeup_msg_sent  = [False]
@@ -6860,6 +6893,9 @@ def finnifty_loop():
     global last_fetch_finnifty, cached_finnifty_df, cached_finnifty_ht
     global finnifty_trade_active, finnifty_position
     global win_streak, loss_streak
+    global _daily_target_exited, _profit_protection_floor
+    global _whipsaw_pause_until, _flip_timestamps
+    global _loss_streak, _win_streak, _blocked_strikes
 
     _fn_weekend_msg_sent = [False]
     _fn_wakeup_msg_sent  = [False]
@@ -7262,6 +7298,9 @@ def sensex_loop():
     global last_fetch_sensex, cached_sensex_df, cached_sensex_ht
     global sensex_trade_active, sensex_position
     global win_streak, loss_streak
+    global _daily_target_exited, _profit_protection_floor
+    global _whipsaw_pause_until, _flip_timestamps
+    global _loss_streak, _win_streak, _blocked_strikes
 
     _sx_weekend_msg_sent = [False]
     _sx_wakeup_msg_sent  = [False]
@@ -7800,6 +7839,9 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
     Crude lot size = 100 bbls.
     """
     global win_streak, loss_streak
+    global _daily_target_exited, _profit_protection_floor
+    global _whipsaw_pause_until, _flip_timestamps
+    global _loss_streak, _win_streak, _blocked_strikes
     global portfolio_pnl, peak_portfolio
 
     # ── Risk parameters ──────────────────────────────────────────────────
@@ -8018,6 +8060,9 @@ def reset_daily_pnl():
 
     global daily_pnl, trade_count, last_reset_date
     global win_streak, loss_streak
+    global _daily_target_exited, _profit_protection_floor
+    global _whipsaw_pause_until, _flip_timestamps
+    global _loss_streak, _win_streak, _blocked_strikes
     global trade_alert_sent
     global report_sent_today, max_drawdown
     global portfolio_pnl, peak_portfolio   # ✅ CORRECT VARIABLES
@@ -8106,6 +8151,7 @@ def reset_daily_pnl():
         global _daily_target_exited, _profit_protection_floor
         _daily_target_exited     = False
         _profit_protection_floor = 0.0
+        daily_profit_target_monitor._protection_triggered = False
         print("🎯 Daily profit target reset for new trading day", flush=True)
 
         # ── Reset same-strike guard for new day ───────────────────────────

@@ -2268,9 +2268,25 @@ def check_first_candle_range(signal, df, instrument):
         today_str  = str(_now_ist.date())
         _break_key = f"{instrument}_{today_str}"
 
-        # ── Already broke out today — pass only if signal matches direction ──
+        # ── Already broke out today — check if direction updated ────────────
         _broke = _fc_breakout_done.get(_break_key)
         if _broke:
+            # Re-check current price — if it has since broken the OTHER side, update
+            fc_high, fc_low, fc_time = get_first_candle(df, instrument)
+            if fc_high is not None and fc_low is not None:
+                cur_close = float(df["close"].iloc[-2])
+                buffer    = cur_close * FIRST_CANDLE_BUFFER_PCT
+                if _broke == "DOWN" and cur_close >= fc_high + buffer:
+                    # Price broke back UP — update direction
+                    _fc_breakout_done[_break_key] = "UP"
+                    _broke = "UP"
+                    print(f"🔄 FC direction updated: DOWN→UP [{instrument}]", flush=True)
+                elif _broke == "UP" and cur_close <= fc_low - buffer:
+                    # Price broke back DOWN — update direction
+                    _fc_breakout_done[_break_key] = "DOWN"
+                    _broke = "DOWN"
+                    print(f"🔄 FC direction updated: UP→DOWN [{instrument}]", flush=True)
+
             if (_broke == "UP"   and signal == "CALL") or \
                (_broke == "DOWN" and signal == "PUT"):
                 return True, f"FC=unlocked(broke {_broke} earlier today)"

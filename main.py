@@ -4322,10 +4322,11 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     global _blocked_strikes
     # exit_done is intentionally LOCAL so two concurrent manage_trade threads
     # (old + new after a flip) do not share state.
-    exit_done = False
+    exit_done        = False
     local_max_profit = 0
     partial_pnl      = 0.0
     _exit_attempted  = False   # prevents profit lock from re-firing after failed exit
+    exit_fill_price  = None    # actual exit fill price from exit_position()
 
     full_symbol = f"{exchange}:{symbol}"
     actual_qty    = get_quantity(qty, exchange, instrument)
@@ -4539,10 +4540,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     _profit_lock_exit_time[instrument] = time.time()
 
                     if not exit_done:
-                        _exit_ok = exit_position(symbol, remaining_qty, exchange)
-                        if _exit_ok:
+                        _exit_fill = exit_position(symbol, remaining_qty, exchange)
+                        if _exit_fill:
+                            exit_fill_price = _exit_fill if isinstance(_exit_fill, float) else None
+                            ltp = exit_fill_price or ltp
+                            pnl = (ltp - entry) * remaining_qty
                             exit_done = True
-                            pnl = current_pnl
                             break
                         else:
                             # Exit failed — try market order as last resort
@@ -4598,10 +4601,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         break
                     else:
                         # Still open — retry exit silently
-                        _exit_ok = exit_position(symbol, remaining_qty, exchange)
-                        if _exit_ok:
+                        _exit_fill = exit_position(symbol, remaining_qty, exchange)
+                        if _exit_fill:
+                            exit_fill_price = _exit_fill if isinstance(_exit_fill, float) else None
+                            ltp = exit_fill_price or ltp
+                            pnl = (ltp - entry) * remaining_qty
                             exit_done = True
-                            pnl = current_pnl
                             break
 
             # ===============================
@@ -4700,10 +4705,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         )
 
                     if not exit_done:
-                        _exit_ok = exit_position(symbol, remaining_qty, exchange)
-                        if _exit_ok:
+                        _exit_fill = exit_position(symbol, remaining_qty, exchange)
+                        if _exit_fill:
+                            exit_fill_price = _exit_fill if isinstance(_exit_fill, float) else None
+                            ltp = exit_fill_price or ltp
+                            pnl = (ltp - entry) * remaining_qty
                             exit_done = True
-                            pnl = current_pnl
                             # Clear flag on successful exit
                             setattr(manage_trade, f"_ht_flip_{symbol}", False)
                             break
@@ -4779,11 +4786,14 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"💔 P&L: ₹{current_pnl:.0f}\n"
                         f"📊 Entry: ₹{entry:.1f}  |  Loss: {((ltp-entry)/entry*100):.1f}%"
                     )
-                    _sl_ok = exit_position(symbol, remaining_qty, exchange)
-                    if not _sl_ok:
+                    _sl_fill = exit_position(symbol, remaining_qty, exchange)
+                    if not _sl_fill:
                         send_message(f"🚨 SL EXIT FAILED — EXIT {symbol} MANUALLY NOW")
+                    else:
+                        exit_fill_price = _sl_fill if isinstance(_sl_fill, float) else None
+                        ltp = exit_fill_price or ltp
+                    pnl = (ltp - entry) * remaining_qty
                     exit_done = True
-                    pnl = current_pnl
                     break
             # ================================================================
             # 💔 MAX LOSS EXIT — exit immediately if loss hits ₹1,600
@@ -4801,9 +4811,11 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     f"📊 Entry: ₹{entry:.1f}  |  LTP: ₹{ltp:.1f}\n"
                     f"🚫 {symbol} blocked for rest of day — same strike won't re-enter"
                 )
-                _ml_ok = exit_position(symbol, remaining_qty, exchange)
-                if not _ml_ok:
+                _ml_fill = exit_position(symbol, remaining_qty, exchange)
+                if not _ml_fill:
                     send_message(f"🚨 MAX LOSS EXIT FAILED — EXIT {symbol} MANUALLY NOW")
+                else:
+                    ltp = _ml_fill if isinstance(_ml_fill, float) else ltp
                 # Block this exact strike for rest of day
                 _blocked_strikes[instrument].add(symbol)
                 exit_done = True
@@ -4840,9 +4852,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"💡 Exiting to avoid theta decay erosion\n"
                         f"♻️ Will re-enter immediately if signal still active"
                     )
-                    _te_ok = exit_position(symbol, remaining_qty, exchange)
-                    if not _te_ok:
+                    _te_fill = exit_position(symbol, remaining_qty, exchange)
+                    if not _te_fill:
                         send_message(f"🚨 THETA EXIT FAILED — EXIT {symbol} MANUALLY")
+                    else:
+                        exit_fill_price = _te_fill if isinstance(_te_fill, float) else None
+                        ltp = exit_fill_price or ltp
                     exit_done = True
                     pnl = current_pnl
                     break
@@ -4934,7 +4949,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 f"📌 {symbol}\n"
                 f"💰 Final P&L : ₹{pnl:+.0f}  ({'PROFIT' if pnl > 0 else 'LOSS'})\n"
                 + (f"💰 Partial   : ₹{partial_pnl:+.0f}  |  Total: ₹{_total_trade_pnl:+.0f}\n" if partial_pnl else "") +
-                f"📊 Entry: ₹{entry:.1f}  |  Exit: ₹{ltp:.1f}\n"
+                f"📊 Entry: ₹{entry:.1f}  |  Exit: ₹{exit_fill_price or ltp:.1f}\n"
                 f"{'─'*28}\n"
                 f"📅 NIFTY      : ₹{nifty_daily_pnl:+.0f}\n"
                 f"📅 FINNIFTY   : ₹{finnifty_daily_pnl:+.0f}\n"
@@ -4944,7 +4959,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 f"💼 Combined   : ₹{_combined_pnl:+.0f}"
             )
 
-            log_trade_full(symbol, entry, ltp, pnl, instrument, signal, probability)
+            log_trade_full(symbol, entry, exit_fill_price or ltp, pnl, instrument, signal, probability)
 
             trade_count += 1
 
@@ -5006,7 +5021,7 @@ def get_open_kite_position(instrument):
             "BANKNIFTY": "BANKNIFTY",
             "FINNIFTY":  "FINNIFTY",
             "SENSEX":    "SENSEX",
-            "CRUDE":     None,
+            "CRUDE":     "CRUDEOIL",   # MCX Crude Oil symbol starts with CRUDEOIL
         }
         target_exchange = exchange_map.get(instrument)
         sym_prefix      = prefix_map.get(instrument)
@@ -5344,8 +5359,6 @@ def exit_position(symbol, qty, exchange):
                     break
 
             if filled:
-                # Invalidate Kite position cache so next loop sees the exit
-                # We don't know instrument here, so pop all equity keys
                 for _inst_key in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "CRUDE"):
                     _kite_pos_cache.pop(_inst_key, None)
                 send_message(
@@ -5355,7 +5368,7 @@ def exit_position(symbol, qty, exchange):
                     f"📊 Slippage: {(1-slip)*100:.1f}% from LTP ₹{ltp:.1f}"
                 )
                 print(f"✅ Exit filled @ ₹{filled_price:.1f}")
-                return True
+                return filled_price   # return actual fill price
 
             # Not filled — cancel and try next slippage level
             try:
@@ -8983,7 +8996,7 @@ def _kite_day_pnl(instrument):
         "BANKNIFTY": "BANKNIFTY",
         "FINNIFTY":  "FINNIFTY",
         "SENSEX":    "SENSEX",
-        "CRUDE":     None,
+        "CRUDE":     "CRUDEOIL",   # MCX Crude Oil symbol starts with CRUDEOIL
     }
 
     try:

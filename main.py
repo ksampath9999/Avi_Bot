@@ -2984,14 +2984,14 @@ Last {len(_trade_summary)} trades for {instrument}:
 {chr(10).join(_trade_summary) if _trade_summary else "  No recent trades"}
 
 STRICT RULES — follow EXACTLY, do not add any rules of your own:
-1. If last 3 trades are ALL losses → confidence must be below 50
-2. If last 2 trades are consecutive losses → reduce confidence by at least 20
-3. If time is after 3:10 PM IST → confidence must be below 50 (force-close at 3:20 PM)
-4. If Hull band < 0.02% → confidence must be below 40
-5. Strong signal cannot overcome 3 consecutive losses
-6. DO NOT apply any time-of-day penalties between 9:20 AM and 3:10 PM
-7. DO NOT reduce confidence based on it being afternoon — only rules 1-5 apply
-8. Hull band above 0.03% is acceptable — do not penalise it unless below 0.02%
+1. If last 3 trades are ALL losses → confidence must be below 50 (hard block)
+2. If time is after 3:10 PM IST → confidence must be below 50 (force-close at 3:20 PM)
+3. If Hull band < 0.02% → confidence must be below 40
+4. DO NOT apply any time-of-day penalties between 9:20 AM and 3:10 PM
+5. DO NOT reduce confidence based on daily P&L alone — only trade history matters
+6. DO NOT penalise for 1 or 2 losses — only 3 consecutive losses trigger rule 1
+7. Hull band above 0.03% is acceptable — do not penalise unless below 0.02%
+8. A strong technical signal (Hull + HalfTrend aligned) should score 70+ confidence
 
 Based on ALL factors especially recent trade history, should the bot enter a {signal} trade on {instrument}?
 

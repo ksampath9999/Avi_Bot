@@ -900,6 +900,7 @@ MAX_LOSS_PER_LOT   = int(os.environ.get("MAX_LOSS_PER_LOT",   "800"))   # ₹800
 DAILY_MAX_LOSS     = int(os.environ.get("DAILY_MAX_LOSS",     "1500"))  # ₹1,500 default
 _daily_max_loss_hit = False   # flag — set True when daily loss limit hit
 
+
 print(f"📦 Lot sizes: NIFTY={NIFTY_LOT_SIZE} BN={BANKNIFTY_LOT_SIZE} "
       f"FN={FINNIFTY_LOT_SIZE} SENSEX={SENSEX_LOT_SIZE} CRUDE={CRUDE_LOT_SIZE}", flush=True)
 print(f"📊 Num lots:  NIFTY={NIFTY_NUM_LOTS or 'auto'} BN={BANKNIFTY_NUM_LOTS or 'auto'} "
@@ -1941,6 +1942,28 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _hull_e:
             _hull_str = f"Hull=err({_hull_e})"
 
+    # ── SuperTrend Filter — must agree with HalfTrend signal ─────────────────
+    _st_str = "ST=off"
+    if USE_SUPERTREND_FILTER and df_15m is not None and len(df_15m) >= ST_PERIOD + 5:
+        try:
+            _st_signal, _st_val = get_supertrend_signal(df_15m, ST_PERIOD, ST_MULTIPLIER)
+            if _st_signal is None:
+                _st_str = "ST=transitioning"
+                print(f"⚠️ SuperTrend transitioning — bypassing", flush=True)
+            elif _st_signal != signal:
+                _st_color = "🟢" if _st_signal == "CALL" else "🔴"
+                _ht_color = "🟢" if signal == "CALL" else "🔴"
+                reason = (f"📈 SuperTrend filter: ST={_st_color} {_st_signal} "
+                          f"vs HalfTrend={_ht_color} {signal} — "
+                          f"not aligned (ST line=₹{_st_val:.1f})")
+                print(f"🚫 ST BLOCK: {reason}", flush=True)
+                return False, reason
+            else:
+                _st_color = "🟢" if _st_signal == "CALL" else "🔴"
+                _st_str = f"ST={_st_color}({_st_val:.1f})"
+        except Exception as _st_e:
+            _st_str = f"ST=err({_st_e})"
+
     # ── 8. Support & Resistance proximity block ───────────────────────────────
     # If price is AT or NEAR a key resistance → block CALL entry (rejection risk)
     # If price is AT or NEAR a key support    → block PUT entry  (bounce risk)
@@ -2220,7 +2243,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _ce:
             _claude_str = f"Claude=err({_ce})"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_sr_str} | {_candle_str} | {_claude_str}"
+    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_st_str} | {_sr_str} | {_candle_str} | {_claude_str}"
 
 
 
@@ -2250,6 +2273,11 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 
 USE_HULL_FILTER  = os.environ.get("USE_HULL_FILTER", "true").lower() == "true"
 HULL_MODE        = "Hma"  # "Hma" | "Ehma" | "Thma"
+
+# ── SuperTrend Filter ──────────────────────────────────────────────────────────
+USE_SUPERTREND_FILTER = os.environ.get("USE_SUPERTREND_FILTER", "false").lower() == "true"
+ST_PERIOD             = int(os.environ.get("ST_PERIOD",     "10"))   # ATR period
+ST_MULTIPLIER         = float(os.environ.get("ST_MULTIPLIER", "3.0")) # band multiplier
 HULL_LENGTH      = 55     # Pine default for swing entry
 
 # Minimum band width as % of price.
@@ -2492,6 +2520,94 @@ def _wma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period).apply(
         lambda x: np.dot(x, weights) / weights.sum(), raw=True
     )
+
+
+def supertrend(df, period=10, multiplier=3.0):
+    """
+    SuperTrend indicator.
+    Returns DataFrame with columns: supertrend, direction
+    direction: 1 = bullish (CALL), -1 = bearish (PUT)
+
+    Standard settings: period=10, multiplier=3.0
+    More sensitive: period=7, multiplier=2.0
+    """
+    try:
+        high   = df["high"].astype(float)
+        low    = df["low"].astype(float)
+        close  = df["close"].astype(float)
+
+        # ATR calculation (Wilder's RMA)
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low  - close.shift(1)).abs()
+        ], axis=1).max(axis=1)
+
+        atr = tr.ewm(alpha=1/period, adjust=False).mean()
+
+        # Basic upper/lower bands
+        hl2        = (high + low) / 2
+        basic_upper = hl2 + (multiplier * atr)
+        basic_lower = hl2 - (multiplier * atr)
+
+        # Final bands with SuperTrend logic
+        n          = len(df)
+        final_upper = basic_upper.copy()
+        final_lower = basic_lower.copy()
+        st          = pd.Series(index=df.index, dtype=float)
+        direction   = pd.Series(index=df.index, dtype=int)
+
+        for i in range(1, n):
+            # Upper band
+            if basic_upper.iloc[i] < final_upper.iloc[i-1] or close.iloc[i-1] > final_upper.iloc[i-1]:
+                final_upper.iloc[i] = basic_upper.iloc[i]
+            else:
+                final_upper.iloc[i] = final_upper.iloc[i-1]
+            # Lower band
+            if basic_lower.iloc[i] > final_lower.iloc[i-1] or close.iloc[i-1] < final_lower.iloc[i-1]:
+                final_lower.iloc[i] = basic_lower.iloc[i]
+            else:
+                final_lower.iloc[i] = final_lower.iloc[i-1]
+            # Direction
+            if i == 1:
+                direction.iloc[i] = 1
+            elif st.iloc[i-1] == final_upper.iloc[i-1]:
+                direction.iloc[i] = -1 if close.iloc[i] > final_upper.iloc[i] else 1
+            else:
+                direction.iloc[i] =  1 if close.iloc[i] < final_lower.iloc[i] else -1
+            # SuperTrend line
+            st.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == -1 else final_upper.iloc[i]
+
+        result        = df.copy()
+        result["st"]  = st
+        result["st_direction"] = direction
+        return result
+
+    except Exception as e:
+        print(f"⚠️ SuperTrend error: {e}", flush=True)
+        return None
+
+
+def get_supertrend_signal(df, period=10, multiplier=3.0):
+    """
+    Returns (signal, st_value) from last CLOSED candle.
+    signal: 'CALL' (bullish), 'PUT' (bearish), or None
+    """
+    try:
+        st_df = supertrend(df, period=period, multiplier=multiplier)
+        if st_df is None or len(st_df) < period + 2:
+            return None, None
+
+        last      = st_df.iloc[-2]   # closed candle (anti-repaint)
+        direction = int(last["st_direction"])
+        st_val    = float(last["st"])
+
+        signal = "CALL" if direction == -1 else "PUT"
+        return signal, st_val
+
+    except Exception as e:
+        print(f"⚠️ get_supertrend_signal error: {e}", flush=True)
+        return None, None
 
 
 def hull_suite(df, mode=HULL_MODE, length=HULL_LENGTH):

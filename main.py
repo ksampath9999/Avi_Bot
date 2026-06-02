@@ -1762,24 +1762,12 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
             hull_sig, hval, h2val, bw_pct = get_hull_signal(
                 df_15m, mode=HULL_MODE, length=HULL_LENGTH)
 
-            # ── Flip re-entry bypass ──────────────────────────────────────────
-            # When HalfTrend just flipped, Hull (length=55) takes 2-5 candles
-            # to catch up. On a flip re-entry, skip colour check entirely.
+            # ── Flip re-entry: still require Hull colour match ────────────────
+            # Even on a flip, Hull colour must agree before entering.
+            # Hull lags by 2-5 candles — wait for it to confirm the new direction.
+            # Only bypass: band width check (Hull always thin right after flip)
             _is_flip = kwargs.get("is_flip_reentry", False)
-            if _is_flip and hull_sig != signal:
-                print(f"🔄 Hull flip bypass: HT just flipped to {signal}, Hull still {hull_sig} — skipping colour check", flush=True)
-                _hull_str = f"Hull=🔄FLIP-BYPASS(HT={signal},Hull={hull_sig})"
-                # Still check band width below
-                if hull_sig is not None and hval is not None:
-                    _now_ist = datetime.now(IST)
-                    _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
-                    _morning_bypass = (0 <= _mins_since_open <= HULL_MORNING_BYPASS_MINS)
-                    if USE_HULL_BAND_FILTER and bw_pct is not None and HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
-                        reason = (f"🌊 Hull filter: band too thin — width={bw_pct*100:.3f}% min {HULL_MIN_BAND_WIDTH_PCT*100:.3f}%")
-                        print(f"🚫 HULL BLOCK: {reason}", flush=True)
-                        return False, reason
-                # Skip rest of Hull check
-            elif hull_sig is None or hval is None:
+            if hull_sig is None or hval is None:
                 _hull_str = "Hull=N/A(transitioning)"
             else:
                 # ── Band width check — always applies, even on volume spikes ─
@@ -2933,12 +2921,18 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
     _cache_key = f"{instrument}_{signal}_{datetime.now(IST).strftime('%Y-%m-%d_%H')}_{_flip_n}"
     if _claude_filter_cache.get(_cache_key):
         cached = _claude_filter_cache[_cache_key]
-        # Expire cached blocks after 30 min — conditions may have improved
         _age = time.time() - cached.get("cached_at", 0)
-        if _age < 300:   # 5 min cache
-            print(f"🤖 Claude cached [{instrument} {signal}]: {cached['confidence']}% "
-                  f"(blocked {_age/60:.1f} min ago) — {cached['reason']}", flush=True)
-            return cached["allowed"], cached["reason"], cached["confidence"]
+        if _age < 300:   # 5-min cache
+            # Max block duration — if Claude keeps blocking >30 min, bypass
+            _first_blocked = cached.get("first_blocked_at", cached.get("cached_at", 0))
+            _total_block   = time.time() - _first_blocked
+            if _total_block > 900:  # 15 min max
+                print(f"🤖 Claude block auto-expired after {_total_block/60:.0f} min — bypassing", flush=True)
+                _claude_filter_cache.pop(_cache_key, None)
+            else:
+                print(f"🤖 Claude cached [{instrument} {signal}]: {cached['confidence']}% "
+                      f"(blocked {_age/60:.1f} min, total {_total_block/60:.0f} min) — {cached['reason']}", flush=True)
+                return cached["allowed"], cached["reason"], cached["confidence"]
         else:
             _claude_filter_cache.pop(_cache_key, None)
             print(f"🤖 Claude cache expired [{instrument}] — calling fresh", flush=True)
@@ -2973,35 +2967,33 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
         _ht_trend  = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
         _now       = datetime.now(IST).strftime("%H:%M")
 
-        _prompt = f"""You are a strict trading risk filter for an Indian options bot trading {instrument}.
+        _prompt = f"""You are a trading signal validator for an Indian options bot trading {instrument}.
 
-Current situation:
-- Signal: {signal} (PUT or CALL)
+Current signal:
+- Direction: {signal}
 - HalfTrend: {_ht_trend}
-- Hull Suite band width: {hull_band_pct*100:.3f}% (wider = stronger trend, >0.05% is good)
-- Current price: ₹{_cur_close:.1f}
+- Hull Suite band: {hull_band_pct*100:.3f}% ({'WIDE=strong trend' if hull_band_pct > 0.0003 else 'NARROW=weak trend'})
+- Price: ₹{_cur_close:.1f}
 - Time: {_now} IST
-- Combined daily P&L today: ₹{nifty_daily_pnl + banknifty_daily_pnl + finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl:.0f}
 
 Last {len(_trade_summary)} trades for {instrument}:
-{chr(10).join(_trade_summary) if _trade_summary else "  No recent trades"}
+{chr(10).join(_trade_summary) if _trade_summary else "  No recent trades today"}
 
-STRICT RULES — follow EXACTLY, do not add any rules of your own:
-1. If last 3 trades are ALL losses → confidence must be below 50 (hard block)
-2. If time is after 3:10 PM IST → confidence must be below 50 (force-close at 3:20 PM)
-3. If Hull band < 0.02% → confidence must be below 40
-4. DO NOT apply any time-of-day penalties between 9:20 AM and 3:10 PM
-5. DO NOT reduce confidence based on daily P&L alone — only trade history matters
-6. DO NOT penalise for 1 or 2 losses — only 3 consecutive losses trigger rule 1
-7. Hull band above 0.03% is acceptable — do not penalise unless below 0.02%
-8. A strong technical signal (Hull + HalfTrend aligned) should score 70+ confidence
+YOUR ONLY JOB: Check these exact rules. Apply NO other logic.
 
-Based on ALL factors especially recent trade history, should the bot enter a {signal} trade on {instrument}?
+RULE 1: If last 3 trades are ALL losses → set confidence=40, allowed=false
+RULE 2: If time after 3:10 PM IST → set confidence=40, allowed=false
+RULE 3: If Hull band below 0.02% → set confidence=40, allowed=false
+RULE 4: For any other situation → set confidence=75, allowed=true
 
-Reply in EXACTLY this JSON format (no other text):
-{{"confidence": 75, "allowed": true, "reason": "one short sentence"}}
+FORBIDDEN — you must NEVER do these:
+- Reduce confidence for 1 or 2 losses (only 3 in a row triggers rule 1)
+- Reduce confidence based on daily P&L
+- Add your own risk rules beyond rules 1-4
+- Score below 65 unless rules 1, 2 or 3 apply
 
-allowed must be true only if confidence >= {CLAUDE_MIN_CONFIDENCE}"""
+Reply ONLY in this JSON format, nothing else:
+{{"confidence": 75, "allowed": true, "reason": "brief reason"}}"""
 
         _response = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -3037,9 +3029,14 @@ allowed must be true only if confidence >= {CLAUDE_MIN_CONFIDENCE}"""
 
         # Only cache BLOCKED results for 5 min — rechecked if conditions improve
         if not allowed:
+            _existing  = _claude_filter_cache.get(_cache_key, {})
+            _now_ts    = time.time()
             _claude_filter_cache[_cache_key] = {
-                "allowed": allowed, "reason": reason, "confidence": confidence,
-                "cached_at": time.time()
+                "allowed":          allowed,
+                "reason":           reason,
+                "confidence":       confidence,
+                "cached_at":        _now_ts,
+                "first_blocked_at": _existing.get("first_blocked_at", _now_ts),
             }
 
         print(f"🤖 Claude filter [{instrument} {signal}]: "

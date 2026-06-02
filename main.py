@@ -832,7 +832,7 @@ def daily_profit_target_monitor():
             print(f"⚠️ Target monitor error: {_mon_err}", flush=True)
 
 # ── Support & Resistance Filter ───────────────────────────────────────────────
-USE_SR_FILTER      = True    # True = active | False = disabled
+USE_SR_FILTER      = os.environ.get("USE_SR_FILTER", "true").lower() == "true"
 SR_BLOCK_PCT       = 0.003   # 0.3% proximity for PDH/PDL/Pivot (when enabled)
 SR_ALGO_BLOCK_PCT  = 0.001   # 0.1% proximity for Algo SZ/RZ — tighter to avoid blocking valid trades
                                # 0.1% = ~24 pts on Nifty 24000, ~75 pts on SENSEX 75000
@@ -1192,6 +1192,8 @@ _profit_lock_tier  = 0    # 0 = none, 1 = 80%, 2 = 85%, 3 = 90%
 # After exiting, the symbol is stored here.  The loop blocks re-entry of the
 # exact same symbol until a NEW arrow fires (is_fresh=True) or trend flips.
 _last_exited_symbol = {}   # instrument -> str e.g. "NIFTY2650523900PE"
+_ip_blocked          = False   # True when Kite rejects orders due to IP
+_ip_alert_sent       = False   # one-time alert flag — prevents spam
 _blocked_strikes    = {    # strikes blocked after max-loss exit — cleared daily
     "NIFTY": set(), "BANKNIFTY": set(), "FINNIFTY": set(),
     "SENSEX": set(), "CRUDE": set()
@@ -1728,6 +1730,10 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     Returns (passed: bool, reason: str).
     """
     global _daily_target_exited, _daily_max_loss_hit   # must be global so reset propagates
+
+    # ── IP blocked — no new entries until whitelist fixed ────────────────────
+    if _ip_blocked:
+        return False, "🚫 IP blocked — fix whitelist at developers.kite.trade before new entries"
     now_ist = datetime.now(IST)
 
     # ── Daily max loss — stop all trading if loss too deep ───────────────────
@@ -2239,7 +2245,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                     signal, instrument, df_15m, _ht_df, _band)
                 _claude_str = f"Claude={_conf}%"
                 if not _ok:
-                    return False, f"🤖 Claude filter: {_reason} (confidence={_conf}%)"
+                    return False, f"🤖 Signal filter: {_reason} (confidence={_conf}%)"
         except Exception as _ce:
             _claude_str = f"Claude=err({_ce})"
 
@@ -2312,31 +2318,45 @@ _first_candle_alert_sent: dict = {} # throttle — timestamp of last alert per i
 
 def get_first_candle(df, instrument):
     """
-    Returns the high and low of the FIRST 5-min candle only (9:15–9:20 AM).
-    This is the opening candle — its high/low forms the reference range.
+    Returns the high and low of the FIRST 5-min candle (9:15–9:20 AM).
+    Always uses 5-min candles regardless of main loop timeframe.
     Returns (high, low, candle_time) or (None, None, None) if not available.
     """
     global _first_candle_cache
 
     try:
-        today = datetime.now(IST).date()
+        today     = datetime.now(IST).date()
         cache_key = f"{instrument}_{today}"
 
         if cache_key in _first_candle_cache:
             c = _first_candle_cache[cache_key]
             return c["high"], c["low"], c["time"]
 
+        # Always fetch 5-min data for FC — regardless of main loop timeframe
+        _token_map = {
+            "NIFTY":     config.NIFTY_TOKEN,
+            "BANKNIFTY": BANKNIFTY_TOKEN,
+            "FINNIFTY":  FINNIFTY_TOKEN,
+            "SENSEX":    SENSEX_TOKEN,
+            "CRUDE":     CRUDE_TOKEN,
+        }
+        _token = _token_map.get(instrument)
+        if _token:
+            df_5m = get_cached_data(_token, "5minute", 30)
+            if df_5m is not None and len(df_5m) >= 2:
+                df = df_5m   # use 5-min data for FC
+
         if df is None or len(df) < 2:
             return None, None, None
 
-        df_copy = df.copy()
+        df_copy      = df.copy()
         df_copy["_dt"] = pd.to_datetime(df_copy["date"])
         if df_copy["_dt"].dt.tz is None:
             df_copy["_dt"] = df_copy["_dt"].dt.tz_localize(IST)
         else:
             df_copy["_dt"] = df_copy["_dt"].dt.tz_convert(IST)
 
-        # Get ONLY the first 5-min candle of today (9:15 AM bar)
+        # Get today's bars
         today_bars = df_copy[df_copy["_dt"].dt.date == today]
         if len(today_bars) == 0:
             return None, None, None
@@ -2344,7 +2364,7 @@ def get_first_candle(df, instrument):
         first_bar = today_bars.iloc[0]
         bar_time  = first_bar["_dt"]
 
-        # Must be the 9:15 AM candle — reject anything else
+        # Must be the 9:15 AM 5-min candle
         if bar_time.hour != 9 or bar_time.minute != 15:
             return None, None, None
 
@@ -2356,7 +2376,7 @@ def get_first_candle(df, instrument):
             "low":  fc_low,
             "time": bar_time
         }
-        print(f"📊 First 5-min candle [{instrument}] 09:15 → "
+        print(f"📊 First 5-min candle [{instrument}] 09:15-09:20 → "
               f"High=₹{fc_high:.1f}  Low=₹{fc_low:.1f}  "
               f"Range={fc_high-fc_low:.1f} pts", flush=True)
         return fc_high, fc_low, bar_time
@@ -2391,21 +2411,34 @@ def check_first_candle_range(signal, df, instrument):
         # ── Already broke out today — check if direction updated ────────────
         _broke = _fc_breakout_done.get(_break_key)
         if _broke:
-            # Re-check current price — if it has since broken the OTHER side, update
             fc_high, fc_low, fc_time = get_first_candle(df, instrument)
             if fc_high is not None and fc_low is not None:
                 cur_close = float(df["close"].iloc[-2])
                 buffer    = cur_close * FIRST_CANDLE_BUFFER_PCT
+
                 if _broke == "DOWN" and cur_close >= fc_high + buffer:
-                    # Price broke back UP — update direction
+                    # Price broke back ABOVE FC high → update to UP
                     _fc_breakout_done[_break_key] = "UP"
                     _broke = "UP"
                     print(f"🔄 FC direction updated: DOWN→UP [{instrument}]", flush=True)
+
                 elif _broke == "UP" and cur_close <= fc_low - buffer:
-                    # Price broke back DOWN — update direction
+                    # Price broke back BELOW FC low → update to DOWN
                     _fc_breakout_done[_break_key] = "DOWN"
                     _broke = "DOWN"
                     print(f"🔄 FC direction updated: UP→DOWN [{instrument}]", flush=True)
+
+                elif _broke == "DOWN" and cur_close > fc_low:
+                    # Price recovered back INSIDE FC range — allow both directions
+                    print(f"🔄 FC: price back inside range [{instrument}] — allowing both directions", flush=True)
+                    _fc_breakout_done.pop(_break_key, None)
+                    return True, f"FC=recovered(price ₹{cur_close:.0f} back inside range)"
+
+                elif _broke == "UP" and cur_close < fc_high:
+                    # Price fell back INSIDE FC range — allow both directions
+                    print(f"🔄 FC: price back inside range [{instrument}] — allowing both directions", flush=True)
+                    _fc_breakout_done.pop(_break_key, None)
+                    return True, f"FC=recovered(price ₹{cur_close:.0f} back inside range)"
 
             if (_broke == "UP"   and signal == "CALL") or \
                (_broke == "DOWN" and signal == "PUT"):
@@ -2524,62 +2557,64 @@ def _wma(series: pd.Series, period: int) -> pd.Series:
 
 def supertrend(df, period=10, multiplier=3.0):
     """
-    SuperTrend indicator.
-    Returns DataFrame with columns: supertrend, direction
-    direction: 1 = bullish (CALL), -1 = bearish (PUT)
-
-    Standard settings: period=10, multiplier=3.0
-    More sensitive: period=7, multiplier=2.0
+    SuperTrend indicator — matches TradingView Pine Script output.
+    direction:  1 = bullish (price above ST → CALL)
+               -1 = bearish (price below ST → PUT)
     """
     try:
-        high   = df["high"].astype(float)
-        low    = df["low"].astype(float)
-        close  = df["close"].astype(float)
+        high  = df["high"].astype(float).values
+        low   = df["low"].astype(float).values
+        close = df["close"].astype(float).values
+        n     = len(df)
 
-        # ATR calculation (Wilder's RMA)
-        tr = pd.concat([
-            high - low,
-            (high - close.shift(1)).abs(),
-            (low  - close.shift(1)).abs()
-        ], axis=1).max(axis=1)
+        if n < period + 2:
+            return None
 
-        atr = tr.ewm(alpha=1/period, adjust=False).mean()
+        # True Range
+        tr = np.zeros(n)
+        for i in range(1, n):
+            tr[i] = max(high[i] - low[i],
+                        abs(high[i] - close[i-1]),
+                        abs(low[i]  - close[i-1]))
 
-        # Basic upper/lower bands
-        hl2        = (high + low) / 2
-        basic_upper = hl2 + (multiplier * atr)
-        basic_lower = hl2 - (multiplier * atr)
+        # ATR via Wilder's RMA (same as Pine's ta.rma)
+        atr = np.zeros(n)
+        atr[period] = np.mean(tr[1:period+1])
+        for i in range(period+1, n):
+            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
 
-        # Final bands with SuperTrend logic
-        n          = len(df)
+        # Basic bands
+        hl2         = (high + low) / 2.0
+        basic_upper = hl2 + multiplier * atr
+        basic_lower = hl2 - multiplier * atr
+
+        # Final bands + SuperTrend line
         final_upper = basic_upper.copy()
         final_lower = basic_lower.copy()
-        st          = pd.Series(index=df.index, dtype=float)
-        direction   = pd.Series(index=df.index, dtype=int)
+        st          = np.zeros(n)
+        direction   = np.ones(n, dtype=int)   # 1=bullish, -1=bearish
 
         for i in range(1, n):
-            # Upper band
-            if basic_upper.iloc[i] < final_upper.iloc[i-1] or close.iloc[i-1] > final_upper.iloc[i-1]:
-                final_upper.iloc[i] = basic_upper.iloc[i]
-            else:
-                final_upper.iloc[i] = final_upper.iloc[i-1]
-            # Lower band
-            if basic_lower.iloc[i] > final_lower.iloc[i-1] or close.iloc[i-1] < final_lower.iloc[i-1]:
-                final_lower.iloc[i] = basic_lower.iloc[i]
-            else:
-                final_lower.iloc[i] = final_lower.iloc[i-1]
-            # Direction
-            if i == 1:
-                direction.iloc[i] = 1
-            elif st.iloc[i-1] == final_upper.iloc[i-1]:
-                direction.iloc[i] = -1 if close.iloc[i] > final_upper.iloc[i] else 1
-            else:
-                direction.iloc[i] =  1 if close.iloc[i] < final_lower.iloc[i] else -1
-            # SuperTrend line
-            st.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == -1 else final_upper.iloc[i]
+            # Upper band stays high unless new lower high appears
+            final_upper[i] = (basic_upper[i]
+                              if basic_upper[i] < final_upper[i-1] or close[i-1] > final_upper[i-1]
+                              else final_upper[i-1])
+            # Lower band stays low unless new higher low appears
+            final_lower[i] = (basic_lower[i]
+                              if basic_lower[i] > final_lower[i-1] or close[i-1] < final_lower[i-1]
+                              else final_lower[i-1])
 
-        result        = df.copy()
-        result["st"]  = st
+            # Direction: 1=bullish (price above ST), -1=bearish (price below ST)
+            if direction[i-1] == -1:
+                direction[i] = 1  if close[i] > final_upper[i] else -1
+            else:
+                direction[i] = -1 if close[i] < final_lower[i] else  1
+
+            # ST line: lower band when bullish, upper band when bearish
+            st[i] = final_lower[i] if direction[i] == 1 else final_upper[i]
+
+        result = df.copy()
+        result["st"]           = st
         result["st_direction"] = direction
         return result
 
@@ -2590,19 +2625,22 @@ def supertrend(df, period=10, multiplier=3.0):
 
 def get_supertrend_signal(df, period=10, multiplier=3.0):
     """
-    Returns (signal, st_value) from last CLOSED candle.
-    signal: 'CALL' (bullish), 'PUT' (bearish), or None
+    Returns (signal, st_value) from last CLOSED candle (anti-repaint).
+    signal: 'CALL' (direction=1, bullish), 'PUT' (direction=-1, bearish), None
     """
     try:
         st_df = supertrend(df, period=period, multiplier=multiplier)
         if st_df is None or len(st_df) < period + 2:
             return None, None
 
-        last      = st_df.iloc[-2]   # closed candle (anti-repaint)
+        last      = st_df.iloc[-2]   # closed candle
         direction = int(last["st_direction"])
         st_val    = float(last["st"])
 
-        signal = "CALL" if direction == -1 else "PUT"
+        if st_val == 0:
+            return None, None   # not yet calculated
+
+        signal = "CALL" if direction == 1 else "PUT"
         return signal, st_val
 
     except Exception as e:
@@ -3129,8 +3167,8 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
 
     _api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not _api_key:
-        print("⚠️ Claude filter: ANTHROPIC_API_KEY not set — skipping", flush=True)
-        return True, "Claude filter: no API key", 100
+        print("⚠️ Signal filter: ANTHROPIC_API_KEY not set — skipping", flush=True)
+        return True, "Signal filter: no API key", 100
 
     # Cache key — one call per instrument per signal per hour per flip
     # Flip counter ensures each HT direction change gets a fresh Claude evaluation
@@ -3163,7 +3201,7 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
                 _msg = f"3 consecutive losses (₹{_last3[-3]:.0f}, ₹{_last3[-2]:.0f}, ₹{_last3[-1]:.0f}) — strategy not working today"
                 print(f"🤖 Claude pre-check [{instrument}]: BLOCKED — {_msg}", flush=True)
                 send_message(
-                    f"🤖 CLAUDE FILTER BLOCKED\n"
+                    f"🚫 SIGNAL FILTER BLOCKED\n"
                     f"📌 {instrument} {signal}\n"
                     f"📊 Confidence: 0% — pre-check failed\n"
                     f"💭 {_msg}"
@@ -3184,65 +3222,37 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
         _ht_trend  = "BULLISH" if int(ht_df.iloc[-2]["trend"]) == 0 else "BEARISH"
         _now       = datetime.now(IST).strftime("%H:%M")
 
-        _prompt = f"""You are a trading signal validator for an Indian options bot trading {instrument}.
+        # ── DETERMINISTIC RULES (replaces Claude API call) ────────────────────
+        # Pure Python — no AI judgment, no hallucinated penalties
+        # Rules are exact and predictable every time
+        _now_ist = datetime.now(IST)
+        _confidence = 75
+        _allowed    = True
+        _reason     = "All rules pass — signal accepted"
 
-Current signal:
-- Direction: {signal}
-- HalfTrend: {_ht_trend}
-- Hull Suite band: {hull_band_pct*100:.3f}% ({'WIDE=strong trend' if hull_band_pct > 0.0003 else 'NARROW=weak trend'})
-- Price: ₹{_cur_close:.1f}
-- Time: {_now} IST
+        # RULE 1: 3 consecutive losses → block
+        _inst_streak = _loss_streak.get(instrument, 0)
+        if _inst_streak >= 3:
+            _confidence = 40
+            _allowed    = False
+            _reason     = f"3 consecutive losses on {instrument} — strategy not working today"
 
-Last {len(_trade_summary)} trades for {instrument}:
-{chr(10).join(_trade_summary) if _trade_summary else "  No recent trades today"}
+        # RULE 2: After 3:10 PM → block
+        elif _now_ist.hour > 15 or (_now_ist.hour == 15 and _now_ist.minute >= 10):
+            _confidence = 40
+            _allowed    = False
+            _reason     = f"After 3:10 PM IST ({_now_ist.strftime('%H:%M')}) — no new entries"
 
-YOUR ONLY JOB: Check these exact rules. Apply NO other logic.
+        # RULE 3: Hull band too thin → block
+        elif hull_band_pct is not None and hull_band_pct < 0.0002:
+            _confidence = 40
+            _allowed    = False
+            _reason     = f"Hull band {hull_band_pct*100:.3f}% below 0.02% — trend too weak"
 
-RULE 1: If last 3 trades are ALL losses → set confidence=40, allowed=false
-RULE 2: If time after 3:10 PM IST → set confidence=40, allowed=false
-RULE 3: If Hull band below 0.02% → set confidence=40, allowed=false
-RULE 4: For any other situation → set confidence=75, allowed=true
-
-FORBIDDEN — you must NEVER do these:
-- Reduce confidence for 1 or 2 losses (only 3 in a row triggers rule 1)
-- Reduce confidence based on daily P&L
-- Add your own risk rules beyond rules 1-4
-- Score below 65 unless rules 1, 2 or 3 apply
-
-Reply ONLY in this JSON format, nothing else:
-{{"confidence": 75, "allowed": true, "reason": "brief reason"}}"""
-
-        _response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":         _api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
-            },
-            json={
-                "model":      "claude-haiku-4-5-20251001",   # fast + cheap
-                "max_tokens": 100,
-                "messages":   [{"role": "user", "content": _prompt}]
-            },
-            timeout=8
-        )
-
-        if _response.status_code != 200:
-            print(f"⚠️ Claude API error {_response.status_code} — allowing trade", flush=True)
-            return True, "Claude API error — allowing", 100
-
-        _text = _response.json()["content"][0]["text"].strip()
-        if not _text:
-            print(f"⚠️ Claude returned empty response — allowing trade", flush=True)
-            return True, "Claude empty response — allowing", 100
-
-        # Strip markdown code blocks if present
-        _text = _text.replace("```json", "").replace("```", "").strip()
-        _data = json.loads(_text)
-
-        confidence = int(_data.get("confidence", 50))
-        allowed    = bool(_data.get("allowed", True))
-        reason     = str(_data.get("reason", ""))
+        # All rules pass → allow with 75% confidence
+        confidence = _confidence
+        allowed    = _allowed
+        reason     = _reason
 
         # Only cache BLOCKED results for 5 min — rechecked if conditions improve
         if not allowed:
@@ -3256,12 +3266,12 @@ Reply ONLY in this JSON format, nothing else:
                 "first_blocked_at": _existing.get("first_blocked_at", _now_ts),
             }
 
-        print(f"🤖 Claude filter [{instrument} {signal}]: "
+        print(f"🔍 Signal filter [{instrument} {signal}]: "
               f"confidence={confidence}% allowed={allowed} — {reason}", flush=True)
 
         if not allowed:
             send_message(
-                f"🤖 CLAUDE FILTER BLOCKED\n"
+                f"🚫 SIGNAL FILTER BLOCKED\n"
                 f"📌 {instrument} {signal}\n"
                 f"📊 Confidence: {confidence}% (min {CLAUDE_MIN_CONFIDENCE}%)\n"
                 f"💭 {reason}"
@@ -4485,24 +4495,40 @@ def place_order(symbol, qty, exchange, instrument):
         # Always send the raw error alert
         send_message(f"❌ Order error: {err_str[:200]}")
 
-        # ── IP whitelist error — also send manual order alert ─────────────
+        # ── IP whitelist error — one-time alert, then pause ──────────────────
         if "not allowed" in err_str.lower() or ("ip" in err_str.lower() and "allowed" in err_str.lower()):
-            _manual_msg = (
-                f"🚨 IP BLOCKED — PLACE MANUALLY\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 Instrument : {instrument}\n"
-                f"📊 Signal     : {signal if 'signal' in dir() else 'CHECK CHART'}\n"
-                f"🏷️ Symbol     : {symbol}\n"
-                f"💰 Price (LTP): ₹{price if price else 'CHECK KITE'}\n"
-                f"📦 Quantity   : {qty} lots ({get_quantity(qty, exchange) if qty and exchange else 'CHECK'} shares)\n"
-                f"🏦 Exchange   : {exchange}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"⚡ Open Kite app → place BUY MIS order\n"
-                f"🔧 Fix IP: developers.kite.trade → Profile → IP Whitelist\n"
-                f"   Add: {os.environ.get('RAILWAY_STATIC_IP', 'check Railway logs for current IP')}"
-            )
-            send_message(_manual_msg)
-            print(_manual_msg, flush=True)
+            global _ip_blocked, _ip_alert_sent
+            _ip_blocked = True
+            if not _ip_alert_sent:
+                _ip_alert_sent = True
+                _manual_msg = (
+                    f"🚨 IP BLOCKED — PLACE MANUALLY\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 Instrument : {instrument}\n"
+                    f"📊 Signal     : {signal if 'signal' in dir() else 'CHECK CHART'}\n"
+                    f"🏷️ Symbol     : {symbol}\n"
+                    f"💰 Price (LTP): ₹{price if price else 'CHECK KITE'}\n"
+                    f"📦 Quantity   : {qty} lots ({get_quantity(qty, exchange) if qty and exchange else 'CHECK'} shares)\n"
+                    f"🏦 Exchange   : {exchange}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚡ Open Kite app → place BUY MIS order\n"
+                    f"🔧 Fix: developers.kite.trade → My Apps → IP Whitelist → DELETE ALL\n"
+                    f"⚠️ No more alerts until fixed (spam prevented)"
+                )
+                send_message(_manual_msg)
+                print(_manual_msg, flush=True)
+                # Auto-retry whitelist
+                try:
+                    print("🔄 Auto-whitelisting IP...", flush=True)
+                    _wl = update_kite_ip_whitelist()
+                    if _wl:
+                        _ip_blocked    = False
+                        _ip_alert_sent = False
+                        send_message("✅ IP auto-whitelisted — trading resumed automatically")
+                except Exception as _wl_e:
+                    print(f"⚠️ Auto whitelist failed: {_wl_e}", flush=True)
+            else:
+                print(f"🔕 IP still blocked — alert already sent, skipping spam", flush=True)
 
         return None
         
@@ -4958,7 +4984,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 if df_ht_exit is None or len(df_ht_exit) < 10:
                     raise ValueError("Insufficient data for HT exit check")
 
-                ht_df_exit = halftrend_tv(df_ht_exit, amplitude=3, channel_deviation=2)
+                ht_df_exit = halftrend_tv(df_ht_exit, amplitude=1, channel_deviation=2)
                 last_exit  = ht_df_exit.iloc[-2]   # last CLOSED candle — anti-repaint
 
                 # Exit on TREND CHANGE — faster than waiting for arrow
@@ -5125,12 +5151,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # Options lose value rapidly after 90 min due to time decay.
             # Only exits if:
             #   1. Trade held > 90 min
-            #   2. P&L is flat or slightly negative (no momentum)
-            #   3. Profit lock NOT already triggered (that handles profit case)
+            #   2. Option moved < 10% (no momentum)
+            #   3. Profit lock NOT already triggered
             # ================================================================
             _trade_age_mins = (time.time() - entry_time) / 60
-            _USE_TIME_EXIT  = True    # set False to disable
-            _TIME_EXIT_MINS = 90      # exit after 90 min if no momentum
+            _USE_TIME_EXIT  = os.environ.get("USE_THETA_EXIT", "true").lower() == "true"
+            _TIME_EXIT_MINS = int(os.environ.get("THETA_EXIT_MINS", "90"))
             _MOMENTUM_PCT   = 0.10    # option must have moved >10% to stay in trade
 
             if (_USE_TIME_EXIT
@@ -5139,8 +5165,13 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     and local_max_profit < 1000):    # profit lock not active
                 _moved_pct = abs(ltp - entry) / entry if entry > 0 else 0
                 if _moved_pct < _MOMENTUM_PCT:
+                    # Re-entry logic after theta exit:
+                    # Loss < ₹500  → re-enter immediately (just theta decay)
+                    # Loss >= ₹500 → block re-entry (option falling, not just decay)
+                    _will_reenter = current_pnl > -500
                     print(f"⏱️ THETA EXIT: {_trade_age_mins:.0f} min held, "
-                          f"option moved only {_moved_pct*100:.1f}% — decay risk", flush=True)
+                          f"moved {_moved_pct*100:.1f}%, P&L=₹{current_pnl:.0f}, "
+                          f"re-enter={_will_reenter}", flush=True)
                     send_message(
                         f"⏱️ THETA DECAY EXIT\n"
                         f"📌 {instrument} {signal} → {symbol}\n"
@@ -5148,8 +5179,15 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"📊 Option moved only {_moved_pct*100:.1f}% — no momentum\n"
                         f"💰 P&L: ₹{current_pnl:.0f}\n"
                         f"💡 Exiting to avoid theta decay erosion\n"
-                        f"♻️ Will re-enter immediately if signal still active"
+                        + (f"♻️ Will re-enter if signal still active (loss < ₹500)"
+                           if _will_reenter else
+                           f"⏳ Loss ₹{current_pnl:.0f} >= ₹500 — waiting for strong candle move before re-entry")
                     )
+
+                    # If big loss — block same strike re-entry until HT flips and comes back
+                    if not _will_reenter:
+                        _blocked_strikes[instrument].add(symbol)
+                        print(f"🚫 {symbol} blocked for re-entry — loss too large", flush=True)
                     _te_fill = exit_position(symbol, remaining_qty, exchange)
                     if not _te_fill:
                         send_message(f"🚨 THETA EXIT FAILED — EXIT {symbol} MANUALLY")
@@ -5679,14 +5717,41 @@ def exit_position(symbol, qty, exchange):
 
         # All attempts exhausted
         print(f"❌ Exit FAILED after 4 attempts — {symbol}")
-        _ip_blocked = "not allowed" in str(_last_order_err).lower() if '_last_order_err' in dir() else False
-        send_message(
-            f"🚨 EXIT FAILED — {symbol}\n"
-            f"4 limit order attempts exhausted.\n"
-            f"Please exit manually immediately!\n"
-            f"Qty: {exit_qty}  |  Last tried price: ₹{round(ltp * slippage_pcts[-1], 1):.1f}\n"
-            + ("⚠️ IP BLOCKED!\nFix: developers.kite.trade\n→ Profile → IP Whitelist → Delete ALL entries" if _ip_blocked else "")
-        )
+        _ip_blocked_exit = "not allowed" in str(_last_order_err).lower() if '_last_order_err' in dir() else False
+
+        if _ip_blocked_exit:
+            global _ip_blocked, _ip_alert_sent
+            _ip_blocked = True
+            if not _ip_alert_sent:
+                _ip_alert_sent = True
+                send_message(
+                    f"🚨 EXIT FAILED — IP BLOCKED\n"
+                    f"📌 {symbol} qty={exit_qty}\n"
+                    f"🔧 Fix: developers.kite.trade\n"
+                    f"   → My Apps → Your App → IP Whitelist\n"
+                    f"   → DELETE ALL entries → Save\n"
+                    f"⚠️ EXIT MANUALLY ON KITE NOW!\n"
+                    f"⚠️ No more alerts until fixed (spam prevented)"
+                )
+                # Auto-retry whitelist
+                try:
+                    print("🔄 Auto-whitelisting IP...", flush=True)
+                    _wl = update_kite_ip_whitelist()
+                    if _wl:
+                        _ip_blocked    = False
+                        _ip_alert_sent = False
+                        send_message("✅ IP auto-whitelisted — trading resumed")
+                except Exception as _wl_e:
+                    print(f"⚠️ Auto whitelist failed: {_wl_e}", flush=True)
+            else:
+                print(f"🔕 IP still blocked — exit alert already sent", flush=True)
+        else:
+            send_message(
+                f"🚨 EXIT FAILED — {symbol}\n"
+                f"4 limit order attempts exhausted.\n"
+                f"Please exit manually immediately!\n"
+                f"Qty: {exit_qty}  |  Last tried price: ₹{round(ltp * slippage_pcts[-1], 1):.1f}"
+            )
         return False
 
     except Exception as e:
@@ -11119,7 +11184,7 @@ if __name__ == "__main__":
 
     _claude_filter_cache.clear()
     _claude_flip_counter.clear()
-    print("🤖 Claude filter cache cleared on startup", flush=True)
+    print("🔍 Signal filter cache cleared on startup", flush=True)
 
     threading.Thread(target=nifty_loop, daemon=True).start()
     print(f"✅ NIFTY loop started (token={config.NIFTY_TOKEN})", flush=True)

@@ -611,6 +611,8 @@ def daily_profit_target_monitor():
                 _daily_target_exited     = False
                 _profit_protection_floor = 0.0
                 daily_profit_target_monitor._protection_triggered = False
+                daily_profit_target_monitor._target_hit_time      = 0
+                daily_profit_target_monitor._floor_tick           = 0
                 _last_reset_date         = _today
                 print(f"🎯 Target monitor: new day reset at {now_ist.strftime('%H:%M')}", flush=True)
                 continue   # skip this tick — let daily P&L vars reset first
@@ -633,14 +635,25 @@ def daily_profit_target_monitor():
             except Exception as _lp_err:
                 print(f"⚠️ Live P&L fetch error: {_lp_err}", flush=True)
 
-            if _live_pnl != 0 or _closed_pnl != 0:
+            if (_live_pnl != 0 or _closed_pnl != 0) and _combined > DAILY_PROFIT_TARGET * 0.5:
                 print(f"🎯 Target monitor: closed=₹{_closed_pnl:.0f} + "
                       f"live=₹{_live_pnl:.0f} = combined=₹{_combined:.0f} "
                       f"/ target=₹{DAILY_PROFIT_TARGET}", flush=True)
 
             # ── PROFIT PROTECTION MODE ────────────────────────────────────────
-            # After target hit: allow new trades but stop if P&L drops below floor
             if _daily_target_exited and USE_PROFIT_PROTECTION:
+
+                # If protection already triggered — silently block entries
+                if getattr(daily_profit_target_monitor, '_protection_triggered', False):
+                    time.sleep(5)
+                    continue
+
+                # Grace period — wait 60s after target hit for exits to settle
+                _hit_time = getattr(daily_profit_target_monitor, '_target_hit_time', 0)
+                if time.time() - _hit_time < 60:
+                    print(f"🛡️ Protection grace period — waiting for exits to settle", flush=True)
+                    continue
+
                 # Dynamic trailing floor — rises as profit grows, never drops
                 if _combined > _profit_protection_floor:
                     _new_floor = max(
@@ -648,21 +661,14 @@ def daily_profit_target_monitor():
                         _combined * 0.85
                     )
                     if _new_floor > _profit_protection_floor:
-                        print(f"🛡️ Protection floor raised: ₹{_profit_protection_floor:.0f} → ₹{_new_floor:.0f}", flush=True)
+                        print(f"🛡️ Protection floor raised: ₹{_profit_protection_floor:.0f} → ₹{_new_floor:.0f} "
+                              f"(85% of peak ₹{_combined:.0f})", flush=True)
                         _profit_protection_floor = _new_floor
 
                 if _combined < _profit_protection_floor:
-                    # Already triggered — hard stop, no more checks needed
-                    if getattr(daily_profit_target_monitor, '_protection_triggered', False):
-                        # Already alerted — just block entries silently
-                        _daily_target_exited       = True
-                        USE_PROFIT_PROTECTION_flag = False
-                        time.sleep(5)
-                        continue
-
                     # First time protection triggers — alert once and exit
                     daily_profit_target_monitor._protection_triggered = True
-                    print(f"🛡️ PROFIT PROTECTION: combined ₹{_combined:.0f} < floor ₹{_profit_protection_floor:.0f}", flush=True)
+                    print(f"🛡️ PROFIT PROTECTION TRIGGERED: ₹{_combined:.0f} < floor ₹{_profit_protection_floor:.0f}", flush=True)
                     send_message(
                         f"🛡️ PROFIT PROTECTION TRIGGERED\n"
                         f"💰 Combined P&L: ₹{_combined:.0f} (live included)\n"
@@ -679,21 +685,25 @@ def daily_profit_target_monitor():
                         ("CRUDE",     crude_position,      crude_trade_active),
                     ]:
                         with lock:
-                            _sym = _pos.get("symbol")
-                            _qty = _pos.get("qty", 0)
-                            _exc = _pos.get("exchange")
+                            _sym  = _pos.get("symbol")
+                            _qty  = _pos.get("qty", 0)
+                            _exc  = _pos.get("exchange")
                             _active = _pos.get("active", False)
                         if _active and _sym and _qty > 0:
                             print(f"   🔴 Protection exit {_inst}: {_sym}", flush=True)
                             _ep_ok = exit_position(_sym, _qty, _exc)
                             if not _ep_ok:
                                 send_message(f"🚨 PROTECTION EXIT FAILED — EXIT {_sym} MANUALLY")
-                    _daily_target_exited     = True
+                    # Floor = 0 so apply_entry_filters blocks new entries
                     _profit_protection_floor = 0.0
-                    continue
                 else:
-                    print(f"🛡️ Protection: ₹{_combined:.0f} > floor ₹{_profit_protection_floor:.0f} ✅", flush=True)
-                    continue
+                    # Above floor — allow new trades, print only every ~30 ticks
+                    if not hasattr(daily_profit_target_monitor, '_floor_tick'):
+                        daily_profit_target_monitor._floor_tick = 0
+                    daily_profit_target_monitor._floor_tick += 1
+                    if daily_profit_target_monitor._floor_tick % 30 == 0:
+                        print(f"🛡️ Protection: ₹{_combined:.0f} above floor ₹{_profit_protection_floor:.0f} ✅", flush=True)
+                continue
 
             # ── First time target hit ─────────────────────────────────────────
             if _combined < DAILY_PROFIT_TARGET:
@@ -701,6 +711,7 @@ def daily_profit_target_monitor():
 
             _daily_target_exited = True
             _profit_protection_floor = DAILY_PROFIT_TARGET   # protect the target amount
+            daily_profit_target_monitor._target_hit_time = time.time()   # grace period start
             print(f"🎯 DAILY TARGET HIT ₹{_combined:.0f} — exiting all positions", flush=True)
 
             _exited = []
@@ -825,6 +836,30 @@ ENABLE_NIFTY      = os.environ.get("ENABLE_NIFTY",      "true").lower()  == "tru
 ENABLE_BANKNIFTY  = os.environ.get("ENABLE_BANKNIFTY",  "false").lower() == "true"
 ENABLE_FINNIFTY   = os.environ.get("ENABLE_FINNIFTY",   "false").lower() == "true"
 ENABLE_SENSEX     = os.environ.get("ENABLE_SENSEX",     "true").lower()  == "true"
+LOW_BALANCE_THRESHOLD = 1500   # if equity balance < ₹1,500 → only SENSEX allowed
+
+# ── Lot sizes — configurable via Railway Variables ────────────────────────────
+# Change without redeploying: set NIFTY_LOT_SIZE=65 in Railway Variables
+NIFTY_LOT_SIZE     = int(os.environ.get("NIFTY_LOT_SIZE",     "65"))
+BANKNIFTY_LOT_SIZE = int(os.environ.get("BANKNIFTY_LOT_SIZE", "30"))
+FINNIFTY_LOT_SIZE  = int(os.environ.get("FINNIFTY_LOT_SIZE",  "60"))
+SENSEX_LOT_SIZE    = int(os.environ.get("SENSEX_LOT_SIZE",    "20"))
+CRUDE_LOT_SIZE     = int(os.environ.get("CRUDE_LOT_SIZE",     "100"))
+
+# ── Number of lots per trade — configurable via Railway Variables ─────────────
+# 0 = auto (calculated by calculate_lots based on balance)
+# 1,2,3 = fixed number of lots regardless of balance
+NIFTY_NUM_LOTS     = int(os.environ.get("NIFTY_NUM_LOTS",     "0"))
+BANKNIFTY_NUM_LOTS = int(os.environ.get("BANKNIFTY_NUM_LOTS", "0"))
+FINNIFTY_NUM_LOTS  = int(os.environ.get("FINNIFTY_NUM_LOTS",  "0"))
+SENSEX_NUM_LOTS    = int(os.environ.get("SENSEX_NUM_LOTS",    "0"))
+CRUDE_NUM_LOTS     = int(os.environ.get("CRUDE_NUM_LOTS",     "0"))
+
+print(f"📦 Lot sizes: NIFTY={NIFTY_LOT_SIZE} BN={BANKNIFTY_LOT_SIZE} "
+      f"FN={FINNIFTY_LOT_SIZE} SENSEX={SENSEX_LOT_SIZE} CRUDE={CRUDE_LOT_SIZE}", flush=True)
+print(f"📊 Num lots:  NIFTY={NIFTY_NUM_LOTS or 'auto'} BN={BANKNIFTY_NUM_LOTS or 'auto'} "
+      f"FN={FINNIFTY_NUM_LOTS or 'auto'} SENSEX={SENSEX_NUM_LOTS or 'auto'} "
+      f"CRUDE={CRUDE_NUM_LOTS or 'auto'}", flush=True)
 ENABLE_CRUDE      = os.environ.get("ENABLE_CRUDE",      "false").lower() == "true"
 ENABLE_SWING      = os.environ.get("ENABLE_SWING",      "false").lower() == "true"
 
@@ -1646,6 +1681,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 
     Returns (passed: bool, reason: str).
     """
+    global _daily_target_exited   # must be global so reset propagates
     now_ist = datetime.now(IST)
 
     # ── Whipsaw guard — pause entries if too many flips in short window ───────
@@ -1663,12 +1699,28 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         if USE_PROFIT_PROTECTION and _profit_protection_floor > 0:
             pass   # protection mode active — monitor handles floor, allow new entries
         else:
+            # Re-check actual combined P&L (closed + live) before blocking
+            # Flag may be stale if trades closed at a loss after target was hit
             _combined_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
                              finnifty_daily_pnl + sensex_daily_pnl + crude_daily_pnl)
-            return False, (
-                f"🎯 Daily target hit — combined P&L Rs.{_combined_pnl:.0f} "
-                f">= target Rs.{DAILY_PROFIT_TARGET:.0f} — no new entries today"
-            )
+            # Also include live unrealised P&L
+            try:
+                _net = kite.positions().get("net", [])
+                for _p in _net:
+                    if _p.get("quantity", 0) > 0:
+                        _combined_pnl += float(_p.get("pnl", 0) or 0)
+            except Exception:
+                pass
+
+            if _combined_pnl >= DAILY_PROFIT_TARGET:
+                return False, (
+                    f"🎯 Daily target hit — combined P&L Rs.{_combined_pnl:.0f} "
+                    f">= target Rs.{DAILY_PROFIT_TARGET:.0f} — no new entries today"
+                )
+            else:
+                # P&L dropped below target — reset flag and allow new entries
+                print(f"🔄 Daily target flag reset: P&L ₹{_combined_pnl:.0f} < target ₹{DAILY_PROFIT_TARGET:.0f} — resuming", flush=True)
+                _daily_target_exited = False
 
     # ── 0. First candle range filter — rangebound inside-day detection ─────────
     # If price is still inside the 9:15 AM first candle's high/low range,
@@ -3670,7 +3722,7 @@ def find_option(signal, instrument):
         step = 50
         token = config.NIFTY_TOKEN
         token_symbol = "NSE:NIFTY 50"
-        lot_size = 65            # NIFTY lot size = 65
+        lot_size = NIFTY_LOT_SIZE
     elif instrument == "BANKNIFTY":
         exchange = "NFO"
         name = "BANKNIFTY"
@@ -3691,7 +3743,7 @@ def find_option(signal, instrument):
         step = 100               # SENSEX strikes move in ₹100 steps
         token = SENSEX_TOKEN
         token_symbol = "BSE:SENSEX"
-        lot_size = 20            # SENSEX lot size = 20
+        lot_size = SENSEX_LOT_SIZE
     else:
         exchange = "MCX"
         name = "CRUDEOIL"
@@ -3793,33 +3845,50 @@ def find_option(signal, instrument):
             strike_shift = 1
             max_price = 700        # ₹700 × 20 = ₹14,000 per lot
     else:
-        # NIFTY — lot size 15 (updated Apr 2025)
-        # 1 lot value = premium * 65
-        # Capital cap: 1 lot must not exceed 40% of balance
-        # For ₹25k: 40% = ₹10,000 → max premium = 10000/65 ≈ 153
-        # For ₹50k: 40% = ₹20,000 → max premium = 20000/65 ≈ 307
-        if balance <= 5000:
-            strike_shift = 2      # 3 strikes OTM — affordable but tradeable
+        # NIFTY lot = 65. Strikes move in ₹50 steps.
+        # Minimum viable balance: ₹10 premium × 65 = ₹650
+        if balance <= 1500:
+            strike_shift = 5      # 250 OTM — very deep, cheapest options
+            max_price = 15        # ₹15 × 65 = ₹975 per lot
+        elif balance <= 3000:
+            strike_shift = 4      # 200 OTM
+            max_price = 30        # ₹30 × 65 = ₹1,950 per lot
+        elif balance <= 5000:
+            strike_shift = 3      # 150 OTM
             max_price = 60        # ₹60 × 65 = ₹3,900 per lot
         elif balance <= 10000:
-            strike_shift = 1      # 2 strikes OTM — better delta
+            strike_shift = 2      # 100 OTM
             max_price = 100       # ₹100 × 65 = ₹6,500 per lot
         elif balance <= 20000:
-            strike_shift = 21     # 2 strikes OTM
+            strike_shift = 2      # 100 OTM
             max_price = 130       # ₹130 × 65 = ₹8,450 per lot
         elif balance <= 35000:
-            strike_shift = 1      # 1 strike OTM
+            strike_shift = 1      # 50 OTM
             max_price = 200       # ₹200 × 65 = ₹13,000 per lot
         elif balance <= 50000:
-            strike_shift = 1      # near ATM
+            strike_shift = 1
             max_price = 280       # ₹280 × 65 = ₹18,200 per lot
         else:
-            strike_shift = 1      # ATM / 1 strike OTM
+            strike_shift = 1
             max_price = 400       # ₹400 × 65 = ₹26,000 per lot
 
-    # =====================================
-    # OPTION TYPE + CORRECT STRIKE DIRECTION
-    # =====================================
+    # ── Minimum balance check ─────────────────────────────────────────────────
+    min_balance_map = {
+        "NIFTY": 650,      # ₹10 × 65 = ₹650 minimum
+        "BANKNIFTY": 600,  # ₹20 × 30 = ₹600 minimum
+        "FINNIFTY": 600,   # ₹10 × 60 = ₹600 minimum
+        "SENSEX": 400,     # ₹20 × 20 = ₹400 minimum
+        "CRUDE": 1000,     # ₹10 × 100 = ₹1000 minimum
+    }
+    _min_bal = min_balance_map.get(instrument, 500)
+    if balance < _min_bal:
+        msg = (f"⚠️ Balance ₹{balance:.0f} too low to trade {instrument} "
+               f"(minimum ₹{_min_bal}) — skipping")
+        print(msg, flush=True)
+        send_message(f"💸 INSUFFICIENT BALANCE\n"
+                     f"📌 {instrument}: ₹{balance:.0f} < min ₹{_min_bal}\n"
+                     f"💡 Add funds to trade {instrument}")
+        return None, None, None, None
     if signal == "CALL":
         opt_type = "CE"
         target_strike = atm + (strike_shift * step)
@@ -3981,6 +4050,14 @@ def find_option(signal, instrument):
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
 
+        # Override with fixed lot count from Railway Variable if set (>0)
+        _fixed = {"NIFTY": NIFTY_NUM_LOTS, "BANKNIFTY": BANKNIFTY_NUM_LOTS,
+                  "FINNIFTY": FINNIFTY_NUM_LOTS, "SENSEX": SENSEX_NUM_LOTS,
+                  "CRUDE": CRUDE_NUM_LOTS}.get(instrument, 0)
+        if _fixed > 0:
+            lot = _fixed
+            print(f"📊 Fixed lots: {lot} [{instrument}] (Railway Variable)", flush=True)
+
         return best["symbol"], best["price"], lot, exchange
 
     # =====================================
@@ -4017,7 +4094,7 @@ def find_option(signal, instrument):
             continue
 
         # Fallback: strict max_price cap + actual affordability check
-        _lot_size = {"SENSEX": 20, "BANKNIFTY": 30, "FINNIFTY": 60, "CRUDE": 100}.get(instrument, 65)
+        _lot_size = {"SENSEX": SENSEX_LOT_SIZE, "BANKNIFTY": BANKNIFTY_LOT_SIZE, "FINNIFTY": FINNIFTY_LOT_SIZE, "CRUDE": CRUDE_LOT_SIZE}.get(instrument, NIFTY_LOT_SIZE)
         _cost = p * _lot_size * 1.05   # 5% buffer
         _affordable = _cost <= _live   # must fit in live balance
 
@@ -4068,6 +4145,14 @@ def find_option(signal, instrument):
 
         strong_trend = is_market_trending(token, df)
         lot = calculate_lots(best["price"], exchange, instrument, strong_trend)
+
+        # Override with fixed lot count from Railway Variable if set (>0)
+        _fixed = {"NIFTY": NIFTY_NUM_LOTS, "BANKNIFTY": BANKNIFTY_NUM_LOTS,
+                  "FINNIFTY": FINNIFTY_NUM_LOTS, "SENSEX": SENSEX_NUM_LOTS,
+                  "CRUDE": CRUDE_NUM_LOTS}.get(instrument, 0)
+        if _fixed > 0:
+            lot = _fixed
+            print(f"📊 Fixed lots: {lot} [{instrument}] (Railway Variable fallback)", flush=True)
 
         return best["symbol"], best["price"], lot, exchange
 
@@ -4337,6 +4422,13 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     pnl = 0
     ltp = entry
 
+    # Spike reversal detection
+    _spike_peak_profit   = 0.0    # highest profit seen in a short window
+    _spike_peak_time     = 0.0    # when peak was seen
+    SPIKE_MIN_PROFIT     = 400    # minimum profit to activate spike detection (₹400)
+    SPIKE_DROP_PCT       = 0.35   # exit if profit drops 35% from spike peak
+    SPIKE_WINDOW_SECS    = 120    # spike must happen within 2 min
+
     # 🔥 CORE RISK MODEL — Two-tier SL
     # Single 45% SL — exit immediately when option drops 45% from entry
     SL_TIER2 = 0.45
@@ -4453,15 +4545,15 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 else:
                     # Lot-size aware partial exit — must be multiple of lot size
                     if instrument == "SENSEX":
-                        one_lot = 20
+                        one_lot = SENSEX_LOT_SIZE
                     elif instrument == "BANKNIFTY":
-                        one_lot = 30
+                        one_lot = BANKNIFTY_LOT_SIZE
                     elif instrument == "FINNIFTY":
-                        one_lot = 60
+                        one_lot = FINNIFTY_LOT_SIZE
                     elif instrument == "CRUDE":
-                        one_lot = 100
+                        one_lot = CRUDE_LOT_SIZE
                     else:
-                        one_lot = 65   # NIFTY
+                        one_lot = NIFTY_LOT_SIZE
 
                     total_lots = remaining_qty // one_lot
                     exit_lots  = max(1, total_lots // 2)
@@ -4504,6 +4596,41 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             if not getattr(manage_trade, "_partial_just_booked", False):
                 local_max_profit = max(local_max_profit, current_pnl)
             manage_trade._partial_just_booked = False
+
+            # ================================================================
+            # ⚡ SPIKE REVERSAL EXIT
+            # If profit spikes rapidly then drops 35% from spike peak → exit
+            # Catches sudden reversals like the chart shows
+            # ================================================================
+            if current_pnl >= SPIKE_MIN_PROFIT and not exit_done:
+                if current_pnl > _spike_peak_profit:
+                    _spike_peak_profit = current_pnl
+                    _spike_peak_time   = time.time()
+                else:
+                    _spike_age = time.time() - _spike_peak_time
+                    if (_spike_age <= SPIKE_WINDOW_SECS and
+                            _spike_peak_profit > 0 and
+                            current_pnl < _spike_peak_profit * (1 - SPIKE_DROP_PCT)):
+                        print(f"⚡ SPIKE REVERSAL: peak=₹{_spike_peak_profit:.0f} "
+                              f"dropped to ₹{current_pnl:.0f} "
+                              f"({(1 - current_pnl/_spike_peak_profit)*100:.0f}% drop in {_spike_age:.0f}s)",
+                              flush=True)
+                        send_message(
+                            f"⚡ SPIKE REVERSAL EXIT\n"
+                            f"📌 {instrument} {signal} → {symbol}\n"
+                            f"📈 Peak profit: ₹{_spike_peak_profit:.0f}\n"
+                            f"📉 Current:     ₹{current_pnl:.0f}\n"
+                            f"⏱️ Reversed in {_spike_age:.0f}s — locking gains"
+                        )
+                        _sr_fill = exit_position(symbol, remaining_qty, exchange)
+                        if not _sr_fill:
+                            send_message(f"🚨 SPIKE EXIT FAILED — EXIT {symbol} MANUALLY")
+                        else:
+                            exit_fill_price = _sr_fill if isinstance(_sr_fill, float) else None
+                            ltp = exit_fill_price or ltp
+                        pnl = current_pnl
+                        exit_done = True
+                        break
 
             if local_max_profit >= 1000:
 
@@ -5761,6 +5888,16 @@ def nifty_loop():
                 time.sleep(30)
                 continue
 
+            # Low balance guard — only SENSEX when equity < ₹1,500
+            try:
+                _eq_bal = float(kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0) or 0)
+                if _eq_bal > 0 and _eq_bal < LOW_BALANCE_THRESHOLD:
+                    print(f"💸 Balance ₹{_eq_bal:.0f} < ₹{LOW_BALANCE_THRESHOLD} — NIFTY skipped (low balance, SENSEX only)", flush=True)
+                    time.sleep(60)
+                    continue
+            except Exception:
+                pass
+
             now_dt = datetime.now(IST)
 
             # ── Weekend: sleep and do nothing ────────────────────────────────
@@ -6532,6 +6669,16 @@ def banknifty_loop():
                 time.sleep(60)
                 continue
 
+            # Low balance guard
+            try:
+                _eq_bal = float(kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0) or 0)
+                if _eq_bal > 0 and _eq_bal < LOW_BALANCE_THRESHOLD:
+                    print(f"Low balance BANKNIFTY skipped", flush=True)
+                    time.sleep(60)
+                    continue
+            except Exception:
+                pass
+
             now_dt = datetime.now(IST)
 
             # ── Weekend: sleep and do nothing ────────────────────────────────
@@ -6939,6 +7086,16 @@ def finnifty_loop():
                     _finnifty_disabled_logged = True
                 time.sleep(60)
                 continue
+
+            # Low balance guard
+            try:
+                _eq_bal = float(kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0) or 0)
+                if _eq_bal > 0 and _eq_bal < LOW_BALANCE_THRESHOLD:
+                    print(f"Low balance FINNIFTY skipped", flush=True)
+                    time.sleep(60)
+                    continue
+            except Exception:
+                pass
 
             now_dt = datetime.now(IST)
 
@@ -7812,36 +7969,48 @@ def confirm_entry(token, signal, df=None):
         return False
     
 def get_quantity(lots, exchange, instrument=None):
-    """Returns total shares for given lots based on instrument lot size."""
-    if exchange == "MCX":              return lots * 100   # CRUDE OIL
-    if instrument == "BANKNIFTY":      return lots * 30    # BankNifty lot = 30
-    if instrument == "FINNIFTY":       return lots * 60    # FinNifty lot = 60
-    if instrument == "SENSEX":         return lots * 20    # SENSEX lot = 20
-    if instrument == "NIFTY":          return lots * 65    # NIFTY lot = 65
-    if exchange in ("NFO", "BFO"):     return lots * 65    # default NFO/BFO
+    """Returns total shares for given lots based on instrument lot size.
+    Lot sizes configurable via Railway Variables:
+    NIFTY_LOT_SIZE, BANKNIFTY_LOT_SIZE, FINNIFTY_LOT_SIZE, SENSEX_LOT_SIZE, CRUDE_LOT_SIZE
+    """
+    if exchange == "MCX":              return lots * CRUDE_LOT_SIZE
+    if instrument == "BANKNIFTY":      return lots * BANKNIFTY_LOT_SIZE
+    if instrument == "FINNIFTY":       return lots * FINNIFTY_LOT_SIZE
+    if instrument == "SENSEX":         return lots * SENSEX_LOT_SIZE
+    if instrument == "NIFTY":          return lots * NIFTY_LOT_SIZE
+    if exchange in ("NFO", "BFO"):     return lots * NIFTY_LOT_SIZE   # default NFO/BFO
     return lots
     
 def get_balance(instrument):
     """
     Returns available balance from Kite.
-    Uses 'cash' (total deposited) for tier selection so open positions
-    don't push you into a cheaper option tier.
-    live_balance is used only for the margin sufficiency check.
+    Uses correct margin segment per instrument:
+    - NFO (NIFTY/BANKNIFTY/FINNIFTY) → equity segment
+    - BFO (SENSEX) → equity segment (BSE F&O uses equity margin)
+    - MCX (CRUDE) → commodity segment
     """
     try:
         margin = kite.margins()
-        seg = margin.get("equity", {}).get("available", {})
 
-        # Use cash (total) for tier selection — live_balance drops when trades are open
-        # which wrongly pushes into cheaper option tiers
-        cash         = float(seg.get("cash", 0) or 0)
-        live_balance = float(seg.get("live_balance", 0) or 0)
+        # Select correct segment
+        if instrument == "CRUDE":
+            seg = margin.get("commodity", {}).get("available", {})
+        else:
+            seg = margin.get("equity", {}).get("available", {})
 
-        # Use whichever is higher — cash reflects total, live_balance reflects free margin
-        balance = max(cash, live_balance)
+        # Try multiple field names Kite uses
+        cash         = float(seg.get("cash", 0) or seg.get("adhoc_margin", 0) or 0)
+        live_balance = float(seg.get("live_balance", 0) or seg.get("opening_balance", 0) or 0)
+        collateral   = float(seg.get("collateral", 0) or 0)
+
+        # Use best available: cash or live_balance (whichever is higher)
+        balance = max(cash, live_balance, collateral)
 
         if balance <= 0:
-            print(f"⚠️ get_balance: zero balance for {instrument} — cash={cash} live={live_balance}")
+            # Last fallback — try net available
+            net_avail = float(seg.get("net", 0) or 0)
+            balance = net_avail
+            print(f"⚠️ get_balance: zero from normal fields [{instrument}] — trying net={net_avail}")
 
         print(f"💳 Balance [{instrument}]: cash=₹{cash:.0f} live=₹{live_balance:.0f} → using ₹{balance:.0f}", flush=True)
         return balance
@@ -7886,7 +8055,7 @@ def calculate_lots(price, exchange, instrument, strong_trend=False):
 
     # ── Lot sizes ─────────────────────────────────────────────────────────
     if instrument == "NIFTY":
-        lot_size = 65          # Current Nifty F&O lot size
+        lot_size = NIFTY_LOT_SIZE
         max_lots = MAX_LOTS_NIFTY
     else:
         lot_size = 100         # Crude Oil MCX lot size

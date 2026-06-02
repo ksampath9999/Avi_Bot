@@ -1774,7 +1774,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                     _now_ist = datetime.now(IST)
                     _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
                     _morning_bypass = (0 <= _mins_since_open <= HULL_MORNING_BYPASS_MINS)
-                    if bw_pct is not None and HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
+                    if USE_HULL_BAND_FILTER and bw_pct is not None and HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
                         reason = (f"🌊 Hull filter: band too thin — width={bw_pct*100:.3f}% min {HULL_MIN_BAND_WIDTH_PCT*100:.3f}%")
                         print(f"🚫 HULL BLOCK: {reason}", flush=True)
                         return False, reason
@@ -1790,7 +1790,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                 _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
                 _morning_bypass = (0 <= _mins_since_open <= HULL_MORNING_BYPASS_MINS)
 
-                if HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
+                if USE_HULL_BAND_FILTER and HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
                     pts = abs(hval - h2val)
                     reason = (
                         f"🌊 Hull filter: band too thin — "
@@ -1800,7 +1800,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                     )
                     print(f"🚫 HULL BLOCK: {reason}", flush=True)
                     return False, reason
-                elif _morning_bypass and bw_pct < HULL_MIN_BAND_WIDTH_PCT:
+                elif USE_HULL_BAND_FILTER and _morning_bypass and bw_pct < HULL_MIN_BAND_WIDTH_PCT:
                     print(f"🌅 Hull morning bypass active ({_mins_since_open} min since open) — "
                           f"band={bw_pct*100:.3f}% skipping width check", flush=True)
 
@@ -2159,7 +2159,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 #   length = 55      (swing entry default in Pine)
 # ──────────────────────────────────────────────────────────────────────────────
 
-USE_HULL_FILTER  = True    # Hull Suite colour must match HalfTrend signal
+USE_HULL_FILTER  = os.environ.get("USE_HULL_FILTER", "true").lower() == "true"
 HULL_MODE        = "Hma"  # "Hma" | "Ehma" | "Thma"
 HULL_LENGTH      = 55     # Pine default for swing entry
 
@@ -2169,7 +2169,10 @@ HULL_LENGTH      = 55     # Pine default for swing entry
 # 0.001 = 0.1% of price  (e.g. on Nifty 23000 → min gap of 23 pts)
 # 0.002 = 0.2% of price  (e.g. on Nifty 23000 → min gap of 46 pts) ← recommended
 # Set to 0.0 to disable the width check.
-HULL_MIN_BAND_WIDTH_PCT  = 0.0002
+HULL_MIN_BAND_WIDTH_PCT  = 0.0003   # 0.03% — minimum band width to confirm trend
+                                     # On 15-min candles: ~7pts on Nifty 23000
+                                     # Thin band = sideways market = skip entry
+USE_HULL_BAND_FILTER = os.environ.get("USE_HULL_BAND_FILTER", "true").lower() == "true"  # enable/disable Hull band width check independently
 HULL_MORNING_BYPASS_MINS = 75
 
 # ── First 5-min candle range filter ──────────────────────────────────────────
@@ -5831,9 +5834,9 @@ def nifty_loop():
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
-                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "5minute", 600)
+                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 200)
                 if cached_nifty_df is not None and len(cached_nifty_df) >= 120:
-                    cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=3, channel_deviation=2)
+                    cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=1, channel_deviation=2)
                 last_fetch_nifty = time.time()
 
             if cached_nifty_df is None or len(cached_nifty_df) < 120 or cached_nifty_ht is None:
@@ -6190,7 +6193,7 @@ def crude_loop():
                 cached_crude_15m = get_cached_data(CRUDE_TOKEN, "15minute", 600)
                 # Recompute HalfTrend only when data refreshes
                 if cached_crude_15m is not None and len(cached_crude_15m) >= 50:
-                    cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=3, channel_deviation=2)
+                    cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=1, channel_deviation=2)
                 last_fetch_crude = time.time()
 
             if cached_crude_15m is None or len(cached_crude_15m) < 50 or cached_crude_ht is None:
@@ -6590,9 +6593,9 @@ def banknifty_loop():
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_banknifty > 30 or cached_banknifty_df is None:
-                cached_banknifty_df = get_cached_data(BANKNIFTY_TOKEN, "5minute", 600)
+                cached_banknifty_df = get_cached_data(BANKNIFTY_TOKEN, "15minute", 200)
                 if cached_banknifty_df is not None and len(cached_banknifty_df) >= 120:
-                    cached_banknifty_ht = halftrend_tv(cached_banknifty_df, amplitude=3, channel_deviation=2)
+                    cached_banknifty_ht = halftrend_tv(cached_banknifty_df, amplitude=1, channel_deviation=2)
                 last_fetch_banknifty = time.time()
 
             if cached_banknifty_df is None or len(cached_banknifty_df) < 120 or cached_banknifty_ht is None:
@@ -6998,9 +7001,9 @@ def finnifty_loop():
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_finnifty > 30 or cached_finnifty_df is None:
-                cached_finnifty_df = get_cached_data(FINNIFTY_TOKEN, "5minute", 600)
+                cached_finnifty_df = get_cached_data(FINNIFTY_TOKEN, "15minute", 200)
                 if cached_finnifty_df is not None and len(cached_finnifty_df) >= 120:
-                    cached_finnifty_ht = halftrend_tv(cached_finnifty_df, amplitude=3, channel_deviation=2)
+                    cached_finnifty_ht = halftrend_tv(cached_finnifty_df, amplitude=1, channel_deviation=2)
                 last_fetch_finnifty = time.time()
 
             if cached_finnifty_df is None or len(cached_finnifty_df) < 120 or cached_finnifty_ht is None:
@@ -7410,9 +7413,9 @@ def sensex_loop():
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_sensex > 30 or cached_sensex_df is None:
-                cached_sensex_df = get_cached_data(SENSEX_TOKEN, "5minute", 600)
+                cached_sensex_df = get_cached_data(SENSEX_TOKEN, "15minute", 200)
                 if cached_sensex_df is not None and len(cached_sensex_df) >= 120:
-                    cached_sensex_ht = halftrend_tv(cached_sensex_df, amplitude=3, channel_deviation=2)
+                    cached_sensex_ht = halftrend_tv(cached_sensex_df, amplitude=1, channel_deviation=2)
                 last_fetch_sensex = time.time()
 
             if cached_sensex_df is None or len(cached_sensex_df) < 120 or cached_sensex_ht is None:

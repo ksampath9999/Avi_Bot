@@ -571,7 +571,7 @@ def daily_profit_target_monitor():
       3. Block new entries for rest of day (via apply_entry_filters check)
     Runs only when DAILY_PROFIT_TARGET > 0.
     """
-    global _daily_target_exited, _profit_protection_floor
+    global _daily_target_exited, _profit_protection_floor, _daily_max_loss_hit
     global nifty_trade_active, banknifty_trade_active, finnifty_trade_active
     global sensex_trade_active, crude_trade_active
     global nifty_position, banknifty_position, finnifty_position, sensex_position, crude_position
@@ -610,15 +610,13 @@ def daily_profit_target_monitor():
             if _last_reset_date != _today:
                 _daily_target_exited     = False
                 _profit_protection_floor = 0.0
+                _daily_max_loss_hit      = False
                 daily_profit_target_monitor._protection_triggered = False
                 daily_profit_target_monitor._target_hit_time      = 0
                 daily_profit_target_monitor._floor_tick           = 0
                 _last_reset_date         = _today
                 print(f"🎯 Target monitor: new day reset at {now_ist.strftime('%H:%M')}", flush=True)
                 continue   # skip this tick — let daily P&L vars reset first
-
-            if _daily_target_exited and not USE_PROFIT_PROTECTION:
-                continue   # normal mode — target hit, skip everything
 
             # ── Calculate combined P&L — closed trades + live unrealised ─────
             _closed_pnl = (nifty_daily_pnl + banknifty_daily_pnl +
@@ -639,6 +637,40 @@ def daily_profit_target_monitor():
                 print(f"🎯 Target monitor: closed=₹{_closed_pnl:.0f} + "
                       f"live=₹{_live_pnl:.0f} = combined=₹{_combined:.0f} "
                       f"/ target=₹{DAILY_PROFIT_TARGET}", flush=True)
+
+            # ── Daily max loss — stop ALL trading if loss too deep ────────────
+            if DAILY_MAX_LOSS > 0 and not _daily_max_loss_hit:
+                if _combined <= -DAILY_MAX_LOSS:
+                    _daily_max_loss_hit = True
+                    print(f"🛑 DAILY MAX LOSS HIT: ₹{_combined:.0f} <= -₹{DAILY_MAX_LOSS}", flush=True)
+                    send_message(
+                        f"🛑 DAILY MAX LOSS REACHED\n"
+                        f"💸 Combined P&L: ₹{_combined:.0f} (closed+live)\n"
+                        f"🔒 Limit: -₹{DAILY_MAX_LOSS}\n"
+                        f"🛑 All trading stopped for today\n"
+                        f"📅 Resumes tomorrow at 9:20 AM"
+                    )
+                    for _inst, _pos, _ in [
+                        ("NIFTY",     nifty_position,    nifty_trade_active),
+                        ("BANKNIFTY", banknifty_position, banknifty_trade_active),
+                        ("FINNIFTY",  finnifty_position,  finnifty_trade_active),
+                        ("SENSEX",    sensex_position,    sensex_trade_active),
+                        ("CRUDE",     crude_position,     crude_trade_active),
+                    ]:
+                        with lock:
+                            _sym  = _pos.get("symbol")
+                            _qty  = _pos.get("qty", 0)
+                            _exc  = _pos.get("exchange")
+                            _active = _pos.get("active", False)
+                        if _active and _sym and _qty > 0:
+                            print(f"   🔴 Max-loss exit {_inst}: {_sym}", flush=True)
+                            exit_position(_sym, _qty, _exc)
+
+            if _daily_max_loss_hit:
+                continue   # silent — block all new entries
+
+            if _daily_target_exited and not USE_PROFIT_PROTECTION:
+                continue   # target hit normal mode — skip
 
             # ── PROFIT PROTECTION MODE ────────────────────────────────────────
             if _daily_target_exited and USE_PROFIT_PROTECTION:
@@ -862,6 +894,11 @@ CRUDE_NUM_LOTS     = int(os.environ.get("CRUDE_NUM_LOTS",     "0"))
 # Set to 0 to disable that check
 MAX_LOSS_PER_TRADE = int(os.environ.get("MAX_LOSS_PER_TRADE", "800"))   # ₹800 default
 MAX_LOSS_PER_LOT   = int(os.environ.get("MAX_LOSS_PER_LOT",   "800"))   # ₹800 per lot default
+
+# Daily max loss — stop ALL trading if combined loss exceeds this
+# Prevents catastrophic days. Set 0 to disable.
+DAILY_MAX_LOSS     = int(os.environ.get("DAILY_MAX_LOSS",     "1500"))  # ₹1,500 default
+_daily_max_loss_hit = False   # flag — set True when daily loss limit hit
 
 print(f"📦 Lot sizes: NIFTY={NIFTY_LOT_SIZE} BN={BANKNIFTY_LOT_SIZE} "
       f"FN={FINNIFTY_LOT_SIZE} SENSEX={SENSEX_LOT_SIZE} CRUDE={CRUDE_LOT_SIZE}", flush=True)
@@ -1689,8 +1726,12 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 
     Returns (passed: bool, reason: str).
     """
-    global _daily_target_exited   # must be global so reset propagates
+    global _daily_target_exited, _daily_max_loss_hit   # must be global so reset propagates
     now_ist = datetime.now(IST)
+
+    # ── Daily max loss — stop all trading if loss too deep ───────────────────
+    if DAILY_MAX_LOSS > 0 and _daily_max_loss_hit:
+        return False, f"🛑 Daily max loss -₹{DAILY_MAX_LOSS} reached — no more trades today"
 
     # ── Whipsaw guard — pause entries if too many flips in short window ───────
     if USE_WHIPSAW_FILTER:

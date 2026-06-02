@@ -855,6 +855,14 @@ FINNIFTY_NUM_LOTS  = int(os.environ.get("FINNIFTY_NUM_LOTS",  "0"))
 SENSEX_NUM_LOTS    = int(os.environ.get("SENSEX_NUM_LOTS",    "0"))
 CRUDE_NUM_LOTS     = int(os.environ.get("CRUDE_NUM_LOTS",     "0"))
 
+# ── Max loss per trade — configurable via Railway Variables ───────────────────
+# MAX_LOSS_PER_TRADE: fixed ₹ loss limit regardless of lot size
+# MAX_LOSS_PER_LOT:   per-lot ₹ loss limit (e.g. ₹800/lot × 2 lots = ₹1,600)
+# If both set, uses whichever is LOWER (more conservative)
+# Set to 0 to disable that check
+MAX_LOSS_PER_TRADE = int(os.environ.get("MAX_LOSS_PER_TRADE", "800"))   # ₹800 default
+MAX_LOSS_PER_LOT   = int(os.environ.get("MAX_LOSS_PER_LOT",   "800"))   # ₹800 per lot default
+
 print(f"📦 Lot sizes: NIFTY={NIFTY_LOT_SIZE} BN={BANKNIFTY_LOT_SIZE} "
       f"FN={FINNIFTY_LOT_SIZE} SENSEX={SENSEX_LOT_SIZE} CRUDE={CRUDE_LOT_SIZE}", flush=True)
 print(f"📊 Num lots:  NIFTY={NIFTY_NUM_LOTS or 'auto'} BN={BANKNIFTY_NUM_LOTS or 'auto'} "
@@ -4923,16 +4931,22 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     exit_done = True
                     break
             # ================================================================
-            # 💔 MAX LOSS EXIT — exit immediately if loss hits ₹1,600
-            # Per-instrument only — NIFTY loss exits NIFTY, SENSEX exits SENSEX
-            # Blocks same strike from re-entry for rest of day
+            # 💔 MAX LOSS EXIT — exit immediately if loss hits limit
+            # MAX_LOSS_PER_TRADE: fixed ₹ limit (e.g. ₹1,600 regardless of lots)
+            # MAX_LOSS_PER_LOT:   per-lot limit (e.g. ₹800 × 2 lots = ₹1,600)
+            # Uses whichever is lower (most conservative)
             # ================================================================
-            MAX_LOSS_PER_TRADE = 1600
+            _lot_count   = remaining_qty // _get_lot_size(instrument)
+            _max_by_lot  = (MAX_LOSS_PER_LOT * _lot_count) if MAX_LOSS_PER_LOT > 0 else 999999
+            _max_by_flat = MAX_LOSS_PER_TRADE if MAX_LOSS_PER_TRADE > 0 else 999999
+            _effective_max_loss = min(_max_by_lot, _max_by_flat)
 
-            if not exit_done and current_pnl <= -MAX_LOSS_PER_TRADE:
-                print(f"💔 MAX LOSS ₹{current_pnl:.0f} <= -₹{MAX_LOSS_PER_TRADE} — exiting {symbol}", flush=True)
+            if not exit_done and current_pnl <= -_effective_max_loss:
+                print(f"💔 MAX LOSS ₹{current_pnl:.0f} <= -₹{_effective_max_loss:.0f} "
+                      f"(flat=₹{MAX_LOSS_PER_TRADE} per_lot=₹{MAX_LOSS_PER_LOT}×{_lot_count}lots) "
+                      f"— exiting {symbol}", flush=True)
                 send_message(
-                    f"💔 MAX LOSS EXIT — ₹{MAX_LOSS_PER_TRADE} LIMIT HIT\n"
+                    f"💔 MAX LOSS EXIT — ₹{_effective_max_loss:.0f} LIMIT HIT\n"
                     f"📌 {instrument} {signal} → {symbol}\n"
                     f"📉 Loss: ₹{current_pnl:.0f}\n"
                     f"📊 Entry: ₹{entry:.1f}  |  LTP: ₹{ltp:.1f}\n"

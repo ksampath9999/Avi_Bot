@@ -908,6 +908,11 @@ CRUDE_NUM_LOTS     = int(os.environ.get("CRUDE_NUM_LOTS",     "0"))
 MAX_LOSS_PER_TRADE = int(os.environ.get("MAX_LOSS_PER_TRADE", "800"))   # ₹800 default
 MAX_LOSS_PER_LOT   = int(os.environ.get("MAX_LOSS_PER_LOT",   "800"))   # ₹800 per lot default
 
+# ── Spike reversal exit settings ──────────────────────────────────────────────
+_SPIKE_MIN_PROFIT  = int(os.environ.get("SPIKE_MIN_PROFIT",  "400"))    # activate at ₹400 profit
+_SPIKE_DROP_PCT    = float(os.environ.get("SPIKE_DROP_PCT",  "0.40"))   # exit if drops 40% from peak
+_SPIKE_WINDOW_SECS = int(os.environ.get("SPIKE_WINDOW_SECS", "120"))    # within 2 min
+
 # Daily max loss — stop ALL trading if combined loss exceeds this
 # Prevents catastrophic days. Set 0 to disable.
 DAILY_MAX_LOSS     = int(os.environ.get("DAILY_MAX_LOSS",     "1500"))  # ₹1,500 default
@@ -4617,9 +4622,9 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
     # Spike reversal detection
     _spike_peak_profit   = 0.0    # highest profit seen in a short window
     _spike_peak_time     = 0.0    # when peak was seen
-    SPIKE_MIN_PROFIT     = 400    # minimum profit to activate spike detection (₹400)
-    SPIKE_DROP_PCT       = 0.35   # exit if profit drops 35% from spike peak
-    SPIKE_WINDOW_SECS    = 120    # spike must happen within 2 min
+    SPIKE_MIN_PROFIT     = _SPIKE_MIN_PROFIT
+    SPIKE_DROP_PCT       = _SPIKE_DROP_PCT
+    SPIKE_WINDOW_SECS    = _SPIKE_WINDOW_SECS
 
     # 🔥 CORE RISK MODEL — Two-tier SL
     # Single 45% SL — exit immediately when option drops 45% from entry
@@ -5860,7 +5865,11 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
             # Only clear state when this trade's symbol is still the active one.
             if pos_dict.get("symbol") == symbol:
                 # ── Record exited symbol for same-strike guard ────────────────
-                _last_exited_symbol[instrument] = symbol
+                # Only block same strike after LOSS exits (HT flip, SL, max-loss)
+                # NOT after profit exits (spike reversal, profit lock) — allow re-entry
+                if pnl < 0:
+                    _last_exited_symbol[instrument] = symbol
+                    print(f"🚫 {instrument} {symbol} blocked (loss exit) — same strike won't re-enter today", flush=True)
 
                 pos_dict.update({"symbol": None, "qty": 0, "exchange": None,
                                  "signal": None, "active": False})

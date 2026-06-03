@@ -1874,89 +1874,59 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     # ── 7. Hull Suite — colour must match HalfTrend AND band must be wide enough
     # EXCEPTIONS:
     # 1. Volume spike — bypass colour check, HalfTrend alone decides
-    # 2. Flip re-entry — HalfTrend just flipped, Hull still catching up → bypass colour
-    # 3. Hull transitioning — returned None from consistency check → bypass colour
-    # Band width check still applies except during morning bypass.
+    # Hull colour must ALWAYS match HalfTrend — no bypasses allowed
+    # Bypasses were causing CALL entries during falling markets
     _hull_str = "Hull=off"
     if USE_HULL_FILTER and df_15m is not None:
         try:
             hull_sig, hval, h2val, bw_pct = get_hull_signal(
                 df_15m, mode=HULL_MODE, length=HULL_LENGTH)
 
-            # ── Flip re-entry: still require Hull colour match ────────────────
-            # Even on a flip, Hull colour must agree before entering.
-            # Hull lags by 2-5 candles — wait for it to confirm the new direction.
-            # Only bypass: band width check (Hull always thin right after flip)
             _is_flip = kwargs.get("is_flip_reentry", False)
+
             if hull_sig is None or hval is None:
-                _hull_str = "Hull=N/A(transitioning)"
-            else:
-                # ── Band width check — always applies, even on volume spikes ─
-                # EXCEPTION: morning warm-up bypass — Hull band is always narrow
-                # at open regardless of actual trend strength. Skip width check
-                # for first HULL_MORNING_BYPASS_MINS minutes after 9:15 AM.
-                _now_ist = datetime.now(IST)
-                _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
-                _morning_bypass = (0 <= _mins_since_open <= HULL_MORNING_BYPASS_MINS)
+                # Hull transitioning — BLOCK entry, don't bypass
+                # Entering during transition = entering during flip chaos
+                reason = "🌊 Hull transitioning — waiting for colour confirmation"
+                print(f"🚫 HULL BLOCK: {reason}", flush=True)
+                return False, reason
 
-                if USE_HULL_BAND_FILTER and HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
-                    pts = abs(hval - h2val)
-                    reason = (
-                        f"🌊 Hull filter: band too thin — "
-                        f"width={bw_pct*100:.3f}% ({pts:.1f} pts) "
-                        f"min {HULL_MIN_BAND_WIDTH_PCT*100:.3f}% — "
-                        f"trend transitioning, skipping signal"
-                    )
-                    print(f"🚫 HULL BLOCK: {reason}", flush=True)
-                    return False, reason
-                elif USE_HULL_BAND_FILTER and _morning_bypass and bw_pct < HULL_MIN_BAND_WIDTH_PCT:
-                    print(f"🌅 Hull morning bypass active ({_mins_since_open} min since open) — "
-                          f"band={bw_pct*100:.3f}% skipping width check", flush=True)
+            # ── Band width check ──────────────────────────────────────────────
+            _now_ist = datetime.now(IST)
+            _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
+            _morning_bypass  = (0 <= _mins_since_open <= HULL_MORNING_BYPASS_MINS)
 
-                # ── Volume spike check — bypasses Hull colour mismatch ────────
-                # If HalfTrend just flipped AND volume is unusually high,
-                # the move has strong conviction → skip Hull colour check.
-                _vol_override = False
-                if hull_sig != signal and VOLUME_SPIKE_MULTIPLIER > 0:
-                    _spike, _cvol, _avgvol, _ratio = is_volume_spike(df_15m)
-                    if _spike:
-                        _vol_override = True
-                        _hull_str = (
-                            f"Hull=⚡VOLUME OVERRIDE "
-                            f"(vol={_cvol:.0f} = {_ratio:.1f}× avg={_avgvol:.0f}) "
-                            f"— HalfTrend alone, Hull still "
-                            f"{'🟢' if hull_sig == 'CALL' else '🔴'}"
-                        )
-                        print(
-                            f"⚡ Volume spike detected — bypassing Hull colour check\n"
-                            f"   Volume: {_cvol:.0f}  Avg: {_avgvol:.0f}  "
-                            f"Ratio: {_ratio:.1f}×  Signal: {signal}",
-                            flush=True
-                        )
+            if USE_HULL_BAND_FILTER and HULL_MIN_BAND_WIDTH_PCT > 0 and bw_pct < HULL_MIN_BAND_WIDTH_PCT and not _morning_bypass:
+                pts    = abs(hval - h2val)
+                reason = (
+                    f"🌊 Hull filter: band too thin — "
+                    f"width={bw_pct*100:.3f}% ({pts:.1f} pts) "
+                    f"min {HULL_MIN_BAND_WIDTH_PCT*100:.3f}% — "
+                    f"trend transitioning, skipping signal"
+                )
+                print(f"🚫 HULL BLOCK: {reason}", flush=True)
+                return False, reason
+            elif USE_HULL_BAND_FILTER and _morning_bypass and bw_pct < HULL_MIN_BAND_WIDTH_PCT:
+                print(f"🌅 Hull morning bypass active ({_mins_since_open} min) — "
+                      f"band={bw_pct*100:.3f}% skipping width check only", flush=True)
 
-                # ── Colour check — only when no volume spike ──────────────────
-                if not _vol_override and hull_sig is None:
-                    # Hull is transitioning (just flipped) — treat as bypass
-                    # Don't block based on a single-bar transition
-                    _hull_str = f"Hull=🔄TRANSITIONING — bypassing colour check"
-                    print(f"⚠️ Hull transitioning — bypassing colour check", flush=True)
-                elif not _vol_override and hull_sig != signal:
-                    hull_color = "🟢 GREEN" if hull_sig == "CALL" else "🔴 RED"
-                    ht_color   = "🟢 GREEN" if signal   == "CALL" else "🔴 RED"
-                    reason = (
-                        f"🌊 Hull filter: Hull={hull_color} vs HalfTrend={ht_color} — "
-                        f"colours must match (hull={hval:.1f}, hull2={h2val:.1f}, "
-                        f"band={bw_pct*100:.3f}%)"
-                    )
-                    print(f"🚫 HULL BLOCK: {reason}", flush=True)
-                    return False, reason
+            # ── Colour check — NO bypasses, always required ───────────────────
+            if hull_sig != signal:
+                hull_color = "🟢 GREEN" if hull_sig == "CALL" else "🔴 RED"
+                ht_color   = "🟢 GREEN" if signal   == "CALL" else "🔴 RED"
+                reason = (
+                    f"🌊 Hull filter: Hull={hull_color} vs HalfTrend={ht_color} — "
+                    f"colours must match (hull={hval:.1f}, hull2={h2val:.1f}, "
+                    f"band={bw_pct*100:.3f}%)"
+                )
+                print(f"🚫 HULL BLOCK: {reason}", flush=True)
+                return False, reason
 
-                if not _vol_override:
-                    band_color = "🟢" if signal == "CALL" else "🔴"
-                    _hull_str  = (
-                        f"Hull={band_color}({hval:.1f} vs {h2val:.1f}) "
-                        f"band={bw_pct*100:.3f}%"
-                    )
+            band_color = "🟢" if signal == "CALL" else "🔴"
+            _hull_str  = (
+                f"Hull={band_color}({hval:.1f} vs {h2val:.1f}) "
+                f"band={bw_pct*100:.3f}%"
+            )
 
         except Exception as _hull_e:
             _hull_str = f"Hull=err({_hull_e})"

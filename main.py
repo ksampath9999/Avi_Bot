@@ -1744,8 +1744,28 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
     """
     global _daily_target_exited, _daily_max_loss_hit   # must be global so reset propagates
 
-    # ── IP blocked — no new entries until whitelist fixed ────────────────────
+    # ── IP blocked — test recovery every 2 min ───────────────────────────────
     if _ip_blocked:
+        global _ip_blocked, _ip_alert_sent
+        # Try a harmless API call to check if IP unblocked
+        _ip_check_key = '_ip_last_check'
+        _last_check = getattr(apply_entry_filters, _ip_check_key, 0)
+        if time.time() - _last_check > 120:   # check every 2 min
+            setattr(apply_entry_filters, _ip_check_key, time.time())
+            try:
+                kite.profile()   # lightweight call to test IP
+                _ip_blocked    = False
+                _ip_alert_sent = False
+                print("✅ IP block cleared — trading resumed", flush=True)
+                send_message("✅ IP unblocked — trading resumed automatically")
+            except Exception as _ip_e:
+                if "not allowed" in str(_ip_e).lower():
+                    print(f"🔕 IP still blocked — next check in 2 min", flush=True)
+                else:
+                    # Different error — IP is fine, clear flag
+                    _ip_blocked    = False
+                    _ip_alert_sent = False
+                    print(f"✅ IP check passed ({_ip_e}) — resuming", flush=True)
         return False, "🚫 IP blocked — fix whitelist at developers.kite.trade before new entries"
     now_ist = datetime.now(IST)
 

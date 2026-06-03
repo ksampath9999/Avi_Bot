@@ -615,8 +615,21 @@ def daily_profit_target_monitor():
                 daily_profit_target_monitor._target_hit_time      = 0
                 daily_profit_target_monitor._floor_tick           = 0
                 _last_reset_date         = _today
-                print(f"🎯 Target monitor: new day reset at {now_ist.strftime('%H:%M')}", flush=True)
-                continue   # skip this tick — let daily P&L vars reset first
+                # Also directly reset all P&L vars to avoid stale yesterday data
+                with lock:
+                    global nifty_daily_pnl, banknifty_daily_pnl, finnifty_daily_pnl
+                    global sensex_daily_pnl, crude_daily_pnl
+                    nifty_daily_pnl     = 0.0
+                    banknifty_daily_pnl = 0.0
+                    finnifty_daily_pnl  = 0.0
+                    sensex_daily_pnl    = 0.0
+                    crude_daily_pnl     = 0.0
+                print(f"🎯 Target monitor: new day reset + P&L cleared at {now_ist.strftime('%H:%M')}", flush=True)
+                continue   # skip this tick
+
+            # Wait until 9:25 AM before checking P&L — loops need time to reset
+            if _hour == 9 and _min < 25:
+                continue   # too early — instrument loops haven't reset yet
 
             # ── Calculate combined P&L — closed trades + live unrealised ─────
             _closed_pnl = (nifty_daily_pnl + banknifty_daily_pnl +

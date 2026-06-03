@@ -923,11 +923,11 @@ ENABLE_CRUDE      = os.environ.get("ENABLE_CRUDE",      "false").lower() == "tru
 ENABLE_SWING      = os.environ.get("ENABLE_SWING",      "false").lower() == "true"
 
 # ── Daily Trade Limits ────────────────────────────────────────────────────────
-MAX_NIFTY_TRADES_PER_DAY      = 4   # NIFTY:     max 4 trades/day
-MAX_BANKNIFTY_TRADES_PER_DAY  = 4   # BANKNIFTY: max 4 trades/day
-MAX_FINNIFTY_TRADES_PER_DAY   = 4   # FINNIFTY:  max 4 trades/day
-MAX_SENSEX_TRADES_PER_DAY     = 4   # SENSEX:    max 4 trades/day
-MAX_CRUDE_TRADES_PER_DAY      = 3   # CRUDE:     max 3 trades/day
+MAX_NIFTY_TRADES_PER_DAY      = int(os.environ.get("MAX_NIFTY_TRADES",     "4"))
+MAX_BANKNIFTY_TRADES_PER_DAY  = int(os.environ.get("MAX_BANKNIFTY_TRADES", "4"))
+MAX_FINNIFTY_TRADES_PER_DAY   = int(os.environ.get("MAX_FINNIFTY_TRADES",  "4"))
+MAX_SENSEX_TRADES_PER_DAY     = int(os.environ.get("MAX_SENSEX_TRADES",    "4"))
+MAX_CRUDE_TRADES_PER_DAY      = int(os.environ.get("MAX_CRUDE_TRADES",     "3"))
 
 # ── Swing Trade Settings ──────────────────────────────────────────────────────
 SWING_STOCKS_FILE        = "stocks.txt"  # one NSE symbol per line (e.g. RELIANCE)
@@ -6129,7 +6129,11 @@ def nifty_loop():
             try:
                 _eq_bal = float(kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0) or 0)
                 if _eq_bal > 0 and _eq_bal < LOW_BALANCE_THRESHOLD:
-                    print(f"💸 Balance ₹{_eq_bal:.0f} < ₹{LOW_BALANCE_THRESHOLD} — NIFTY skipped (low balance, SENSEX only)", flush=True)
+                    _lb_key = f"_lb_logged_NIFTY"
+                    if not getattr(nifty_loop, _lb_key, False) or time.time() - getattr(nifty_loop, _lb_key+"_t", 0) > 300:
+                        setattr(nifty_loop, _lb_key, True)
+                        setattr(nifty_loop, _lb_key+"_t", time.time())
+                        print(f"💸 Balance ₹{_eq_bal:.0f} < ₹{LOW_BALANCE_THRESHOLD} — NIFTY skipped (SENSEX only)", flush=True)
                     time.sleep(60)
                     continue
             except Exception:
@@ -6397,22 +6401,14 @@ def nifty_loop():
 
             # ── Same-strike guard: block immediate re-entry of just-exited symbol ──
             # Only blocks carry-over (is_fresh=False). Fresh arrows always override.
-            # After 5 minutes (profit lock cooldown), allow re-entry on same strike.
-            _sx_exit_ts = _profit_lock_exit_time.get("NIFTY", 0)
-            _sx_exited_sym = _last_exited_symbol.get("NIFTY")
-            _sx_same_strike = (symbol == _sx_exited_sym and not is_fresh)
-            _sx_cooldown_done = (time.time() - _sx_exit_ts) >= 300  # 5 min
-            if _sx_same_strike and not _sx_cooldown_done:
-                print(f"🚫 NIFTY same-strike block: {symbol} — waiting 5 min before re-entry", flush=True)
+            # Same-strike block — never re-enter same strike that was exited today
+            if symbol == _last_exited_symbol.get("NIFTY") and not is_fresh:
+                print(f"🚫 NIFTY same-strike blocked for today: {symbol} — find_option will pick different strike", flush=True)
                 with lock:
                     nifty_trade_active = False
                     global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
-                time.sleep(30)
+                time.sleep(10)
                 continue
-            elif _sx_same_strike and _sx_cooldown_done:
-                # 5 min passed — allow re-entry and clear the guard
-                print(f"✅ NIFTY same-strike cooldown done — allowing re-entry on {symbol}", flush=True)
-                _last_exited_symbol.pop("NIFTY", None)
 
             filled_price = place_order(symbol, lot, exchange, "NIFTY")
 
@@ -8023,20 +8019,14 @@ def sensex_loop():
                 continue
 
             # ── Same-strike guard ─────────────────────────────────────────────
-            _sx_exited_sym = _last_exited_symbol.get("SENSEX")
-            _sx_same_strike = (symbol == _sx_exited_sym and not is_fresh)
-            _sx_exit_ts     = _profit_lock_exit_time.get("SENSEX", 0)
-            _sx_cooldown_done = (time.time() - _sx_exit_ts) >= 300
-            if _sx_same_strike and not _sx_cooldown_done:
-                print(f"🚫 SENSEX same-strike block: {symbol} — waiting 5 min", flush=True)
+            # Same-strike block — never re-enter same strike that was exited today
+            if symbol == _last_exited_symbol.get("SENSEX") and not is_fresh:
+                print(f"🚫 SENSEX same-strike blocked for today: {symbol}", flush=True)
                 with lock:
                     sensex_trade_active = False
                     global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
                 time.sleep(30)
                 continue
-            elif _sx_same_strike and _sx_cooldown_done:
-                print(f"✅ SENSEX same-strike cooldown done — allowing re-entry on {symbol}", flush=True)
-                _last_exited_symbol.pop("SENSEX", None)
 
             filled_price = place_order(symbol, lot, exchange, "SENSEX")
 

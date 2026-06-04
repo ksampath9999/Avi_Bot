@@ -6300,14 +6300,6 @@ def nifty_loop():
 
             _just_flipped_nifty = False   # reset each iteration; set True right after flip exit
 
-            # ── Carry-over stability check ────────────────────────────────────
-            # Don't enter carry-over if signal just appeared (< 2 bars = 30 min)
-            # This prevents entering right as HT is flipping
-            _MIN_CARRYOVER_BARS = int(os.environ.get("MIN_CARRYOVER_BARS", "2"))
-            if not is_fresh and bars_ago < _MIN_CARRYOVER_BARS:
-                print(f"⏳ NIFTY carry-over too new: {bars_ago} bars ({bars_ago*15} min) — waiting for stability ({_MIN_CARRYOVER_BARS} bars min)", flush=True)
-                time.sleep(10)
-                continue
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str     = datetime.now(IST).strftime("%Y-%m-%d")
@@ -7164,13 +7156,6 @@ def banknifty_loop():
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
-            # ── Carry-over stability check ────────────────────────────────────
-            _MIN_CARRYOVER_BARS = int(os.environ.get("MIN_CARRYOVER_BARS", "2"))
-            _co_bars = bars_ago if 'bars_ago' in dir() else _bars_ago if '_bars_ago' in dir() else 0
-            if not is_fresh and _co_bars < _MIN_CARRYOVER_BARS:
-                print(f"⏳ BANKNIFTY carry-over too new: {_co_bars} bars ({_co_bars*15} min) — waiting", flush=True)
-                time.sleep(10)
-                continue
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -7635,13 +7620,6 @@ def finnifty_loop():
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
-            # ── Carry-over stability check ────────────────────────────────────
-            _MIN_CARRYOVER_BARS = int(os.environ.get("MIN_CARRYOVER_BARS", "2"))
-            _co_bars = bars_ago if 'bars_ago' in dir() else _bars_ago if '_bars_ago' in dir() else 0
-            if not is_fresh and _co_bars < _MIN_CARRYOVER_BARS:
-                print(f"⏳ FINNIFTY carry-over too new: {_co_bars} bars ({_co_bars*15} min) — waiting", flush=True)
-                time.sleep(10)
-                continue
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -8100,13 +8078,6 @@ def sensex_loop():
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 SENSEX {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
-            # ── Carry-over stability check ────────────────────────────────────
-            _MIN_CARRYOVER_BARS = int(os.environ.get("MIN_CARRYOVER_BARS", "2"))
-            _co_bars = bars_ago if 'bars_ago' in dir() else _bars_ago if '_bars_ago' in dir() else 0
-            if not is_fresh and _co_bars < _MIN_CARRYOVER_BARS:
-                print(f"⏳ SENSEX carry-over too new: {_co_bars} bars ({_co_bars*15} min) — waiting", flush=True)
-                time.sleep(10)
-                continue
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")

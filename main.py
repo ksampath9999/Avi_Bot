@@ -546,8 +546,13 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # Toggle each filter on/off with True/False.
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
-USE_ADX_FILTER     = False   # OFF — using first-candle range filter instead
-ADX_MIN_VALUE      = 20
+USE_ADX_FILTER     = os.environ.get("USE_ADX_FILTER", "true").lower() == "true"
+ADX_MIN_VALUE      = int(os.environ.get("ADX_MIN_VALUE", "20"))   # below 20 = sideways = skip
+
+# ATR filter — minimum candle size to ensure enough movement for profit
+# ATR as % of price: 0.3% on SENSEX 75000 = ₹225 range per candle
+USE_ATR_FILTER     = os.environ.get("USE_ATR_FILTER", "true").lower() == "true"
+ATR_MIN_PCT        = float(os.environ.get("ATR_MIN_PCT", "0.003"))  # 0.3% minimum
 
 # ── Daily profit target ───────────────────────────────────────────────────────
 # Read from Railway env var DAILY_PROFIT_TARGET so each bot can have its own.
@@ -1853,7 +1858,32 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _e:
             _adx_str = f"ADX=err"
 
-    # ── 3. MTF 1-hour confirmation ────────────────────────────────────────────
+    # ── 3. ATR candle size filter — skip if candles too small ────────────────
+    _atr_str = "ATR=off"
+    if USE_ATR_FILTER and df_15m is not None and len(df_15m) >= 15:
+        try:
+            _high  = df_15m["high"].astype(float)
+            _low   = df_15m["low"].astype(float)
+            _close = df_15m["close"].astype(float)
+            _tr    = pd.concat([
+                _high - _low,
+                (_high - _close.shift(1)).abs(),
+                (_low  - _close.shift(1)).abs()
+            ], axis=1).max(axis=1)
+            _atr14     = _tr.ewm(span=14, adjust=False).mean().iloc[-2]
+            _cur_price = float(_close.iloc[-2])
+            _atr_pct   = _atr14 / _cur_price if _cur_price > 0 else 0
+            if _atr_pct < ATR_MIN_PCT:
+                reason = (f"📏 ATR filter: candles too small — "
+                          f"ATR={_atr14:.1f} ({_atr_pct*100:.2f}% of price) "
+                          f"min {ATR_MIN_PCT*100:.2f}% — low volatility day, skip")
+                print(f"🚫 ATR BLOCK: {reason}", flush=True)
+                return False, reason
+            _atr_str = f"ATR={_atr14:.1f}({_atr_pct*100:.2f}%)"
+        except Exception as _ae:
+            _atr_str = "ATR=err"
+
+    # ── 4. MTF 1-hour confirmation ────────────────────────────────────────────
     _mtf_str = "MTF=off"
     if USE_MTF_FILTER:
         trend_1h = get_mtf_trend(token, instrument)
@@ -2262,7 +2292,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         except Exception as _ce:
             _claude_str = f"Claude=err({_ce})"
 
-    return True, f"✅ Filters passed — {_adx_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_st_str} | {_sr_str} | {_candle_str} | {_claude_str}"
+    return True, f"✅ Filters passed — {_adx_str} | {_atr_str} | {_ema_str} | {_mtf_str} | {_vix_str} | {_ml_str} | {_hull_str} | {_st_str} | {_sr_str} | {_candle_str} | {_claude_str}"
 
 
 
@@ -4997,7 +5027,11 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 if df_ht_exit is None or len(df_ht_exit) < 10:
                     raise ValueError("Insufficient data for HT exit check")
 
-                ht_df_exit = halftrend_tv(df_ht_exit, amplitude=HT_AMPLITUDE, channel_deviation=2)
+                # Use lower amplitude for EXIT detection than entry
+                # amplitude=2 catches reversals faster than entry amplitude=4
+                # This prevents holding a losing trade waiting for HT to flip
+                _exit_amplitude = max(1, HT_AMPLITUDE - 2)   # e.g. 4→2, 3→1
+                ht_df_exit = halftrend_tv(df_ht_exit, amplitude=_exit_amplitude, channel_deviation=2)
                 last_exit  = ht_df_exit.iloc[-2]   # last CLOSED candle — anti-repaint
 
                 # Exit on TREND CHANGE — faster than waiting for arrow
@@ -5163,14 +5197,42 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # ⏱️ THETA DECAY EXIT — exit if trade held too long with no momentum
             # Options lose value rapidly after 90 min due to time decay.
             # Only exits if:
-            #   1. Trade held > 90 min
+            #   1. Trade held > 60 min (reduced from 90)
             #   2. Option moved < 10% (no momentum)
             #   3. Profit lock NOT already triggered
             # ================================================================
             _trade_age_mins = (time.time() - entry_time) / 60
             _USE_TIME_EXIT  = os.environ.get("USE_THETA_EXIT", "true").lower() == "true"
-            _TIME_EXIT_MINS = int(os.environ.get("THETA_EXIT_MINS", "90"))
+            _TIME_EXIT_MINS = int(os.environ.get("THETA_EXIT_MINS", "60"))   # reduced to 60 min
             _MOMENTUM_PCT   = 0.10    # option must have moved >10% to stay in trade
+
+            # ── Early exit: option stagnant/falling after 30 min ─────────────
+            # If option dropped > 15% from entry AND no recovery in 30 min → exit
+            # This catches slow decay before it becomes a big loss
+            if (_USE_TIME_EXIT and not exit_done
+                    and _trade_age_mins >= 30
+                    and local_max_profit < 500
+                    and current_pnl < -(entry * 0.15 * remaining_qty)):
+                _decay_pct = abs(current_pnl) / (entry * remaining_qty) * 100
+                print(f"⏱️ EARLY DECAY EXIT: {_trade_age_mins:.0f} min, "
+                      f"option lost {_decay_pct:.1f}% with no momentum", flush=True)
+                send_message(
+                    f"⏱️ EARLY DECAY EXIT\n"
+                    f"📌 {instrument} {signal} → {symbol}\n"
+                    f"🕐 Held: {_trade_age_mins:.0f} min — no momentum\n"
+                    f"📉 Option lost {_decay_pct:.1f}% from entry\n"
+                    f"💰 P&L: ₹{current_pnl:.0f}\n"
+                    f"💡 Exiting before theta erodes further"
+                )
+                _ed_fill = exit_position(symbol, remaining_qty, exchange)
+                if not _ed_fill:
+                    send_message(f"🚨 EARLY DECAY EXIT FAILED — EXIT {symbol} MANUALLY")
+                else:
+                    exit_fill_price = _ed_fill if isinstance(_ed_fill, float) else None
+                    ltp = exit_fill_price or ltp
+                exit_done = True
+                pnl = current_pnl
+                break
 
             if (_USE_TIME_EXIT
                     and not exit_done

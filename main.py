@@ -909,6 +909,9 @@ MAX_LOSS_PER_TRADE = int(os.environ.get("MAX_LOSS_PER_TRADE", "800"))   # ₹800
 MAX_LOSS_PER_LOT   = int(os.environ.get("MAX_LOSS_PER_LOT",   "800"))   # ₹800 per lot default
 
 # ── HalfTrend settings ───────────────────────────────────────────────────────
+# Max carry-over age in trading days — block signals older than this
+# 0 = today only, 1 = allow yesterday, 2 = allow up to 2 days old (default)
+HT_MAX_CARRYOVER_DAYS = int(os.environ.get("HT_MAX_CARRYOVER_DAYS", "1"))
 HT_AMPLITUDE       = int(os.environ.get("HT_AMPLITUDE",      "4"))    # amplitude (1=sensitive, 4=smooth)
 HT_LOOKBACK_CANDLES = int(os.environ.get("HT_LOOKBACK_CANDLES", "400")) # candles (200=~2.5 days on 15min)
 
@@ -6245,6 +6248,28 @@ def nifty_loop():
                 arrow_level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 bars_ago   = len(ht_df) - arrow_idx - 2
 
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 NIFTY carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
+
                 if is_fresh:
                     tag = "🟢 FRESH" if signal == "CALL" else "🔴 FRESH"
                     print(f"{tag} NIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}", flush=True)
@@ -6274,6 +6299,15 @@ def nifty_loop():
                 continue
 
             _just_flipped_nifty = False   # reset each iteration; set True right after flip exit
+
+            # ── Carry-over stability check ────────────────────────────────────
+            # Don't enter carry-over if signal just appeared (< 2 bars = 30 min)
+            # This prevents entering right as HT is flipping
+            _MIN_CARRYOVER_BARS = int(os.environ.get("MIN_CARRYOVER_BARS", "2"))
+            if not is_fresh and bars_ago < _MIN_CARRYOVER_BARS:
+                print(f"⏳ NIFTY carry-over too new: {bars_ago} bars ({bars_ago*15} min) — waiting for stability ({_MIN_CARRYOVER_BARS} bars min)", flush=True)
+                time.sleep(10)
+                continue
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str     = datetime.now(IST).strftime("%Y-%m-%d")
@@ -6595,6 +6629,28 @@ def crude_loop():
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
 
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 CRUDE carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
+
                     print(f"{'🟢' if signal=='CALL' else '🔴'} CARRY-OVER CRUDE {signal} — {bars_ago} bars ago @ {arrow_level:.2f}")
 
             if signal is None:
@@ -6627,6 +6683,28 @@ def crude_loop():
                 _arrow_bar_c = ht_df.iloc[arrow_idx]
                 _level_c = _arrow_bar_c["atrLow"] if signal == "CALL" else _arrow_bar_c["atrHigh"]
                 _bars_ago_c = len(ht_df) - arrow_idx - 2
+
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 CRUDE carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
                 _freshness_c = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago_c * 15} min ago)"
                 print(f"🔔 CRUDE {signal} {_freshness_c} @ ₹{_level_c:.2f}", flush=True)
 
@@ -7011,6 +7089,28 @@ def banknifty_loop():
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
 
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 BANKNIFTY carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
+
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} BANKNIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
 
@@ -7039,8 +7139,38 @@ def banknifty_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
+
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 BANKNIFTY carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
+
+            # ── Carry-over stability check ────────────────────────────────────
+            _MIN_CARRYOVER_BARS = int(os.environ.get("MIN_CARRYOVER_BARS", "2"))
+            _co_bars = bars_ago if 'bars_ago' in dir() else _bars_ago if '_bars_ago' in dir() else 0
+            if not is_fresh and _co_bars < _MIN_CARRYOVER_BARS:
+                print(f"⏳ BANKNIFTY carry-over too new: {_co_bars} bars ({_co_bars*15} min) — waiting", flush=True)
+                time.sleep(10)
+                continue
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -7430,6 +7560,28 @@ def finnifty_loop():
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
 
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 FINNIFTY carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
+
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} BANKNIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
 
@@ -7458,8 +7610,38 @@ def finnifty_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
+
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 FINNIFTY carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
+
+            # ── Carry-over stability check ────────────────────────────────────
+            _MIN_CARRYOVER_BARS = int(os.environ.get("MIN_CARRYOVER_BARS", "2"))
+            _co_bars = bars_ago if 'bars_ago' in dir() else _bars_ago if '_bars_ago' in dir() else 0
+            if not is_fresh and _co_bars < _MIN_CARRYOVER_BARS:
+                print(f"⏳ FINNIFTY carry-over too new: {_co_bars} bars ({_co_bars*15} min) — waiting", flush=True)
+                time.sleep(10)
+                continue
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -7843,6 +8025,28 @@ def sensex_loop():
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
 
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 SENSEX carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
+
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} SENSEX {signal} — {bars_ago} bars ({bars_ago*5} min) ago @ {arrow_level:.2f}", flush=True)
 
@@ -7871,8 +8075,38 @@ def sensex_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
+
+                # Block carry-over signals older than HT_MAX_CARRYOVER_DAYS trading days
+                if not is_fresh:
+                    try:
+                        _arrow_ts = pd.to_datetime(arrow_bar["date"])
+                        _arrow_date = _arrow_ts.date() if hasattr(_arrow_ts, 'date') else _arrow_ts
+                        _today = datetime.now(IST).date()
+                        # Count trading days between arrow date and today
+                        from datetime import timedelta
+                        _td = 0
+                        _d = _arrow_date
+                        while _d < _today:
+                            _d += timedelta(days=1)
+                            if _d.weekday() < 5:   # Mon-Fri only
+                                _td += 1
+                        if _td > HT_MAX_CARRYOVER_DAYS:
+                            print(f"🚫 SENSEX carry-over too old: {_td} trading days (max {HT_MAX_CARRYOVER_DAYS}) — signal from {_arrow_date}", flush=True)
+                            time.sleep(10)
+                            continue
+                    except Exception as _ca_e:
+                        pass
+
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 SENSEX {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
+
+            # ── Carry-over stability check ────────────────────────────────────
+            _MIN_CARRYOVER_BARS = int(os.environ.get("MIN_CARRYOVER_BARS", "2"))
+            _co_bars = bars_ago if 'bars_ago' in dir() else _bars_ago if '_bars_ago' in dir() else 0
+            if not is_fresh and _co_bars < _MIN_CARRYOVER_BARS:
+                print(f"⏳ SENSEX carry-over too new: {_co_bars} bars ({_co_bars*15} min) — waiting", flush=True)
+                time.sleep(10)
+                continue
 
             # ── Carry-over: enter only once per day ───────────────────────────
             today_str = datetime.now(IST).strftime("%Y-%m-%d")

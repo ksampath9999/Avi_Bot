@@ -6244,22 +6244,6 @@ def nifty_loop():
                 arrow_bar  = ht_df.iloc[arrow_idx]
                 arrow_level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 bars_ago   = len(ht_df) - arrow_idx - 2
-                # Block carry-over signals from previous days
-                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                _today_date = datetime.now(IST).date()
-                if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                    print(f"🚫 NIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                    time.sleep(10)
-                    continue
-
-
-                # Block carry-over signals from previous days
-                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                _today_date = datetime.now(IST).date()
-                if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                    print(f"🚫 NIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                    time.sleep(10)
-                    continue
 
                 if is_fresh:
                     tag = "🟢 FRESH" if signal == "CALL" else "🔴 FRESH"
@@ -6610,13 +6594,6 @@ def crude_loop():
                     print(f"{'🟢' if signal=='CALL' else '🔴'} FRESH CRUDE {signal} @ {arrow_level:.2f}")
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
-                    # Block carry-over signals from previous days
-                    _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                    _today_date = datetime.now(IST).date()
-                    if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                        print(f"🚫 CRUDE carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                        time.sleep(10)
-                        continue
 
                     print(f"{'🟢' if signal=='CALL' else '🔴'} CARRY-OVER CRUDE {signal} — {bars_ago} bars ago @ {arrow_level:.2f}")
 
@@ -7033,13 +7010,6 @@ def banknifty_loop():
                     print(f"{tag} BANKNIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
-                    # Block carry-over signals from previous days
-                    _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                    _today_date = datetime.now(IST).date()
-                    if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                        print(f"🚫 BANKNIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                        time.sleep(10)
-                        continue
 
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} BANKNIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
@@ -7069,14 +7039,6 @@ def banknifty_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
-                # Block carry-over signals from previous days
-                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                _today_date = datetime.now(IST).date()
-                if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                    print(f"🚫 BANKNIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                    time.sleep(10)
-                    continue
-
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
@@ -7467,13 +7429,6 @@ def finnifty_loop():
                     print(f"{tag} BANKNIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
-                    # Block carry-over signals from previous days
-                    _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                    _today_date = datetime.now(IST).date()
-                    if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                        print(f"🚫 FINNIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                        time.sleep(10)
-                        continue
 
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} BANKNIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
@@ -7503,14 +7458,6 @@ def finnifty_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
-                # Block carry-over signals from previous days
-                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                _today_date = datetime.now(IST).date()
-                if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                    print(f"🚫 FINNIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                    time.sleep(10)
-                    continue
-
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
@@ -7895,13 +7842,6 @@ def sensex_loop():
                     print(f"{tag} SENSEX {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
-                    # Block carry-over signals from previous days
-                    _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                    _today_date = datetime.now(IST).date()
-                    if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                        print(f"🚫 SENSEX carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                        time.sleep(10)
-                        continue
 
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} SENSEX {signal} — {bars_ago} bars ({bars_ago*5} min) ago @ {arrow_level:.2f}", flush=True)
@@ -7931,14 +7871,6 @@ def sensex_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
-                # Block carry-over signals from previous days
-                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
-                _today_date = datetime.now(IST).date()
-                if not is_fresh and _arrow_date and _arrow_date < _today_date:
-                    print(f"🚫 SENSEX carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
-                    time.sleep(10)
-                    continue
-
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 SENSEX {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 

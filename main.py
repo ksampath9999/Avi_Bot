@@ -908,6 +908,10 @@ CRUDE_NUM_LOTS     = int(os.environ.get("CRUDE_NUM_LOTS",     "0"))
 MAX_LOSS_PER_TRADE = int(os.environ.get("MAX_LOSS_PER_TRADE", "800"))   # ₹800 default
 MAX_LOSS_PER_LOT   = int(os.environ.get("MAX_LOSS_PER_LOT",   "800"))   # ₹800 per lot default
 
+# ── HalfTrend settings ───────────────────────────────────────────────────────
+HT_AMPLITUDE       = int(os.environ.get("HT_AMPLITUDE",      "4"))    # amplitude (1=sensitive, 4=smooth)
+HT_LOOKBACK_CANDLES = int(os.environ.get("HT_LOOKBACK_CANDLES", "400")) # candles (200=~2.5 days on 15min)
+
 # ── Spike reversal exit settings ──────────────────────────────────────────────
 _SPIKE_MIN_PROFIT  = int(os.environ.get("SPIKE_MIN_PROFIT",  "400"))    # activate at ₹400 profit
 _SPIKE_DROP_PCT    = float(os.environ.get("SPIKE_DROP_PCT",  "0.40"))   # exit if drops 40% from peak
@@ -4990,7 +4994,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 if df_ht_exit is None or len(df_ht_exit) < 10:
                     raise ValueError("Insufficient data for HT exit check")
 
-                ht_df_exit = halftrend_tv(df_ht_exit, amplitude=1, channel_deviation=2)
+                ht_df_exit = halftrend_tv(df_ht_exit, amplitude=HT_AMPLITUDE, channel_deviation=2)
                 last_exit  = ht_df_exit.iloc[-2]   # last CLOSED candle — anti-repaint
 
                 # Exit on TREND CHANGE — faster than waiting for arrow
@@ -6218,9 +6222,9 @@ def nifty_loop():
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_nifty > 30 or cached_nifty_df is None:
-                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", 200)
+                cached_nifty_df = get_cached_data(config.NIFTY_TOKEN, "15minute", HT_LOOKBACK_CANDLES)
                 if cached_nifty_df is not None and len(cached_nifty_df) >= 120:
-                    cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=1, channel_deviation=2)
+                    cached_nifty_ht = halftrend_tv(cached_nifty_df, amplitude=HT_AMPLITUDE, channel_deviation=2)
                 last_fetch_nifty = time.time()
 
             if cached_nifty_df is None or len(cached_nifty_df) < 120 or cached_nifty_ht is None:
@@ -6240,12 +6244,29 @@ def nifty_loop():
                 arrow_bar  = ht_df.iloc[arrow_idx]
                 arrow_level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 bars_ago   = len(ht_df) - arrow_idx - 2
+                # Block carry-over signals from previous days
+                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                _today_date = datetime.now(IST).date()
+                if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                    print(f"🚫 NIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                    time.sleep(10)
+                    continue
+
+
+                # Block carry-over signals from previous days
+                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                _today_date = datetime.now(IST).date()
+                if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                    print(f"🚫 NIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                    time.sleep(10)
+                    continue
+
                 if is_fresh:
                     tag = "🟢 FRESH" if signal == "CALL" else "🔴 FRESH"
                     print(f"{tag} NIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}", flush=True)
                 else:
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
-                    print(f"{tag} NIFTY {signal} — {bars_ago} bars ({bars_ago*5} min ago) @ {arrow_level:.2f}", flush=True)
+                    print(f"{tag} NIFTY {signal} — {bars_ago} bars ({bars_ago*15} min ago) @ {arrow_level:.2f}", flush=True)
 
             if signal is None:
                 status = "NO_ARROW_NIFTY"
@@ -6569,7 +6590,7 @@ def crude_loop():
                 cached_crude_15m = get_cached_data(CRUDE_TOKEN, "15minute", 600)
                 # Recompute HalfTrend only when data refreshes
                 if cached_crude_15m is not None and len(cached_crude_15m) >= 50:
-                    cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=1, channel_deviation=2)
+                    cached_crude_ht = halftrend_tv(cached_crude_15m, amplitude=HT_AMPLITUDE, channel_deviation=2)
                 last_fetch_crude = time.time()
 
             if cached_crude_15m is None or len(cached_crude_15m) < 50 or cached_crude_ht is None:
@@ -6589,6 +6610,14 @@ def crude_loop():
                     print(f"{'🟢' if signal=='CALL' else '🔴'} FRESH CRUDE {signal} @ {arrow_level:.2f}")
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
+                    # Block carry-over signals from previous days
+                    _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                    _today_date = datetime.now(IST).date()
+                    if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                        print(f"🚫 CRUDE carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                        time.sleep(10)
+                        continue
+
                     print(f"{'🟢' if signal=='CALL' else '🔴'} CARRY-OVER CRUDE {signal} — {bars_ago} bars ago @ {arrow_level:.2f}")
 
             if signal is None:
@@ -6979,9 +7008,9 @@ def banknifty_loop():
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_banknifty > 30 or cached_banknifty_df is None:
-                cached_banknifty_df = get_cached_data(BANKNIFTY_TOKEN, "15minute", 200)
+                cached_banknifty_df = get_cached_data(BANKNIFTY_TOKEN, "15minute", HT_LOOKBACK_CANDLES)
                 if cached_banknifty_df is not None and len(cached_banknifty_df) >= 120:
-                    cached_banknifty_ht = halftrend_tv(cached_banknifty_df, amplitude=1, channel_deviation=2)
+                    cached_banknifty_ht = halftrend_tv(cached_banknifty_df, amplitude=HT_AMPLITUDE, channel_deviation=2)
                 last_fetch_banknifty = time.time()
 
             if cached_banknifty_df is None or len(cached_banknifty_df) < 120 or cached_banknifty_ht is None:
@@ -7004,6 +7033,14 @@ def banknifty_loop():
                     print(f"{tag} BANKNIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
+                    # Block carry-over signals from previous days
+                    _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                    _today_date = datetime.now(IST).date()
+                    if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                        print(f"🚫 BANKNIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                        time.sleep(10)
+                        continue
+
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} BANKNIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
 
@@ -7032,6 +7069,14 @@ def banknifty_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
+                # Block carry-over signals from previous days
+                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                _today_date = datetime.now(IST).date()
+                if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                    print(f"🚫 BANKNIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                    time.sleep(10)
+                    continue
+
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
@@ -7397,9 +7442,9 @@ def finnifty_loop():
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_finnifty > 30 or cached_finnifty_df is None:
-                cached_finnifty_df = get_cached_data(FINNIFTY_TOKEN, "15minute", 200)
+                cached_finnifty_df = get_cached_data(FINNIFTY_TOKEN, "15minute", HT_LOOKBACK_CANDLES)
                 if cached_finnifty_df is not None and len(cached_finnifty_df) >= 120:
-                    cached_finnifty_ht = halftrend_tv(cached_finnifty_df, amplitude=1, channel_deviation=2)
+                    cached_finnifty_ht = halftrend_tv(cached_finnifty_df, amplitude=HT_AMPLITUDE, channel_deviation=2)
                 last_fetch_finnifty = time.time()
 
             if cached_finnifty_df is None or len(cached_finnifty_df) < 120 or cached_finnifty_ht is None:
@@ -7422,6 +7467,14 @@ def finnifty_loop():
                     print(f"{tag} BANKNIFTY {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
+                    # Block carry-over signals from previous days
+                    _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                    _today_date = datetime.now(IST).date()
+                    if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                        print(f"🚫 FINNIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                        time.sleep(10)
+                        continue
+
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} BANKNIFTY {signal} — {bars_ago} bars ({bars_ago*15} min) ago @ {arrow_level:.2f}")
 
@@ -7450,6 +7503,14 @@ def finnifty_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
+                # Block carry-over signals from previous days
+                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                _today_date = datetime.now(IST).date()
+                if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                    print(f"🚫 FINNIFTY carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                    time.sleep(10)
+                    continue
+
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 BANKNIFTY {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 
@@ -7809,9 +7870,9 @@ def sensex_loop():
 
             # Refresh data cache every 30 seconds — 5-minute bars for faster arrow detection
             if time.time() - last_fetch_sensex > 30 or cached_sensex_df is None:
-                cached_sensex_df = get_cached_data(SENSEX_TOKEN, "15minute", 200)
+                cached_sensex_df = get_cached_data(SENSEX_TOKEN, "15minute", HT_LOOKBACK_CANDLES)
                 if cached_sensex_df is not None and len(cached_sensex_df) >= 120:
-                    cached_sensex_ht = halftrend_tv(cached_sensex_df, amplitude=1, channel_deviation=2)
+                    cached_sensex_ht = halftrend_tv(cached_sensex_df, amplitude=HT_AMPLITUDE, channel_deviation=2)
                 last_fetch_sensex = time.time()
 
             if cached_sensex_df is None or len(cached_sensex_df) < 120 or cached_sensex_ht is None:
@@ -7834,6 +7895,14 @@ def sensex_loop():
                     print(f"{tag} SENSEX {signal} @ {arrow_level:.2f}  HT={arrow_bar['ht']:.2f}")
                 else:
                     bars_ago = len(ht_df) - arrow_idx - 2
+                    # Block carry-over signals from previous days
+                    _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                    _today_date = datetime.now(IST).date()
+                    if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                        print(f"🚫 SENSEX carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                        time.sleep(10)
+                        continue
+
                     tag = "🟢 CARRY-OVER" if signal == "CALL" else "🔴 CARRY-OVER"
                     print(f"{tag} SENSEX {signal} — {bars_ago} bars ({bars_ago*5} min) ago @ {arrow_level:.2f}", flush=True)
 
@@ -7862,6 +7931,14 @@ def sensex_loop():
                 arrow_bar = ht_df.iloc[arrow_idx]
                 _level = arrow_bar["atrLow"] if signal == "CALL" else arrow_bar["atrHigh"]
                 _bars_ago = len(ht_df) - arrow_idx - 2
+                # Block carry-over signals from previous days
+                _arrow_date = pd.to_datetime(arrow_bar["date"]).date() if "date" in arrow_bar else None
+                _today_date = datetime.now(IST).date()
+                if not is_fresh and _arrow_date and _arrow_date < _today_date:
+                    print(f"🚫 SENSEX carry-over blocked — signal from {_arrow_date} (previous day)", flush=True)
+                    time.sleep(10)
+                    continue
+
                 _freshness = "FRESH" if is_fresh else f"CARRY-OVER ({_bars_ago * 15} min ago)"
                 print(f"🔔 SENSEX {signal} {_freshness} @ ₹{_level:.2f}", flush=True)
 

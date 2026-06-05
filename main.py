@@ -547,7 +547,7 @@ FIXED_LOT_MODE = True   # ← change to False when ready for balance-based sizin
 # All filters must pass before an order is placed.
 # ─────────────────────────────────────────────────────────────────────────────
 USE_ADX_FILTER     = os.environ.get("USE_ADX_FILTER", "true").lower() == "true"
-ADX_MIN_VALUE      = int(os.environ.get("ADX_MIN_VALUE", "20"))   # below 20 = sideways = skip
+ADX_MIN_VALUE      = int(os.environ.get("ADX_MIN_VALUE", "15"))   # lowered to 15 — ADX lags, 20 was too strict
 
 # ATR filter — minimum candle size to ensure enough movement for profit
 # ATR as % of price: 0.3% on SENSEX 75000 = ₹225 range per candle
@@ -882,6 +882,31 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # ── Instrument Enable / Disable ───────────────────────────────────────────────
 # Control each instrument via Railway Variables — no code change needed.
 # Default: NIFTY and SENSEX on, rest off.
+
+# ═══════════════════════════════════════════════════════════════════
+# 🔥 DELTA EXCHANGE — CRYPTO TRADING MODULE
+# Trades BTC/ETH perpetuals using same HalfTrend + Hull strategy
+# Runs 24/7 as a separate thread alongside Kite F&O trading
+# ═══════════════════════════════════════════════════════════════════
+ENABLE_DELTA        = os.environ.get("ENABLE_DELTA",       "false").lower() == "true"
+DELTA_API_KEY       = os.environ.get("DELTA_API_KEY",       "")
+DELTA_API_SECRET    = os.environ.get("DELTA_API_SECRET",    "")
+DELTA_SYMBOL        = os.environ.get("DELTA_SYMBOL",        "BTCUSD")   # BTCUSD / ETHUSD
+DELTA_TRADE_SIZE    = float(os.environ.get("DELTA_TRADE_SIZE", "1"))     # contracts per trade
+DELTA_MAX_TRADES    = int(os.environ.get("DELTA_MAX_TRADES",   "2"))     # max trades/day
+DELTA_MAX_LOSS_USD  = float(os.environ.get("DELTA_MAX_LOSS_USD", "20"))  # $20 daily max loss
+DELTA_PROFIT_USD    = float(os.environ.get("DELTA_PROFIT_USD",  "30"))   # $30 daily target
+DELTA_CANDLE_TF     = os.environ.get("DELTA_CANDLE_TF",    "15m")       # 15m / 1h / 4h
+DELTA_TESTNET       = os.environ.get("DELTA_TESTNET",      "false").lower() == "true"
+DELTA_BASE_URL      = ("https://cdn-ind.testnet.deltaex.org" if DELTA_TESTNET
+                       else "https://api.india.delta.exchange")
+
+# Delta state
+_delta_daily_pnl    = 0.0
+_delta_trade_count  = 0
+_delta_position     = {"active": False, "symbol": None, "side": None,
+                        "entry": 0.0, "size": 0, "product_id": None}
+
 ENABLE_NIFTY      = os.environ.get("ENABLE_NIFTY",      "true").lower()  == "true"
 ENABLE_BANKNIFTY  = os.environ.get("ENABLE_BANKNIFTY",  "false").lower() == "true"
 ENABLE_FINNIFTY   = os.environ.get("ENABLE_FINNIFTY",   "false").lower() == "true"
@@ -1850,11 +1875,25 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
         try:
             adx_val = ADX(df_15m, period=14).iloc[-2]
             if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
-                reason = (f"📊 ADX={adx_val:.1f} below {ADX_MIN_VALUE} — "
-                          f"market is rangebound/choppy, skipping entry")
-                print(f"🚫 ADX BLOCK: {reason}", flush=True)
-                return False, reason
-            _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
+                # ADX below threshold — check if price is moving strongly
+                # ADX lags 14 bars — allow if last 3 candles show strong momentum
+                _c = df_15m["close"].astype(float)
+                _h = df_15m["high"].astype(float)
+                _l = df_15m["low"].astype(float)
+                _price_move_3 = abs(_c.iloc[-2] - _c.iloc[-5]) / _c.iloc[-5] if len(_c) >= 5 else 0
+                _candle_range = (_h.iloc[-2] - _l.iloc[-2]) / _c.iloc[-2]
+
+                # Allow if price moved > 0.3% in last 3 candles (momentum override)
+                if _price_move_3 > 0.003:
+                    print(f"⚡ ADX={adx_val:.1f} low but price moved {_price_move_3*100:.2f}% in 3 candles — momentum override", flush=True)
+                    _adx_str = f"ADX={adx_val:.1f}⚡(momentum override)"
+                else:
+                    reason = (f"📊 ADX={adx_val:.1f} below {ADX_MIN_VALUE} — "
+                              f"market is rangebound/choppy, skipping entry")
+                    print(f"🚫 ADX BLOCK: {reason}", flush=True)
+                    return False, reason
+            else:
+                _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
         except Exception as _e:
             _adx_str = f"ADX=err"
 
@@ -11240,6 +11279,320 @@ def backtest_df(df):
 # -----------------------------
 # MAIN
 # -----------------------------
+
+# ═══════════════════════════════════════════════════════════════════
+# 🔥 DELTA EXCHANGE CRYPTO LOOP
+# ═══════════════════════════════════════════════════════════════════
+
+def delta_get_candles(symbol, resolution="15m", count=250):
+    """Fetch OHLCV candles from Delta Exchange."""
+    try:
+        # Get product_id for symbol
+        r = requests.get(f"{DELTA_BASE_URL}/v2/products", timeout=10)
+        products = r.json().get("result", [])
+        product_id = None
+        for p in products:
+            if p.get("symbol") == symbol and p.get("contract_type") == "perpetual_futures":
+                product_id = p.get("id")
+                break
+        if not product_id:
+            print(f"⚠️ Delta: product not found for {symbol}", flush=True)
+            return None, None
+
+        # Fetch candles
+        r = requests.get(
+            f"{DELTA_BASE_URL}/v2/history/candles",
+            params={"resolution": resolution, "symbol": symbol, "count": count},
+            timeout=10
+        )
+        data = r.json().get("result", [])
+        if not data:
+            return None, None
+
+        df = pd.DataFrame(data)
+        df.columns = [c.lower() for c in df.columns]
+        df["date"]  = pd.to_datetime(df["time"], unit="s")
+        df["open"]  = df["open"].astype(float)
+        df["high"]  = df["high"].astype(float)
+        df["low"]   = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        df = df.sort_values("date").reset_index(drop=True)
+        return df, product_id
+
+    except Exception as e:
+        print(f"⚠️ Delta candle fetch error: {e}", flush=True)
+        return None, None
+
+
+def delta_get_ltp(symbol):
+    """Get last traded price for a Delta symbol."""
+    try:
+        r = requests.get(
+            f"{DELTA_BASE_URL}/v2/tickers",
+            params={"symbol": symbol},
+            timeout=5
+        )
+        data = r.json().get("result", [{}])
+        if data:
+            return float(data[0].get("close", 0) or 0)
+    except Exception as e:
+        print(f"⚠️ Delta LTP error: {e}", flush=True)
+    return 0.0
+
+
+def delta_place_order(product_id, side, size, symbol):
+    """Place a market order on Delta Exchange."""
+    try:
+        import hmac, hashlib, time as _time
+        method   = "POST"
+        path     = "/v2/orders"
+        ts       = str(int(_time.time()))
+        body     = {
+            "product_id":   product_id,
+            "size":         int(size),
+            "side":         side,       # "buy" or "sell"
+            "order_type":   "market_order",
+            "time_in_force": "ioc",
+        }
+        body_str = json.dumps(body, separators=(",", ":"))
+        sig_data = method + ts + path + body_str
+        sig = hmac.new(
+            DELTA_API_SECRET.encode(),
+            sig_data.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        headers = {
+            "api-key":    DELTA_API_KEY,
+            "timestamp":  ts,
+            "signature":  sig,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        r = requests.post(
+            f"{DELTA_BASE_URL}{path}",
+            headers=headers,
+            data=body_str,
+            timeout=10
+        )
+        result = r.json()
+        if result.get("success"):
+            avg_price = float(result["result"].get("average_fill_price", 0) or 0)
+            print(f"✅ Delta order filled: {side} {size} {symbol} @ ${avg_price:.1f}", flush=True)
+            return avg_price
+        else:
+            print(f"❌ Delta order failed: {result}", flush=True)
+            return None
+    except Exception as e:
+        print(f"❌ Delta place_order error: {e}", flush=True)
+        return None
+
+
+def delta_close_position(product_id, side, size, symbol):
+    """Close open position on Delta Exchange."""
+    close_side = "sell" if side == "buy" else "buy"
+    return delta_place_order(product_id, close_side, size, symbol)
+
+
+def delta_loop():
+    """
+    Delta Exchange crypto trading loop.
+    Runs 24/7 — same HalfTrend + Hull strategy as Kite F&O.
+    Trades BTC/ETH perpetual futures.
+    """
+    global _delta_daily_pnl, _delta_trade_count, _delta_position
+
+    if not DELTA_API_KEY or not DELTA_API_SECRET:
+        print("⚠️ Delta loop skipped — DELTA_API_KEY or DELTA_API_SECRET missing", flush=True)
+        return
+
+    print(f"🔥 Delta Exchange loop started — {DELTA_SYMBOL} {DELTA_CANDLE_TF}", flush=True)
+    send_message(
+        f"🔥 DELTA EXCHANGE LOOP STARTED\n"
+        f"📌 Symbol: {DELTA_SYMBOL}\n"
+        f"📊 Timeframe: {DELTA_CANDLE_TF}\n"
+        f"💰 Trade size: {DELTA_TRADE_SIZE} contracts\n"
+        f"🎯 Daily target: ${DELTA_PROFIT_USD}\n"
+        f"🛑 Daily max loss: ${DELTA_MAX_LOSS_USD}"
+    )
+
+    _last_reset_date = None
+    _last_signal     = None
+
+    while True:
+        try:
+            time.sleep(30)   # check every 30 seconds
+
+            now_ist = datetime.now(IST)
+
+            # Daily reset
+            _today = now_ist.date()
+            if _last_reset_date != _today:
+                _delta_daily_pnl    = 0.0
+                _delta_trade_count  = 0
+                _last_signal        = None
+                _last_reset_date    = _today
+                print(f"🔄 Delta daily reset — {_today}", flush=True)
+                continue
+
+            # Daily max loss check
+            if _delta_daily_pnl <= -DELTA_MAX_LOSS_USD:
+                print(f"🛑 Delta daily max loss ${DELTA_MAX_LOSS_USD} hit — pausing", flush=True)
+                time.sleep(300)
+                continue
+
+            # Daily profit target check
+            if _delta_daily_pnl >= DELTA_PROFIT_USD:
+                print(f"🎯 Delta daily target ${DELTA_PROFIT_USD} hit — no more trades", flush=True)
+                time.sleep(300)
+                continue
+
+            # Max trades check
+            if _delta_trade_count >= DELTA_MAX_TRADES:
+                print(f"📊 Delta max trades {DELTA_MAX_TRADES}/day reached", flush=True)
+                time.sleep(300)
+                continue
+
+            # Fetch candles
+            df, product_id = delta_get_candles(DELTA_SYMBOL, DELTA_CANDLE_TF, 250)
+            if df is None or len(df) < 55:
+                continue
+
+            # ── HalfTrend signal ──────────────────────────────────────────────
+            ht_df = halftrend_tv(df, amplitude=HT_AMPLITUDE, channel_deviation=2)
+            if ht_df is None:
+                continue
+
+            signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
+            if signal is None:
+                continue
+
+            bars_ago = len(ht_df) - arrow_idx - 2
+
+            # Block stale carry-over
+            if not is_fresh and bars_ago > (HT_MAX_CARRYOVER_DAYS * 26):  # ~26 bars/day on 15m
+                continue
+
+            # ── Hull filter ───────────────────────────────────────────────────
+            if USE_HULL_FILTER:
+                hull_sig, hval, h2val, bw_pct = get_hull_signal(df, mode=HULL_MODE, length=HULL_LENGTH)
+                if hull_sig is None or hull_sig != signal:
+                    continue
+
+            # ── ADX filter ────────────────────────────────────────────────────
+            if USE_ADX_FILTER:
+                try:
+                    adx_val = ADX(df, period=14).iloc[-2]
+                    if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
+                        # Momentum override
+                        _move3 = abs(df["close"].iloc[-2] - df["close"].iloc[-5]) / df["close"].iloc[-5]
+                        if _move3 < 0.003:
+                            continue
+                except Exception:
+                    pass
+
+            # ── Manage open position ──────────────────────────────────────────
+            if _delta_position["active"]:
+                ltp = delta_get_ltp(DELTA_SYMBOL)
+                if ltp <= 0:
+                    continue
+
+                pos_side = _delta_position["side"]
+                entry    = _delta_position["entry"]
+                size     = _delta_position["size"]
+                pid      = _delta_position["product_id"]
+
+                # P&L in USD
+                if pos_side == "buy":
+                    pnl_usd = (ltp - entry) * size / entry * 100  # approx for perp
+                else:
+                    pnl_usd = (entry - ltp) * size / entry * 100
+
+                # HT flip exit
+                pos_signal = "CALL" if pos_side == "buy" else "PUT"
+                if signal != pos_signal:
+                    fill = delta_close_position(pid, pos_side, size, DELTA_SYMBOL)
+                    if fill:
+                        _delta_daily_pnl   += pnl_usd
+                        _delta_position     = {"active": False, "symbol": None, "side": None,
+                                               "entry": 0.0, "size": 0, "product_id": None}
+                        _last_signal        = None
+                        send_message(
+                            f"🔄 DELTA HT FLIP EXIT\n"
+                            f"📌 {DELTA_SYMBOL} {pos_signal} → {signal}\n"
+                            f"💰 P&L: ${pnl_usd:.2f}\n"
+                            f"📊 Daily P&L: ${_delta_daily_pnl:.2f}"
+                        )
+                    continue
+
+                # Max loss exit
+                if pnl_usd <= -DELTA_MAX_LOSS_USD * 0.5:   # 50% of daily max = per trade limit
+                    fill = delta_close_position(pid, pos_side, size, DELTA_SYMBOL)
+                    if fill:
+                        _delta_daily_pnl += pnl_usd
+                        _delta_position   = {"active": False, "symbol": None, "side": None,
+                                             "entry": 0.0, "size": 0, "product_id": None}
+                        send_message(
+                            f"💔 DELTA MAX LOSS EXIT\n"
+                            f"📌 {DELTA_SYMBOL}\n"
+                            f"💸 P&L: ${pnl_usd:.2f}\n"
+                            f"📊 Daily P&L: ${_delta_daily_pnl:.2f}"
+                        )
+                    continue
+
+                # Profit target exit
+                if pnl_usd >= DELTA_PROFIT_USD * 0.6:   # 60% of daily target per trade
+                    fill = delta_close_position(pid, pos_side, size, DELTA_SYMBOL)
+                    if fill:
+                        _delta_daily_pnl += pnl_usd
+                        _delta_position   = {"active": False, "symbol": None, "side": None,
+                                             "entry": 0.0, "size": 0, "product_id": None}
+                        send_message(
+                            f"🎯 DELTA PROFIT TARGET\n"
+                            f"📌 {DELTA_SYMBOL}\n"
+                            f"💰 P&L: ${pnl_usd:.2f}\n"
+                            f"📊 Daily P&L: ${_delta_daily_pnl:.2f}"
+                        )
+                    continue
+
+                continue  # position active, no new entry
+
+            # ── New entry ─────────────────────────────────────────────────────
+            # Skip if same signal already executed
+            _signal_key = f"{DELTA_SYMBOL}_{signal}_{now_ist.strftime('%Y-%m-%d')}"
+            if _last_signal == _signal_key:
+                continue
+
+            side      = "buy" if signal == "CALL" else "sell"
+            ltp       = delta_get_ltp(DELTA_SYMBOL)
+            if ltp <= 0:
+                continue
+
+            fill_price = delta_place_order(product_id, side, DELTA_TRADE_SIZE, DELTA_SYMBOL)
+            if fill_price:
+                _delta_position = {
+                    "active":     True,
+                    "symbol":     DELTA_SYMBOL,
+                    "side":       side,
+                    "entry":      fill_price,
+                    "size":       DELTA_TRADE_SIZE,
+                    "product_id": product_id,
+                }
+                _delta_trade_count += 1
+                _last_signal        = _signal_key
+                send_message(
+                    f"🔥 DELTA NEW TRADE\n"
+                    f"📌 {DELTA_SYMBOL} {'LONG' if side=='buy' else 'SHORT'}\n"
+                    f"💰 Entry: ${fill_price:.1f}\n"
+                    f"📦 Size: {DELTA_TRADE_SIZE} contracts\n"
+                    f"📊 Trade {_delta_trade_count}/{DELTA_MAX_TRADES} today"
+                )
+
+        except Exception as e:
+            print(f"❌ Delta loop error: {e}", flush=True)
+            time.sleep(30)
+
+
 if __name__ == "__main__":
 
     import time
@@ -11483,6 +11836,15 @@ if __name__ == "__main__":
     else:
         print("❌ SENSEX LOOP SKIPPED — SENSEX_TOKEN missing from config.py", flush=True)
         send_message("⚠️ SENSEX loop NOT started — SENSEX_TOKEN missing from config.py")
+
+    if ENABLE_DELTA:
+        if DELTA_API_KEY and DELTA_API_SECRET:
+            threading.Thread(target=delta_loop, daemon=True, name="DeltaLoop").start()
+            print(f"✅ Delta Exchange loop started — {DELTA_SYMBOL}", flush=True)
+        else:
+            print("⚠️ Delta loop skipped — set DELTA_API_KEY and DELTA_API_SECRET in Railway", flush=True)
+    else:
+        print("⚠️ Delta loop disabled (ENABLE_DELTA=false)", flush=True)
 
     if ENABLE_SWING:
         threading.Thread(target=swing_loop, daemon=True, name="SwingLoop").start()

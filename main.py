@@ -11331,48 +11331,66 @@ def delta_get_ltp(symbol):
         r = requests.get(
             f"{DELTA_BASE_URL}/v2/tickers",
             params={"symbol": symbol},
+            headers={"Accept": "application/json", "User-Agent": "python-rest-client"},
             timeout=5
         )
-        data = r.json().get("result", [{}])
-        if data:
-            return float(data[0].get("close", 0) or 0)
+        result = r.json().get("result", [])
+        if isinstance(result, list) and result:
+            return float(result[0].get("close", 0) or 0)
+        elif isinstance(result, dict):
+            return float(result.get("close", 0) or 0)
     except Exception as e:
         print(f"⚠️ Delta LTP error: {e}", flush=True)
     return 0.0
 
 
+def _delta_generate_signature(secret, method, timestamp, path, query_string="", payload=""):
+    """Generate HMAC-SHA256 signature for Delta Exchange API.
+    Format: method + timestamp + path + query_string + payload
+    """
+    import hmac, hashlib
+    message      = method + timestamp + path + query_string + payload
+    secret_bytes = bytes(secret, 'utf-8')
+    msg_bytes    = bytes(message, 'utf-8')
+    return hmac.new(secret_bytes, msg_bytes, hashlib.sha256).hexdigest()
+
+
+def _delta_headers(method, path, query_string="", payload=""):
+    """Build authenticated headers for Delta Exchange API."""
+    import time as _time
+    timestamp = str(int(_time.time()))
+    signature = _delta_generate_signature(
+        DELTA_API_SECRET, method, timestamp, path, query_string, payload
+    )
+    return {
+        "api-key":      DELTA_API_KEY,
+        "timestamp":    timestamp,
+        "signature":    signature,
+        "User-Agent":   "python-rest-client",
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+    }
+
+
 def delta_place_order(product_id, side, size, symbol):
     """Place a market order on Delta Exchange."""
     try:
-        import hmac, hashlib, time as _time
         method   = "POST"
         path     = "/v2/orders"
-        ts       = str(int(_time.time()))
         body     = {
-            "product_id":   product_id,
-            "size":         int(size),
-            "side":         side,       # "buy" or "sell"
-            "order_type":   "market_order",
+            "product_id":    product_id,
+            "size":          int(size),
+            "side":          side,         # "buy" or "sell"
+            "order_type":    "market_order",
             "time_in_force": "ioc",
         }
-        body_str = json.dumps(body, separators=(",", ":"))
-        sig_data = method + ts + path + body_str
-        sig = hmac.new(
-            DELTA_API_SECRET.encode(),
-            sig_data.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        headers = {
-            "api-key":    DELTA_API_KEY,
-            "timestamp":  ts,
-            "signature":  sig,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        payload  = json.dumps(body, separators=(",", ":"))
+        headers  = _delta_headers(method, path, payload=payload)
+
         r = requests.post(
             f"{DELTA_BASE_URL}{path}",
             headers=headers,
-            data=body_str,
+            data=payload,
             timeout=10
         )
         result = r.json()
@@ -11382,6 +11400,11 @@ def delta_place_order(product_id, side, size, symbol):
             return avg_price
         else:
             print(f"❌ Delta order failed: {result}", flush=True)
+            send_message(
+                f"❌ DELTA ORDER FAILED\n"
+                f"📌 {symbol} {side} size={size}\n"
+                f"⚠️ Error: {result.get('error', {}).get('code', str(result))}"
+            )
             return None
     except Exception as e:
         print(f"❌ Delta place_order error: {e}", flush=True)

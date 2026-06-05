@@ -11309,8 +11309,12 @@ def delta_get_candles(symbol, resolution="15m", count=250):
         r = requests.get(
             f"{DELTA_BASE_URL}/v2/history/candles",
             params={"resolution": resolution, "symbol": symbol, "count": count},
+            headers={"Accept": "application/json", "User-Agent": "python-rest-client"},
             timeout=10
         )
+        if r.status_code != 200:
+            print(f"⚠️ Delta candles HTTP {r.status_code}: {r.text[:200]}", flush=True)
+            return None, None
         data = r.json().get("result", [])
         if not data:
             return None, None
@@ -11484,8 +11488,26 @@ def delta_loop():
 
             # Fetch candles
             df, product_id = delta_get_candles(DELTA_SYMBOL, DELTA_CANDLE_TF, 250)
+            _delta_candle_fail_key = '_candle_fail_logged'
             if df is None or len(df) < 55:
-                print(f"⚠️ Delta: insufficient candles for {DELTA_SYMBOL}", flush=True)
+                # Only print once per 10 min to avoid spam
+                _last_fail = getattr(delta_loop, _delta_candle_fail_key, 0)
+                if time.time() - _last_fail > 600:
+                    setattr(delta_loop, _delta_candle_fail_key, time.time())
+                    _candle_count = len(df) if df is not None else 0
+                    print(f"⚠️ Delta: candle fetch failed — got {_candle_count} candles "
+                          f"(need 55+). Likely Railway network restriction or wrong IP whitelist. "
+                          f"Whitelist {os.environ.get('RAILWAY_STATIC_IP','100.49.102.243')} "
+                          f"on Delta Exchange API key settings.", flush=True)
+                    send_message(
+                        f"⚠️ DELTA CANDLE FETCH FAILED\n"
+                        f"Got {_candle_count} candles (need 55+)\n"
+                        f"Fix: Whitelist IP on Delta Exchange:\n"
+                        f"india.delta.exchange → API Key → IP Whitelist\n"
+                        f"Add: 100.49.102.243 or set 0.0.0.0/0\n"
+                        f"Will retry every 10 min"
+                    )
+                time.sleep(600)   # wait 10 min before retry
                 continue
 
             print(f"🔥 Delta [{DELTA_SYMBOL}]: {len(df)} candles fetched, product_id={product_id}", flush=True)

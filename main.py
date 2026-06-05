@@ -984,7 +984,7 @@ USE_HTF_FILTER = False           # ✅ 30-min direction filter enabled
 # Set False to disable ALL SL logic (trailing + hard SL).
 # Profit-lock logic is NOT affected — it always stays active.
 # Re-enable by setting back to True.
-USE_STOP_LOSS = False           # ⛔ SL disabled — profit lock only
+USE_STOP_LOSS = os.environ.get("USE_STOP_LOSS", "false").lower() == "true"  # 45% SL
 
 # ── ML Signal Filter ──────────────────────────────────────────────────────────
 # ml_signal_server.py must be running (separate Railway/Render service).

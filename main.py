@@ -11485,18 +11485,24 @@ def delta_loop():
             # Fetch candles
             df, product_id = delta_get_candles(DELTA_SYMBOL, DELTA_CANDLE_TF, 250)
             if df is None or len(df) < 55:
+                print(f"⚠️ Delta: insufficient candles for {DELTA_SYMBOL}", flush=True)
                 continue
+
+            print(f"🔥 Delta [{DELTA_SYMBOL}]: {len(df)} candles fetched, product_id={product_id}", flush=True)
 
             # ── HalfTrend signal ──────────────────────────────────────────────
             ht_df = halftrend_tv(df, amplitude=HT_AMPLITUDE, channel_deviation=2)
             if ht_df is None:
+                print(f"⚠️ Delta: HalfTrend returned None", flush=True)
                 continue
 
             signal, arrow_idx, is_fresh = get_last_active_signal(ht_df)
             if signal is None:
+                print(f"⚠️ Delta: no HT signal detected", flush=True)
                 continue
 
             bars_ago = len(ht_df) - arrow_idx - 2
+            print(f"🧠 Delta [{DELTA_SYMBOL}]: signal={signal} bars_ago={bars_ago} is_fresh={is_fresh}", flush=True)
 
             # Block stale carry-over
             if not is_fresh and bars_ago > (HT_MAX_CARRYOVER_DAYS * 26):  # ~26 bars/day on 15m
@@ -11505,20 +11511,23 @@ def delta_loop():
             # ── Hull filter ───────────────────────────────────────────────────
             if USE_HULL_FILTER:
                 hull_sig, hval, h2val, bw_pct = get_hull_signal(df, mode=HULL_MODE, length=HULL_LENGTH)
+                print(f"🌊 Delta Hull: hull={hull_sig} signal={signal} band={bw_pct*100:.3f}%", flush=True)
                 if hull_sig is None or hull_sig != signal:
+                    print(f"🚫 Delta Hull blocked: hull={hull_sig} vs HT={signal}", flush=True)
                     continue
 
             # ── ADX filter ────────────────────────────────────────────────────
             if USE_ADX_FILTER:
                 try:
                     adx_val = ADX(df, period=14).iloc[-2]
+                    print(f"📊 Delta ADX: {adx_val:.1f} (min={ADX_MIN_VALUE})", flush=True)
                     if not np.isnan(adx_val) and adx_val < ADX_MIN_VALUE:
-                        # Momentum override
                         _move3 = abs(df["close"].iloc[-2] - df["close"].iloc[-5]) / df["close"].iloc[-5]
                         if _move3 < 0.003:
+                            print(f"🚫 Delta ADX blocked: {adx_val:.1f}", flush=True)
                             continue
-                except Exception:
-                    pass
+                except Exception as _ae:
+                    print(f"⚠️ Delta ADX error: {_ae}", flush=True)
 
             # ── Manage open position ──────────────────────────────────────────
             if _delta_position["active"]:

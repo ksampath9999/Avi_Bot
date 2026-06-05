@@ -7092,7 +7092,10 @@ def banknifty_loop():
             try:
                 _eq_bal = float(kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0) or 0)
                 if _eq_bal > 0 and _eq_bal < LOW_BALANCE_THRESHOLD:
-                    print(f"Low balance BANKNIFTY skipped", flush=True)
+                    _bn_lb_last = getattr(banknifty_loop, '_lb_logged_t', 0)
+                    if time.time() - _bn_lb_last > 300:   # print once per 5 min
+                        banknifty_loop._lb_logged_t = time.time()
+                        print(f"💸 BANKNIFTY skipped: balance ₹{_eq_bal:.0f} < ₹{LOW_BALANCE_THRESHOLD} (SENSEX only)", flush=True)
                     time.sleep(60)
                     continue
             except Exception:
@@ -7556,7 +7559,10 @@ def finnifty_loop():
             try:
                 _eq_bal = float(kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0) or 0)
                 if _eq_bal > 0 and _eq_bal < LOW_BALANCE_THRESHOLD:
-                    print(f"Low balance FINNIFTY skipped", flush=True)
+                    _fn_lb_last = getattr(finnifty_loop, '_lb_logged_t', 0)
+                    if time.time() - _fn_lb_last > 300:
+                        finnifty_loop._lb_logged_t = time.time()
+                        print(f"💸 FINNIFTY skipped: balance ₹{_eq_bal:.0f} < ₹{LOW_BALANCE_THRESHOLD} (SENSEX only)", flush=True)
                     time.sleep(60)
                     continue
             except Exception:
@@ -11847,9 +11853,11 @@ if __name__ == "__main__":
     else:
         print("❌ BANKNIFTY LOOP SKIPPED — BANKNIFTY_TOKEN missing from config.py", flush=True)
 
-    if FINNIFTY_TOKEN:
+    if FINNIFTY_TOKEN and ENABLE_FINNIFTY:
         threading.Thread(target=finnifty_loop, daemon=True).start()
         print(f"✅ FINNIFTY loop started (token={FINNIFTY_TOKEN})", flush=True)
+    elif not ENABLE_FINNIFTY:
+        print("⛔ FINNIFTY loop skipped (ENABLE_FINNIFTY=False)", flush=True)
     else:
         print("❌ FINNIFTY LOOP SKIPPED — FINNIFTY_TOKEN missing from config.py", flush=True)
 

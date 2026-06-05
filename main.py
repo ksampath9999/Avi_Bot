@@ -11291,43 +11291,56 @@ def backtest_df(df):
 # ═══════════════════════════════════════════════════════════════════
 
 def delta_get_candles(symbol, resolution="15m", count=250):
-    """Fetch OHLCV candles from Delta Exchange."""
+    """Fetch OHLCV candles from Delta Exchange India.
+    Correct format: start/end timestamps, explicit column names.
+    """
     try:
-        # Get product_id for symbol
-        r = requests.get(f"{DELTA_BASE_URL}/v2/products", timeout=10)
-        products = r.json().get("result", [])
-        product_id = None
-        for p in products:
-            if p.get("symbol") == symbol and p.get("contract_type") == "perpetual_futures":
-                product_id = p.get("id")
-                break
-        if not product_id:
-            print(f"⚠️ Delta: product not found for {symbol}", flush=True)
-            return None, None
+        import time as _time
+
+        # Resolution to seconds
+        res_secs = {"1m":60,"3m":180,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400,"1d":86400}
+        secs     = res_secs.get(resolution, 900)
+        end_ts   = int(_time.time())
+        start_ts = end_ts - (count * secs)
 
         # Fetch candles
         r = requests.get(
             f"{DELTA_BASE_URL}/v2/history/candles",
-            params={"resolution": resolution, "symbol": symbol, "count": count},
+            params={"symbol": symbol, "resolution": resolution,
+                    "start": start_ts, "end": end_ts},
             headers={"Accept": "application/json", "User-Agent": "python-rest-client"},
             timeout=10
         )
         if r.status_code != 200:
             print(f"⚠️ Delta candles HTTP {r.status_code}: {r.text[:200]}", flush=True)
             return None, None
+
         data = r.json().get("result", [])
         if not data:
+            print(f"⚠️ Delta: empty candle response for {symbol}", flush=True)
             return None, None
 
-        df = pd.DataFrame(data)
-        df.columns = [c.lower() for c in df.columns]
-        df["date"]  = pd.to_datetime(df["time"], unit="s")
-        df["open"]  = df["open"].astype(float)
-        df["high"]  = df["high"].astype(float)
-        df["low"]   = df["low"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["volume"] = df["volume"].astype(float)
+        # Explicit columns — Delta returns [time, open, high, low, close, volume]
+        df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
+        df["date"]   = pd.to_datetime(df["time"], unit="s", utc=True)
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
         df = df.sort_values("date").reset_index(drop=True)
+
+        # Get product_id
+        product_id = None
+        try:
+            rp = requests.get(
+                f"{DELTA_BASE_URL}/v2/products/{symbol}",
+                headers={"Accept": "application/json", "User-Agent": "python-rest-client"},
+                timeout=5
+            )
+            if rp.status_code == 200:
+                product_id = rp.json().get("result", {}).get("id")
+        except Exception:
+            pass
+
+        print(f"✅ Delta: {len(df)} candles for {symbol} product_id={product_id}", flush=True)
         return df, product_id
 
     except Exception as e:

@@ -11575,11 +11575,16 @@ def delta_loop():
                 size     = _delta_position["size"]
                 pid      = _delta_position["product_id"]
 
-                # P&L in USD
+                # P&L for BTCUSD inverse perpetual on Delta India
+                # 1 contract = $1 USD notional (inverse perp)
+                # P&L in USD = size × (1/entry - 1/ltp) × entry × ltp
+                # Simplified: P&L ≈ size × (price_diff / entry)
+                # For 1 contract at $60,000: $128 move = $128/60000 = $0.002 BTC ≈ $0.21 P&L
+                # Note: DELTA_TRADE_SIZE should be set to 100+ contracts for meaningful P&L
                 if pos_side == "buy":
-                    pnl_usd = (ltp - entry) * size / entry * 100  # approx for perp
+                    pnl_usd = size * (ltp - entry) / entry   # in USD (inverse perp approx)
                 else:
-                    pnl_usd = (entry - ltp) * size / entry * 100
+                    pnl_usd = size * (entry - ltp) / entry
 
                 # HT flip exit
                 pos_signal = "CALL" if pos_side == "buy" else "PUT"

@@ -2484,8 +2484,10 @@ def check_first_candle_range(signal, df, instrument):
     try:
         _now_ist = datetime.now(IST)
         _mins_since_open = (_now_ist.hour - 9) * 60 + _now_ist.minute - 15
-        if _mins_since_open > 120:
-            return True, f"FC=expired(market open {_mins_since_open} min ago)"
+
+        # FC expires after 60 min — after that both directions allowed
+        if _mins_since_open > 60:
+            return True, f"FC=expired({_mins_since_open} min since open)"
 
         today_str  = str(_now_ist.date())
         _break_key = f"{instrument}_{today_str}"
@@ -2526,6 +2528,26 @@ def check_first_candle_range(signal, df, instrument):
                (_broke == "DOWN" and signal == "PUT"):
                 return True, f"FC=unlocked(broke {_broke} earlier today)"
             else:
+                # FC direction conflicts with HT signal
+                # Override if both HT and Hull agree on opposite direction
+                # This handles false FC breakouts at open (quick spike then reversal)
+                try:
+                    _hull_sig, _, _, _ = get_hull_signal(df, mode=HULL_MODE, length=HULL_LENGTH)
+                    _ht_df = halftrend_tv(df, amplitude=HT_AMPLITUDE, channel_deviation=2)
+                    if _hull_sig == signal and _ht_df is not None:
+                        # Check if HT has been in this direction for 2+ bars
+                        _last = _ht_df.iloc[-2]
+                        _prev = _ht_df.iloc[-3]
+                        _ht_trend_now  = int(_last.get("trend", -1))
+                        _ht_trend_prev = int(_prev.get("trend", -1))
+                        _expected_trend = 0 if signal == "CALL" else 1
+                        if _ht_trend_now == _expected_trend and _ht_trend_prev == _expected_trend:
+                            # HT confirmed for 2 bars + Hull matches → override FC
+                            _fc_breakout_done.pop(_break_key, None)
+                            print(f"🔄 FC override: HT+Hull both confirm {signal} for 2+ bars — ignoring FC={_broke}", flush=True)
+                            return True, f"FC=overridden(HT+Hull both confirm {signal})"
+                except Exception:
+                    pass
                 return False, (f"FC=broke {_broke} but signal is {signal} — "
                                f"direction mismatch")
 

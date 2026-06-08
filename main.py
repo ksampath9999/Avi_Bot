@@ -552,7 +552,7 @@ ADX_MIN_VALUE      = int(os.environ.get("ADX_MIN_VALUE", "15"))   # lowered to 1
 # ATR filter — minimum candle size to ensure enough movement for profit
 # ATR as % of price: 0.3% on SENSEX 75000 = ₹225 range per candle
 USE_ATR_FILTER     = os.environ.get("USE_ATR_FILTER", "true").lower() == "true"
-ATR_MIN_PCT        = float(os.environ.get("ATR_MIN_PCT", "0.002"))  # 0.20% minimum (was 0.30%)
+ATR_MIN_PCT        = float(os.environ.get("ATR_MIN_PCT", "0.0015"))  # 0.15% minimum
 
 # ── Daily profit target ───────────────────────────────────────────────────────
 # Read from Railway env var DAILY_PROFIT_TARGET so each bot can have its own.
@@ -851,6 +851,7 @@ def daily_profit_target_monitor():
 
 # ── Support & Resistance Filter ───────────────────────────────────────────────
 USE_SR_FILTER      = os.environ.get("USE_SR_FILTER", "true").lower() == "true"
+USE_CPR_FILTER     = os.environ.get("USE_CPR_FILTER", "true").lower() == "true"  # Central Pivot Range
 SR_BLOCK_PCT       = 0.003   # 0.3% proximity for PDH/PDL/Pivot (when enabled)
 SR_ALGO_BLOCK_PCT  = 0.001   # 0.1% proximity for Algo SZ/RZ — tighter to avoid blocking valid trades
                                # 0.1% = ~24 pts on Nifty 24000, ~75 pts on SENSEX 75000
@@ -1890,7 +1891,12 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                 else:
                     reason = (f"📊 ADX={adx_val:.1f} below {ADX_MIN_VALUE} — "
                               f"market is rangebound/choppy, skipping entry")
-                    print(f"🚫 ADX BLOCK: {reason}", flush=True)
+                    print(f"🚫 ADX BLOCK [{instrument}]: {reason}", flush=True)
+                    _adx_alert_key = f"_adx_alerted_{instrument}"
+                    _last_adx_alert = getattr(apply_entry_filters, _adx_alert_key, 0)
+                    if time.time() - _last_adx_alert > 3600:
+                        setattr(apply_entry_filters, _adx_alert_key, time.time())
+                        send_message(f"🚫 {instrument} ORDER BLOCKED\n{reason}")
                     return False, reason
             else:
                 _adx_str = f"ADX={adx_val:.1f}" if not np.isnan(adx_val) else "ADX=N/A"
@@ -1916,7 +1922,13 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                 reason = (f"📏 ATR filter: candles too small — "
                           f"ATR={_atr14:.1f} ({_atr_pct*100:.2f}% of price) "
                           f"min {ATR_MIN_PCT*100:.2f}% — low volatility day, skip")
-                print(f"🚫 ATR BLOCK: {reason}", flush=True)
+                print(f"🚫 ATR BLOCK [{instrument}]: {reason}", flush=True)
+                # Telegram alert only once per hour per instrument
+                _atr_alert_key = f"_atr_alerted_{instrument}"
+                _last_atr_alert = getattr(apply_entry_filters, _atr_alert_key, 0)
+                if time.time() - _last_atr_alert > 3600:
+                    setattr(apply_entry_filters, _atr_alert_key, time.time())
+                    send_message(f"🚫 {instrument} ORDER BLOCKED\n{reason}")
                 return False, reason
             _atr_str = f"ATR={_atr14:.1f}({_atr_pct*100:.2f}%)"
         except Exception as _ae:
@@ -2094,7 +2106,51 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                 s1    = (2 * pivot) - pdh
                 s2    = pivot - (pdh - pdl)
 
-            # ── Method 3: Round Number / Psychological Levels ─────────────────
+            # ── CPR (Central Pivot Range) ─────────────────────────────────────
+            # TC = Top Central   = (Pivot + PDH) / 2
+            # BC = Bottom Central = (Pivot + PDL) / 2
+            # Narrow CPR (TC-BC small) = strong trend day
+            # Wide CPR (TC-BC large)   = sideways/balanced day
+            cpr_tc = cpr_bc = cpr_pivot = None
+            if pdh and pdl and pdc:
+                cpr_pivot = (pdh + pdl + pdc) / 3
+                cpr_tc    = (cpr_pivot + pdh) / 2
+                cpr_bc    = (cpr_pivot + pdl) / 2
+
+            # CPR filter — only enter when price confirms CPR direction
+            if USE_CPR_FILTER and cpr_tc and cpr_bc:
+                _cpr_width_pct = (cpr_tc - cpr_bc) / cur_close * 100
+                if signal == "CALL":
+                    if cur_close < cpr_bc:
+                        # Price below CPR → bearish bias → block CALL
+                        _cpr_reason = (f"📊 CPR filter: CALL blocked — price ₹{cur_close:.0f} "
+                                       f"below CPR (BC=₹{cpr_bc:.0f} TC=₹{cpr_tc:.0f}) — bearish bias")
+                        print(f"🚫 CPR BLOCK: {_cpr_reason}", flush=True)
+                        return False, _cpr_reason
+                    elif cpr_bc <= cur_close <= cpr_tc:
+                        # Price inside CPR → indecision → block
+                        _cpr_reason = (f"📊 CPR filter: CALL blocked — price ₹{cur_close:.0f} "
+                                       f"inside CPR range (BC=₹{cpr_bc:.0f}–TC=₹{cpr_tc:.0f}) — "
+                                       f"indecision zone")
+                        print(f"🚫 CPR INSIDE: {_cpr_reason}", flush=True)
+                        return False, _cpr_reason
+                elif signal == "PUT":
+                    if cur_close > cpr_tc:
+                        # Price above CPR → bullish bias → block PUT
+                        _cpr_reason = (f"📊 CPR filter: PUT blocked — price ₹{cur_close:.0f} "
+                                       f"above CPR (BC=₹{cpr_bc:.0f} TC=₹{cpr_tc:.0f}) — bullish bias")
+                        print(f"🚫 CPR BLOCK: {_cpr_reason}", flush=True)
+                        return False, _cpr_reason
+                    elif cpr_bc <= cur_close <= cpr_tc:
+                        # Price inside CPR → indecision → block
+                        _cpr_reason = (f"📊 CPR filter: PUT blocked — price ₹{cur_close:.0f} "
+                                       f"inside CPR range (BC=₹{cpr_bc:.0f}–TC=₹{cpr_tc:.0f}) — "
+                                       f"indecision zone")
+                        print(f"🚫 CPR INSIDE: {_cpr_reason}", flush=True)
+                        return False, _cpr_reason
+                print(f"✅ CPR: price ₹{cur_close:.0f} {'above' if signal=='PUT' else 'below'} CPR "
+                      f"(BC=₹{cpr_bc:.0f} TC=₹{cpr_tc:.0f} width={_cpr_width_pct:.2f}%) — "
+                      f"{'bearish' if signal=='PUT' else 'bullish'} confirmed", flush=True)
             # Nifty: 50-pt round numbers (24000, 24050, 24100...)
             # BankNifty/SENSEX: 100-pt round numbers
             if instrument in ("BANKNIFTY", "SENSEX"):

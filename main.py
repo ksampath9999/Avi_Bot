@@ -552,7 +552,7 @@ ADX_MIN_VALUE      = int(os.environ.get("ADX_MIN_VALUE", "15"))   # lowered to 1
 # ATR filter — minimum candle size to ensure enough movement for profit
 # ATR as % of price: 0.3% on SENSEX 75000 = ₹225 range per candle
 USE_ATR_FILTER     = os.environ.get("USE_ATR_FILTER", "true").lower() == "true"
-ATR_MIN_PCT        = float(os.environ.get("ATR_MIN_PCT", "0.003"))  # 0.3% minimum
+ATR_MIN_PCT        = float(os.environ.get("ATR_MIN_PCT", "0.002"))  # 0.20% minimum (was 0.30%)
 
 # ── Daily profit target ───────────────────────────────────────────────────────
 # Read from Railway env var DAILY_PROFIT_TARGET so each bot can have its own.

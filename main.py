@@ -11500,12 +11500,29 @@ def delta_place_order(product_id, side, size, symbol):
             print(f"✅ Delta order filled: {side} {size} {symbol} @ ${avg_price:.1f}", flush=True)
             return avg_price
         else:
-            print(f"❌ Delta order failed: {result}", flush=True)
-            send_message(
-                f"❌ DELTA ORDER FAILED\n"
-                f"📌 {symbol} {side} size={size}\n"
-                f"⚠️ Error: {result.get('error', {}).get('code', str(result))}"
-            )
+            _err_code = result.get("error", {}).get("code", str(result))
+            print(f"❌ Delta order failed: {_err_code}", flush=True)
+
+            # One-time alert per error type — prevent spam
+            _alert_key = f"_delta_err_{_err_code}"
+            _last_alert = getattr(delta_place_order, _alert_key, 0)
+            if time.time() - _last_alert > 86400:   # alert once per day
+                setattr(delta_place_order, _alert_key, time.time())
+                if _err_code == "insufficient_margin":
+                    send_message(
+                        f"❌ DELTA ORDER FAILED — INSUFFICIENT MARGIN\n"
+                        f"📌 {symbol} {side} size={size}\n"
+                        f"💰 Please deposit funds on Delta Exchange\n"
+                        f"🌐 india.delta.exchange → Wallet → Deposit\n"
+                        f"⚠️ Trading paused until margin added\n"
+                        f"📌 This alert won't repeat for 1 hour"
+                    )
+                else:
+                    send_message(
+                        f"❌ DELTA ORDER FAILED\n"
+                        f"📌 {symbol} {side} size={size}\n"
+                        f"⚠️ Error: {_err_code}"
+                    )
             return None
     except Exception as e:
         print(f"❌ Delta place_order error: {e}", flush=True)
@@ -11743,6 +11760,10 @@ def delta_loop():
                     f"📦 Size: {DELTA_TRADE_SIZE} contracts\n"
                     f"📊 Trade {_delta_trade_count}/{DELTA_MAX_TRADES} today"
                 )
+            else:
+                # Order failed — check if margin issue → pause 1 hour
+                print(f"⚠️ Delta order failed — pausing 60 min", flush=True)
+                time.sleep(3600)
 
         except Exception as e:
             print(f"❌ Delta loop error: {e}", flush=True)

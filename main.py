@@ -851,7 +851,7 @@ def daily_profit_target_monitor():
 
 # ── Support & Resistance Filter ───────────────────────────────────────────────
 USE_SR_FILTER      = os.environ.get("USE_SR_FILTER", "true").lower() == "true"
-USE_CPR_FILTER     = os.environ.get("USE_CPR_FILTER", "true").lower() == "true"  # Central Pivot Range
+USE_CPR_FILTER     = os.environ.get("USE_CPR_FILTER", "false").lower() == "true"  # Central Pivot Range
 SR_BLOCK_PCT       = 0.003   # 0.3% proximity for PDH/PDL/Pivot (when enabled)
 SR_ALGO_BLOCK_PCT  = 0.001   # 0.1% proximity for Algo SZ/RZ — tighter to avoid blocking valid trades
                                # 0.1% = ~24 pts on Nifty 24000, ~75 pts on SENSEX 75000
@@ -2120,35 +2120,38 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
             # CPR filter — only enter when price confirms CPR direction
             if USE_CPR_FILTER and cpr_tc and cpr_bc:
                 _cpr_width_pct = (cpr_tc - cpr_bc) / cur_close * 100
+                # Buffer = 0.1% of price — small tolerance at CPR boundary
+                _cpr_buffer = cur_close * 0.001
+
                 if signal == "CALL":
-                    if cur_close < cpr_bc:
-                        # Price below CPR → bearish bias → block CALL
+                    if cur_close < cpr_bc - _cpr_buffer:
+                        # Price clearly below CPR → bearish bias → block CALL
                         _cpr_reason = (f"📊 CPR filter: CALL blocked — price ₹{cur_close:.0f} "
                                        f"below CPR (BC=₹{cpr_bc:.0f} TC=₹{cpr_tc:.0f}) — bearish bias")
                         print(f"🚫 CPR BLOCK: {_cpr_reason}", flush=True)
                         return False, _cpr_reason
-                    elif cpr_bc <= cur_close <= cpr_tc:
-                        # Price inside CPR → indecision → block
+                    elif cpr_bc - _cpr_buffer <= cur_close <= cpr_tc + _cpr_buffer:
+                        # Price inside CPR (with buffer) → indecision → block
                         _cpr_reason = (f"📊 CPR filter: CALL blocked — price ₹{cur_close:.0f} "
                                        f"inside CPR range (BC=₹{cpr_bc:.0f}–TC=₹{cpr_tc:.0f}) — "
                                        f"indecision zone")
                         print(f"🚫 CPR INSIDE: {_cpr_reason}", flush=True)
                         return False, _cpr_reason
                 elif signal == "PUT":
-                    if cur_close > cpr_tc:
-                        # Price above CPR → bullish bias → block PUT
+                    if cur_close > cpr_tc + _cpr_buffer:
+                        # Price clearly above CPR → bullish bias → block PUT
                         _cpr_reason = (f"📊 CPR filter: PUT blocked — price ₹{cur_close:.0f} "
                                        f"above CPR (BC=₹{cpr_bc:.0f} TC=₹{cpr_tc:.0f}) — bullish bias")
                         print(f"🚫 CPR BLOCK: {_cpr_reason}", flush=True)
                         return False, _cpr_reason
-                    elif cpr_bc <= cur_close <= cpr_tc:
-                        # Price inside CPR → indecision → block
+                    elif cpr_bc - _cpr_buffer <= cur_close <= cpr_tc + _cpr_buffer:
+                        # Price inside CPR (with buffer) → indecision → block
                         _cpr_reason = (f"📊 CPR filter: PUT blocked — price ₹{cur_close:.0f} "
                                        f"inside CPR range (BC=₹{cpr_bc:.0f}–TC=₹{cpr_tc:.0f}) — "
                                        f"indecision zone")
                         print(f"🚫 CPR INSIDE: {_cpr_reason}", flush=True)
                         return False, _cpr_reason
-                print(f"✅ CPR: price ₹{cur_close:.0f} {'above' if signal=='PUT' else 'below'} CPR "
+                print(f"✅ CPR: price ₹{cur_close:.0f} "
                       f"(BC=₹{cpr_bc:.0f} TC=₹{cpr_tc:.0f} width={_cpr_width_pct:.2f}%) — "
                       f"{'bearish' if signal=='PUT' else 'bullish'} confirmed", flush=True)
             # Nifty: 50-pt round numbers (24000, 24050, 24100...)

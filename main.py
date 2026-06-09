@@ -1918,13 +1918,23 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
             _atr14     = _tr.ewm(span=14, adjust=False).mean().iloc[-2]
             _cur_price = float(_close.iloc[-2])
             _atr_pct   = _atr14 / _cur_price if _cur_price > 0 else 0
-            if _atr_pct < ATR_MIN_PCT:
+
+            # 5% tolerance — if ATR within 5% of threshold, allow
+            # Prevents borderline flickering (e.g. 0.20% vs 0.20% threshold)
+            _atr_threshold = ATR_MIN_PCT * 0.95   # 0.0015 × 0.95 = 0.001425
+
+            if _atr_pct < _atr_threshold:
                 reason = (f"📏 ATR filter: candles too small — "
                           f"ATR={_atr14:.1f} ({_atr_pct*100:.2f}% of price) "
                           f"min {ATR_MIN_PCT*100:.2f}% — low volatility day, skip")
-                print(f"🚫 ATR BLOCK [{instrument}]: {reason}", flush=True)
+                # Log only once per 5 min — not every 10 seconds
+                _atr_log_key  = f"_atr_logged_{instrument}"
+                _last_atr_log = getattr(apply_entry_filters, _atr_log_key, 0)
+                if time.time() - _last_atr_log > 300:
+                    setattr(apply_entry_filters, _atr_log_key, time.time())
+                    print(f"🚫 ATR BLOCK [{instrument}]: {reason}", flush=True)
                 # Telegram alert only once per hour per instrument
-                _atr_alert_key = f"_atr_alerted_{instrument}"
+                _atr_alert_key  = f"_atr_alerted_{instrument}"
                 _last_atr_alert = getattr(apply_entry_filters, _atr_alert_key, 0)
                 if time.time() - _last_atr_alert > 3600:
                     setattr(apply_entry_filters, _atr_alert_key, time.time())

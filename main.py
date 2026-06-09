@@ -565,6 +565,10 @@ DAILY_PROFIT_TARGET = int(os.environ.get("DAILY_PROFIT_TARGET", "0"))
 # but stop if P&L drops below the target (protect the gains)
 USE_PROFIT_PROTECTION = os.environ.get("USE_PROFIT_PROTECTION", "false").lower() == "true"
 _profit_protection_floor = 0.0   # set when target first hit
+_daily_target_exited     = False  # True when daily profit target hit
+_ip_blocked              = False  # True when Kite rejects due to IP block
+_ip_alert_sent           = False  # one-time IP alert flag
+_last_loss_exit_time     = {}     # {instrument: timestamp} for loss cooldown
 
 
 def daily_profit_target_monitor():

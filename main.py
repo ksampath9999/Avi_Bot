@@ -3421,11 +3421,15 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
             _allowed    = False
             _reason     = f"After 3:10 PM IST ({_now_ist.strftime('%H:%M')}) — no new entries"
 
-        # RULE 3: Hull band too thin → block
-        elif hull_band_pct is not None and hull_band_pct < 0.0002:
+        # RULE 3: Hull band too thin → only block if USE_HULL_BAND_FILTER is enabled
+        # (avoids duplicate blocking when USE_HULL_BAND_FILTER=false)
+        elif (USE_HULL_BAND_FILTER and
+              hull_band_pct is not None and
+              hull_band_pct < HULL_MIN_BAND_WIDTH_PCT):
             _confidence = 40
             _allowed    = False
-            _reason     = f"Hull band {hull_band_pct*100:.3f}% below 0.02% — trend too weak"
+            _reason     = (f"Hull band {hull_band_pct*100:.3f}% below "
+                           f"{HULL_MIN_BAND_WIDTH_PCT*100:.3f}% — trend too weak")
 
         # All rules pass → allow with 75% confidence
         confidence = _confidence

@@ -4246,9 +4246,17 @@ def find_option(signal, instrument):
         msg = (f"⚠️ Balance ₹{balance:.0f} too low to trade {instrument} "
                f"(minimum ₹{_min_bal}) — skipping")
         print(msg, flush=True)
-        send_message(f"💸 INSUFFICIENT BALANCE\n"
-                     f"📌 {instrument}: ₹{balance:.0f} < min ₹{_min_bal}\n"
-                     f"💡 Add funds to trade {instrument}")
+        # Alert once per day per instrument
+        _bal_key  = f"_insuf_bal_{instrument}"
+        _last_bal = getattr(find_option, _bal_key, 0)
+        if time.time() - _last_bal > 86400:
+            setattr(find_option, _bal_key, time.time())
+            send_message(
+                f"💸 INSUFFICIENT BALANCE\n"
+                f"📌 {instrument}: ₹{balance:.0f} < min ₹{_min_bal}\n"
+                f"🛑 No more {instrument} trades today\n"
+                f"👉 Add funds to resume trading"
+            )
         return None, None, None, None
     if signal == "CALL":
         opt_type = "CE"
@@ -6350,11 +6358,21 @@ def nifty_loop():
             try:
                 _eq_bal = float(kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0) or 0)
                 if _eq_bal > 0 and _eq_bal < LOW_BALANCE_THRESHOLD:
-                    _lb_key = f"_lb_logged_NIFTY"
-                    if not getattr(nifty_loop, _lb_key, False) or time.time() - getattr(nifty_loop, _lb_key+"_t", 0) > 300:
-                        setattr(nifty_loop, _lb_key, True)
-                        setattr(nifty_loop, _lb_key+"_t", time.time())
+                    _nifty_lb_last = getattr(nifty_loop, '_lb_last_t', 0)
+                    if time.time() - _nifty_lb_last > 300:   # print once per 5 min
+                        nifty_loop._lb_last_t = time.time()
                         print(f"💸 Balance ₹{_eq_bal:.0f} < ₹{LOW_BALANCE_THRESHOLD} — NIFTY skipped (SENSEX only)", flush=True)
+                    # Telegram alert once per day
+                    _nifty_lb_alert = getattr(nifty_loop, '_lb_alert_t', 0)
+                    if time.time() - _nifty_lb_alert > 86400:
+                        nifty_loop._lb_alert_t = time.time()
+                        send_message(
+                            f"💸 LOW BALANCE ALERT\n"
+                            f"Balance: ₹{_eq_bal:.0f} (min ₹{LOW_BALANCE_THRESHOLD})\n"
+                            f"NIFTY/BANKNIFTY trading disabled\n"
+                            f"Only SENSEX can trade (min ₹400)\n"
+                            f"👉 Add funds to resume full trading"
+                        )
                     time.sleep(60)
                     continue
             except Exception:
@@ -7197,7 +7215,7 @@ def banknifty_loop():
                 _eq_bal = float(kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0) or 0)
                 if _eq_bal > 0 and _eq_bal < LOW_BALANCE_THRESHOLD:
                     _bn_lb_last = getattr(banknifty_loop, '_lb_logged_t', 0)
-                    if time.time() - _bn_lb_last > 300:   # print once per 5 min
+                    if time.time() - _bn_lb_last > 300:
                         banknifty_loop._lb_logged_t = time.time()
                         print(f"💸 BANKNIFTY skipped: balance ₹{_eq_bal:.0f} < ₹{LOW_BALANCE_THRESHOLD} (SENSEX only)", flush=True)
                     time.sleep(60)
@@ -11616,7 +11634,10 @@ def delta_loop():
 
             # Max trades check
             if _delta_trade_count >= DELTA_MAX_TRADES:
-                print(f"📊 Delta max trades {DELTA_MAX_TRADES}/day reached", flush=True)
+                _dt_key = getattr(delta_loop, '_max_trades_logged', 0)
+                if time.time() - _dt_key > 3600:
+                    delta_loop._max_trades_logged = time.time()
+                    print(f"📊 Delta max trades {DELTA_MAX_TRADES}/day reached — resuming tomorrow", flush=True)
                 time.sleep(300)
                 continue
 

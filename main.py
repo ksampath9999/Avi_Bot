@@ -2438,13 +2438,14 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 # ──────────────────────────────────────────────────────────────────────────────
 
 USE_HULL_FILTER  = os.environ.get("USE_HULL_FILTER", "true").lower() == "true"
-HULL_MODE        = "Hma"  # "Hma" | "Ehma" | "Thma"
+HULL_MODE        = os.environ.get("HULL_MODE",   "Hma")   # "Hma" | "Ehma" | "Thma"
+HULL_LENGTH      = int(os.environ.get("HULL_LENGTH", "25"))  # 25 = your TV setting
+HULL_SOURCE      = os.environ.get("HULL_SOURCE", "open")    # "open" | "close" | "hl2"
 
 # ── SuperTrend Filter ──────────────────────────────────────────────────────────
 USE_SUPERTREND_FILTER = os.environ.get("USE_SUPERTREND_FILTER", "false").lower() == "true"
 ST_PERIOD             = int(os.environ.get("ST_PERIOD",     "10"))   # ATR period
 ST_MULTIPLIER         = float(os.environ.get("ST_MULTIPLIER", "3.0")) # band multiplier
-HULL_LENGTH      = 55     # Pine default for swing entry
 
 # Minimum band width as % of price.
 # Band width = abs(MHULL - SHULL) / price
@@ -2830,9 +2831,10 @@ def get_supertrend_signal(df, period=10, multiplier=3.0):
         return None, None
 
 
-def hull_suite(df, mode=HULL_MODE, length=HULL_LENGTH):
+def hull_suite(df, mode=HULL_MODE, length=HULL_LENGTH, source=None):
     """
     Computes Hull Suite on the given OHLCV DataFrame.
+    source: "open" | "close" | "hl2" | "hlc3" | "ohlc4" (default: HULL_SOURCE)
 
     Returns a DataFrame with extra columns:
         hull      : the Hull MA line value (MHULL = HULL[0])
@@ -2842,7 +2844,20 @@ def hull_suite(df, mode=HULL_MODE, length=HULL_LENGTH):
         hull_signal: "CALL" | "PUT" | None
     """
     df = df.copy()
-    src = df["close"]
+
+    # Source selection — matches TradingView source dropdown
+    _src_name = (source or HULL_SOURCE).lower()
+    if _src_name == "open":
+        src = df["open"].astype(float)
+    elif _src_name == "hl2":
+        src = (df["high"].astype(float) + df["low"].astype(float)) / 2
+    elif _src_name == "hlc3":
+        src = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3
+    elif _src_name == "ohlc4":
+        src = (df["open"].astype(float) + df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 4
+    else:
+        src = df["close"].astype(float)   # default close
+
     n   = int(length)
 
     if mode == "Hma":

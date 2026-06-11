@@ -4780,7 +4780,7 @@ def update_exit_time(instrument):
 # TRADE MGMT
 # -----------------------------
 def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, market_type,
-                 gen_id=None):
+                 gen_id=None, pnl_out=None):
     """
     Manages an open option trade until it exits via SL, profit-lock, force-close, or flip.
 
@@ -5538,6 +5538,10 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
 
             log_trade_full(symbol, entry, exit_fill_price or ltp, pnl, instrument, signal, probability)
 
+            # Pass pnl back to run_trade_wrapper for same-strike guard
+            if pnl_out is not None:
+                pnl_out[0] = pnl
+
             trade_count += 1
 
             # ✅ THREAD SAFE PERFORMANCE LOG
@@ -6080,9 +6084,12 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
             global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
         return
 
+    _pnl_result = [0]   # mutable container to receive pnl from manage_trade
+    pnl = 0             # fallback if manage_trade exits abnormally
     try:
         manage_trade(symbol, price, lot, exchange, instrument, signal, probability, market_type,
-                     gen_id=gen_id)
+                     gen_id=gen_id, pnl_out=_pnl_result)
+        pnl = _pnl_result[0]
 
     finally:
         with lock:

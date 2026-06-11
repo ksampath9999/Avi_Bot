@@ -5196,7 +5196,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                 # Use lower amplitude for EXIT detection than entry
                 # amplitude=2 catches reversals faster than entry amplitude=4
                 # This prevents holding a losing trade waiting for HT to flip
-                _exit_amplitude = max(1, HT_AMPLITUDE - 2)   # e.g. 4→2, 3→1
+                _exit_amplitude = HT_AMPLITUDE   # same as entry — no premature exits
                 ht_df_exit = halftrend_tv(df_ht_exit, amplitude=_exit_amplitude, channel_deviation=2)
                 last_exit  = ht_df_exit.iloc[-2]   # last CLOSED candle — anti-repaint
 
@@ -6554,6 +6554,17 @@ def nifty_loop():
                     print(f"⏭️ NIFTY carry-over already entered today ({carryover_key}) — skipping", flush=True)
                     time.sleep(10)
                     continue
+                # 2-bar stability check — don't enter if HT not stable
+                try:
+                    _ht_last  = int(cached_nifty_ht.iloc[-2].get("trend", -1))
+                    _ht_prev  = int(cached_nifty_ht.iloc[-3].get("trend", -1))
+                    _exp_trend = 0 if signal == "CALL" else 1
+                    if _ht_last != _exp_trend or _ht_prev != _exp_trend:
+                        print(f"⚠️ NIFTY carry-over stability fail — HT not stable for 2 bars", flush=True)
+                        time.sleep(10)
+                        continue
+                except Exception:
+                    pass
             else:
                 # Fresh arrow fired — reset carryover so it can re-enter if needed
                 nifty_loop._carryover_done = None
@@ -8337,6 +8348,21 @@ def sensex_loop():
                 if getattr(sensex_loop, "_carryover_done", None) == carryover_key:
                     time.sleep(10)
                     continue
+
+                # ── 2-bar stability check for carry-over ──────────────────────
+                # Don't enter carry-over if HT trend changed in last 2 bars
+                # Prevents entering a stale signal right before a flip
+                try:
+                    _ht_last  = int(cached_sensex_ht.iloc[-2].get("trend", -1))
+                    _ht_prev  = int(cached_sensex_ht.iloc[-3].get("trend", -1))
+                    _exp_trend = 0 if signal == "CALL" else 1
+                    if _ht_last != _exp_trend or _ht_prev != _exp_trend:
+                        print(f"⚠️ SENSEX carry-over stability fail — HT not stable for 2 bars "
+                              f"(last={_ht_last} prev={_ht_prev} expected={_exp_trend})", flush=True)
+                        time.sleep(10)
+                        continue
+                except Exception:
+                    pass
             else:
                 # Fresh arrow — reset carryover so re-entry is allowed
                 sensex_loop._carryover_done = None

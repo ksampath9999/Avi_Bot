@@ -6569,6 +6569,21 @@ def nifty_loop():
                 # Fresh arrow fired — reset carryover so it can re-enter if needed
                 nifty_loop._carryover_done = None
 
+            # ── Session-based signal selection ────────────────────────────────
+            _now_ist_nf = datetime.now(IST)
+            _nf_session_sig, _nf_session_num, _nf_session_reason = get_combined_session_signal(
+                cached_nifty_df, "NIFTY", signal, _now_ist_nf
+            )
+            if USE_SESSION_STRATEGY:
+                _s_names = {1: "ORB", 2: "VWAP", 3: "TREND"}
+                print(f"🎯 NIFTY S{_nf_session_num}({_s_names.get(_nf_session_num,'?')}): {_nf_session_reason}", flush=True)
+                if _nf_session_sig is None:
+                    time.sleep(10)
+                    continue
+                if _nf_session_sig != signal:
+                    print(f"🔄 NIFTY signal: HT={signal} → Session={_nf_session_sig}", flush=True)
+                signal = _nf_session_sig
+
             # ══════════════════════════════════════════════════════════════
             # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)
             # ══════════════════════════════════════════════════════════════
@@ -7482,6 +7497,21 @@ def banknifty_loop():
             # ══════════════════════════════════════════════════════════════
             _just_flipped_bn = getattr(banknifty_loop, "_just_flipped", False)
             banknifty_loop._just_flipped = False
+
+            # ── Session-based signal selection ────────────────────────────
+            _now_ist_bn = datetime.now(IST)
+            _bn_ss, _bn_sn, _bn_sr = get_combined_session_signal(
+                cached_banknifty_df, "BANKNIFTY", signal, _now_ist_bn)
+            if USE_SESSION_STRATEGY:
+                _sn = {1:"ORB", 2:"VWAP", 3:"TREND"}
+                print(f"🎯 BANKNIFTY S{_bn_sn}({_sn.get(_bn_sn,'?')}): {_bn_sr}", flush=True)
+                if _bn_ss is None:
+                    time.sleep(10)
+                    continue
+                if _bn_ss != signal:
+                    print(f"🔄 BANKNIFTY: HT={signal} → Session={_bn_ss}", flush=True)
+                signal = _bn_ss
+
             _filter_ok, _filter_reason = apply_entry_filters(
                 signal, "BANKNIFTY", cached_banknifty_df, BANKNIFTY_TOKEN,
                 is_flip_reentry=_just_flipped_bn,
@@ -8365,6 +8395,21 @@ def sensex_loop():
             else:
                 # Fresh arrow — reset carryover so re-entry is allowed
                 sensex_loop._carryover_done = None
+
+            # ── Session-based signal selection ────────────────────────────────
+            _now_ist_sx = datetime.now(IST)
+            _sx_session_sig, _sx_session_num, _sx_session_reason = get_combined_session_signal(
+                cached_sensex_df, "SENSEX", signal, _now_ist_sx
+            )
+            if USE_SESSION_STRATEGY:
+                _s_names = {1: "ORB", 2: "VWAP", 3: "TREND"}
+                print(f"🎯 SENSEX S{_sx_session_num}({_s_names.get(_sx_session_num,'?')}): {_sx_session_reason}", flush=True)
+                if _sx_session_sig is None:
+                    time.sleep(10)
+                    continue
+                if _sx_session_sig != signal:
+                    print(f"🔄 SENSEX signal: HT={signal} → Session={_sx_session_sig}", flush=True)
+                signal = _sx_session_sig
 
             # ══════════════════════════════════════════════════════════════
             # 📐  HTF FILTER  (30-min direction must agree with 15-min signal)
@@ -12280,4 +12325,212 @@ if __name__ == "__main__":
         time.sleep(60)
 
 
-    # end of __main__
+    # end of __main__ 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🎯 COMBINED SESSION STRATEGY
+# Session 1: ORB    (9:15 - 10:00 AM)
+# Session 2: VWAP   (10:00 AM - 1:00 PM)
+# Session 3: Trend  (1:00 PM - 3:00 PM)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Config
+USE_SESSION_STRATEGY  = os.environ.get("USE_SESSION_STRATEGY",  "false").lower() == "true"
+ORB_LOT_MULTIPLIER    = float(os.environ.get("ORB_LOT_MULTIPLIER",   "1.0"))
+VWAP_LOT_MULTIPLIER   = float(os.environ.get("VWAP_LOT_MULTIPLIER",  "1.0"))
+TREND_LOT_MULTIPLIER  = float(os.environ.get("TREND_LOT_MULTIPLIER", "1.0"))
+VWAP_DISTANCE_PCT     = float(os.environ.get("VWAP_DISTANCE_PCT",    "0.003"))  # 0.3%
+VWAP_RSI_CALL         = int(os.environ.get("VWAP_RSI_CALL",          "55"))     # RSI > 55 for CE
+VWAP_RSI_PUT          = int(os.environ.get("VWAP_RSI_PUT",           "45"))     # RSI < 45 for PE
+
+# Session state per instrument
+_session_state = {}   # {instrument: {"session": 1/2/3, "orb_signal": None, "vwap_signal": None}}
+
+
+def get_current_session(now_ist=None):
+    """
+    Returns current trading session:
+    1 = ORB    (9:15 - 10:00 AM)
+    2 = VWAP   (10:00 AM - 1:00 PM)
+    3 = Trend  (1:00 PM - 3:10 PM)
+    0 = Outside trading hours
+    """
+    if now_ist is None:
+        now_ist = datetime.now(IST)
+    h, m = now_ist.hour, now_ist.minute
+    total_min = h * 60 + m
+
+    if total_min < 9 * 60 + 15:   return 0   # before open
+    if total_min < 10 * 60:       return 1   # ORB session
+    if total_min < 13 * 60:       return 2   # VWAP session
+    if total_min < 15 * 60 + 10:  return 3   # Trend session
+    return 0                                   # after 3:10 PM
+
+
+def calculate_rsi(close_series, period=14):
+    """Calculate RSI for signal confirmation."""
+    try:
+        delta  = close_series.diff()
+        gain   = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+        loss   = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+        rs     = gain / loss.replace(0, 1e-10)
+        return (100 - 100 / (1 + rs)).iloc[-2]
+    except Exception:
+        return 50.0
+
+
+def get_session_vwap(df, instrument):
+    """
+    Calculate intraday VWAP from 9:15 AM.
+    Returns (vwap_value, distance_pct, direction)
+    direction: 'above' | 'below' | 'at'
+    """
+    try:
+        df_copy = df.copy()
+        df_copy["_dt"] = pd.to_datetime(df_copy["date"])
+        if df_copy["_dt"].dt.tz is None:
+            df_copy["_dt"] = df_copy["_dt"].dt.tz_localize(IST)
+        else:
+            df_copy["_dt"] = df_copy["_dt"].dt.tz_convert(IST)
+
+        today     = datetime.now(IST).date()
+        today_df  = df_copy[df_copy["_dt"].dt.date == today].copy()
+        if len(today_df) < 2:
+            return None, None, None
+
+        today_df["typical"] = (today_df["high"].astype(float) +
+                               today_df["low"].astype(float) +
+                               today_df["close"].astype(float)) / 3
+        today_df["vol"]     = today_df["volume"].astype(float)
+        today_df["tp_vol"]  = today_df["typical"] * today_df["vol"]
+
+        cum_tpvol = today_df["tp_vol"].cumsum()
+        cum_vol   = today_df["vol"].cumsum().replace(0, 1e-10)
+        vwap      = (cum_tpvol / cum_vol).iloc[-2]
+
+        cur_close    = float(today_df["close"].iloc[-2])
+        dist_pct     = (cur_close - vwap) / vwap
+        direction    = "above" if dist_pct > 0.0005 else "below" if dist_pct < -0.0005 else "at"
+
+        return round(vwap, 2), round(dist_pct * 100, 3), direction
+
+    except Exception as e:
+        print(f"⚠️ VWAP calc error [{instrument}]: {e}", flush=True)
+        return None, None, None
+
+
+def get_orb_signal(df, instrument):
+    """
+    Opening Range Breakout signal.
+    Uses first 15-min candle (9:15-9:30) high/low.
+    Returns: (signal, breakout_level, range_size) or (None, None, None)
+    """
+    try:
+        fc_high, fc_low, fc_time = get_first_candle(df, instrument)
+        if fc_high is None or fc_low is None:
+            return None, None, None
+
+        cur_close  = float(df["close"].iloc[-2])
+        range_size = fc_high - fc_low
+
+        if range_size < 20:   # range too small → unreliable
+            return None, None, None
+
+        buffer = cur_close * 0.0005   # 0.05% buffer
+
+        if cur_close > fc_high + buffer:
+            return "CALL", fc_high, range_size
+        elif cur_close < fc_low - buffer:
+            return "PUT", fc_low, range_size
+        else:
+            return None, None, None   # inside range
+
+    except Exception as e:
+        print(f"⚠️ ORB signal error [{instrument}]: {e}", flush=True)
+        return None, None, None
+
+
+def get_vwap_signal(df, instrument):
+    """
+    VWAP Bounce/Rejection signal.
+    Entry when price deviates from VWAP then bounces back.
+    Returns: (signal, vwap, distance_pct) or (None, None, None)
+    """
+    try:
+        vwap, dist_pct, direction = get_session_vwap(df, instrument)
+        if vwap is None:
+            return None, None, None
+
+        close   = df["close"].astype(float)
+        rsi     = calculate_rsi(close)
+        cur     = float(close.iloc[-2])
+        prev    = float(close.iloc[-3])
+
+        # CALL: price was below VWAP, now bouncing up above VWAP
+        if (dist_pct is not None and
+                dist_pct > VWAP_DISTANCE_PCT * 100 * -1 and
+                prev < vwap and cur > vwap and
+                rsi > VWAP_RSI_CALL):
+            return "CALL", vwap, dist_pct
+
+        # PUT: price was above VWAP, now rejecting down below VWAP
+        if (dist_pct is not None and
+                dist_pct < VWAP_DISTANCE_PCT * 100 and
+                prev > vwap and cur < vwap and
+                rsi < VWAP_RSI_PUT):
+            return "PUT", vwap, dist_pct
+
+        # Alternative: price far from VWAP (mean reversion)
+        abs_dist = abs(dist_pct) if dist_pct else 0
+        if abs_dist > VWAP_DISTANCE_PCT * 100 * 2:   # 2× threshold
+            if direction == "above" and rsi > 65:
+                return "PUT", vwap, dist_pct   # overextended above → mean revert PUT
+            elif direction == "below" and rsi < 35:
+                return "CALL", vwap, dist_pct  # overextended below → mean revert CALL
+
+        return None, None, None
+
+    except Exception as e:
+        print(f"⚠️ VWAP signal error [{instrument}]: {e}", flush=True)
+        return None, None, None
+
+
+def get_combined_session_signal(df, instrument, ht_signal, now_ist=None):
+    """
+    Returns the signal based on current session:
+    Session 1 (ORB):   ORB breakout signal
+    Session 2 (VWAP):  VWAP bounce signal
+    Session 3 (Trend): HalfTrend signal (existing)
+
+    Returns: (signal, session, reason) or (None, session, reason)
+    """
+    if not USE_SESSION_STRATEGY:
+        return ht_signal, 3, "Session strategy disabled — using HT only"
+
+    session = get_current_session(now_ist)
+
+    if session == 0:
+        return None, 0, "Outside trading hours"
+
+    elif session == 1:
+        # ORB session — use first candle breakout
+        orb_sig, orb_level, orb_range = get_orb_signal(df, instrument)
+        if orb_sig:
+            return orb_sig, 1, f"🔴 ORB {orb_sig}: broke {'above' if orb_sig=='CALL' else 'below'} ₹{orb_level:.0f} (range={orb_range:.0f}pts)"
+        else:
+            return None, 1, "ORB: price inside opening range — waiting for breakout"
+
+    elif session == 2:
+        # VWAP session — use VWAP bounce
+        vwap_sig, vwap, dist = get_vwap_signal(df, instrument)
+        if vwap_sig:
+            return vwap_sig, 2, f"📊 VWAP {vwap_sig}: price crossed VWAP ₹{vwap:.0f} (dist={dist:.2f}%)"
+        else:
+            vwap_val, dist_pct, direction = get_session_vwap(df, instrument)
+            return None, 2, f"VWAP: no bounce signal (VWAP=₹{vwap_val:.0f} price {direction} by {dist_pct:.2f}%)"
+
+    elif session == 3:
+        # Trend session — use HalfTrend (existing strategy)
+        return ht_signal, 3, f"📈 Trend: HT signal = {ht_signal}"
+
+    return None, session, "No signal"

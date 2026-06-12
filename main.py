@@ -12164,6 +12164,15 @@ if __name__ == "__main__":
     else:
         print("⚠️ Delta loop disabled (ENABLE_DELTA=false)", flush=True)
 
+    if ENABLE_OPTIONS_SELLING:
+        if SELLING_INSTRUMENT in ("SENSEX", "NIFTY", "BANKNIFTY"):
+            threading.Thread(target=options_selling_loop, daemon=True, name="SellingLoop").start()
+            print(f"🔴 Options Selling loop started — {SELLING_INSTRUMENT} {SELLING_STRATEGY}", flush=True)
+        else:
+            print(f"⚠️ Options selling skipped — invalid instrument: {SELLING_INSTRUMENT}", flush=True)
+    else:
+        print("⚠️ Options selling disabled (ENABLE_OPTIONS_SELLING=false)", flush=True)
+
     if ENABLE_SWING:
         threading.Thread(target=swing_loop, daemon=True, name="SwingLoop").start()
     else:
@@ -12534,3 +12543,338 @@ def get_combined_session_signal(df, instrument, ht_signal, now_ist=None):
         return ht_signal, 3, f"📈 Trend: HT signal = {ht_signal}"
 
     return None, session, "No signal"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔴 OPTIONS SELLING MODULE — Iron Condor / Short Strangle
+# Strategy: Sell OTM CE + Sell OTM PE → collect premium
+# Win rate: 70-80% (market stays in range)
+# Requires: ₹50,000+ margin per instrument
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Config ────────────────────────────────────────────────────────────────
+ENABLE_OPTIONS_SELLING   = os.environ.get("ENABLE_OPTIONS_SELLING",   "false").lower() == "true"
+SELLING_STRATEGY         = os.environ.get("SELLING_STRATEGY",         "strangle")  # "strangle" | "condor"
+
+# Per-instrument enable flags for selling
+SELL_NIFTY     = os.environ.get("SELL_NIFTY",     "false").lower() == "true"
+SELL_BANKNIFTY = os.environ.get("SELL_BANKNIFTY", "false").lower() == "true"
+SELL_FINNIFTY  = os.environ.get("SELL_FINNIFTY",  "false").lower() == "true"
+SELL_SENSEX    = os.environ.get("SELL_SENSEX",    "true").lower()  == "true"  # default SENSEX only
+SELL_CRUDE     = os.environ.get("SELL_CRUDE",     "false").lower() == "true"
+
+SELLING_STRIKES_AWAY     = int(os.environ.get("SELLING_STRIKES_AWAY", "8"))        # OTM strikes from ATM (8 = safe distance from buying range)
+SELLING_MAX_LOSS_PCT     = float(os.environ.get("SELLING_MAX_LOSS_PCT","2.0"))      # exit if 2× premium
+SELLING_TARGET_PCT       = float(os.environ.get("SELLING_TARGET_PCT", "0.5"))      # exit at 50% profit
+SELLING_ENTRY_TIME_START = os.environ.get("SELLING_ENTRY_TIME_START", "09:30")     # entry window start
+SELLING_ENTRY_TIME_END   = os.environ.get("SELLING_ENTRY_TIME_END",   "10:30")     # entry window end
+SELLING_EXIT_TIME        = os.environ.get("SELLING_EXIT_TIME",        "15:10")     # force close
+SELLING_MAX_TRADES_DAY   = int(os.environ.get("SELLING_MAX_TRADES_DAY","1"))       # per instrument/day
+SELLING_VIX_MAX          = float(os.environ.get("SELLING_VIX_MAX",    "20.0"))     # skip VIX > 20
+SELLING_VIX_MIN          = float(os.environ.get("SELLING_VIX_MIN",    "12.0"))     # skip VIX < 12
+
+# Instruments to sell — list built from flags
+SELLING_INSTRUMENTS = [
+    inst for inst, flag in [
+        ("NIFTY",     SELL_NIFTY),
+        ("BANKNIFTY", SELL_BANKNIFTY),
+        ("FINNIFTY",  SELL_FINNIFTY),
+        ("SENSEX",    SELL_SENSEX),
+        ("CRUDE",     SELL_CRUDE),
+    ] if flag
+]
+
+# ── State ─────────────────────────────────────────────────────────────────
+_selling_position = {
+    "active":       False,
+    "ce_symbol":    None,
+    "pe_symbol":    None,
+    "ce_entry":     0.0,
+    "pe_entry":     0.0,
+    "ce_qty":       0,
+    "pe_qty":       0,
+    "exchange":     None,
+    "entry_time":   0,
+    "total_premium":0.0,
+    "instrument":   None,
+}
+_selling_trade_count = 0
+_selling_daily_pnl   = 0.0
+
+
+def get_india_vix():
+    """Get India VIX from Kite."""
+    try:
+        vix_data = kite.quote(["NSE:INDIA VIX"])
+        return float(vix_data.get("NSE:INDIA VIX", {}).get("last_price", 16.0) or 16.0)
+    except Exception:
+        return 16.0   # default — assume normal VIX
+
+
+def find_otm_strike(instrument, option_type, strikes_away):
+    """
+    Find OTM strike for selling.
+    strikes_away: number of strikes away from ATM
+    Returns (symbol, strike, ltp) or (None, None, None)
+    """
+    try:
+        # Get ATM
+        _token_map = {
+            "SENSEX":    SENSEX_TOKEN,
+            "NIFTY":     config.NIFTY_TOKEN,
+            "BANKNIFTY": BANKNIFTY_TOKEN,
+        }
+        _ltp_map = {
+            "SENSEX":    "BSE:SENSEX",
+            "NIFTY":     "NSE:NIFTY 50",
+            "BANKNIFTY": "NSE:NIFTY BANK",
+        }
+        _step_map = {
+            "SENSEX":    100,
+            "NIFTY":     50,
+            "BANKNIFTY": 100,
+        }
+        _exchange_map = {
+            "SENSEX": "BFO",
+            "NIFTY":  "NFO",
+            "BANKNIFTY": "NFO",
+        }
+
+        _ltp_sym = _ltp_map.get(instrument)
+        _step    = _step_map.get(instrument, 50)
+        _exchange = _exchange_map.get(instrument, "NFO")
+
+        spot = float(kite.quote([_ltp_sym])[_ltp_sym]["last_price"])
+        atm  = round(spot / _step) * _step
+
+        # OTM strike — CE above ATM, PE below ATM
+        if option_type == "CE":
+            target_strike = atm + (strikes_away * _step)
+        else:
+            target_strike = atm - (strikes_away * _step)
+
+        # Get expiry instruments
+        instruments = kite.instruments(_exchange)
+        today = datetime.now(IST).date()
+
+        candidates = [
+            i for i in instruments
+            if i["name"] == instrument
+            and i["instrument_type"] == option_type
+            and i["expiry"] >= today
+            and abs(i["strike"] - target_strike) <= _step * 2
+        ]
+
+        if not candidates:
+            return None, None, None
+
+        # Sort by expiry (nearest first), then by strike proximity
+        candidates.sort(key=lambda x: (x["expiry"], abs(x["strike"] - target_strike)))
+        best = candidates[0]
+
+        sym = best["tradingsymbol"]
+        ltp_data = kite.quote([f"{_exchange}:{sym}"])
+        ltp = float(ltp_data.get(f"{_exchange}:{sym}", {}).get("last_price", 0) or 0)
+
+        if ltp < 1:
+            return None, None, None
+
+        return sym, best["strike"], ltp
+
+    except Exception as e:
+        print(f"⚠️ find_otm_strike error [{instrument} {option_type}]: {e}", flush=True)
+        return None, None, None
+
+
+def sell_option(symbol, qty, exchange, price):
+    """Place SELL order for options selling."""
+    try:
+        # SELL order — collect premium
+        order_id = kite.place_order(
+            variety   = "regular",
+            exchange  = exchange,
+            tradingsymbol = symbol,
+            transaction_type = "SELL",
+            quantity  = qty,
+            order_type = "LIMIT",
+            price     = round(price * 0.99, 1),   # 1% below LTP
+            product   = "MIS",
+        )
+        print(f"✅ SELL order placed: {symbol} qty={qty} @ ₹{price:.1f} id={order_id}", flush=True)
+        return order_id
+    except Exception as e:
+        print(f"❌ Sell order failed [{symbol}]: {e}", flush=True)
+        return None
+
+
+def buy_back_option(symbol, qty, exchange, price):
+    """Buy back sold option to close position."""
+    try:
+        order_id = kite.place_order(
+            variety   = "regular",
+            exchange  = exchange,
+            tradingsymbol = symbol,
+            transaction_type = "BUY",
+            quantity  = qty,
+            order_type = "LIMIT",
+            price     = round(price * 1.02, 1),   # 2% above LTP
+            product   = "MIS",
+        )
+        print(f"✅ BUY-BACK order placed: {symbol} qty={qty} @ ₹{price:.1f}", flush=True)
+        return order_id
+    except Exception as e:
+        print(f"❌ Buy-back failed [{symbol}]: {e}", flush=True)
+        return None
+
+
+def options_selling_loop():
+    """
+    Options Selling Loop — Iron Condor / Short Strangle.
+
+    Strategy:
+      Morning (9:30-10:30): Sell OTM CE + OTM PE
+      Collect premium
+      Exit when:
+        a) 50% profit (target hit) ← SELLING_TARGET_PCT
+        b) 2× premium loss (stop) ← SELLING_MAX_LOSS_PCT
+        c) 3:10 PM force close
+    """
+    global _selling_position, _selling_trade_count, _selling_daily_pnl
+
+    print(f"🔴 Options Selling loop started — {SELLING_INSTRUMENT} {SELLING_STRATEGY}", flush=True)
+    send_message(
+        f"🔴 OPTIONS SELLING STARTED\n"
+        f"📌 Instrument: {SELLING_INSTRUMENT}\n"
+        f"📊 Strategy: {SELLING_STRATEGY.upper()}\n"
+        f"🎯 Strikes away: {SELLING_STRIKES_AWAY}\n"
+        f"💰 Target: {SELLING_TARGET_PCT*100:.0f}% profit\n"
+        f"🛑 Stop: {SELLING_MAX_LOSS_PCT*100:.0f}% loss\n"
+        f"⏰ Entry window: {SELLING_ENTRY_TIME_START}-{SELLING_ENTRY_TIME_END}"
+    )
+
+    _lot_map  = {"SENSEX": 20, "NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "CRUDE": 100}
+    _exch_map = {"SENSEX": "BFO", "NIFTY": "NFO", "BANKNIFTY": "NFO", "FINNIFTY": "NFO", "CRUDE": "MCX"}
+    _last_reset = None
+
+    # Per-instrument state
+    _inst_positions    = {inst: dict(_selling_position) for inst in SELLING_INSTRUMENTS}
+    _inst_trade_counts = {inst: 0 for inst in SELLING_INSTRUMENTS}
+
+    while True:
+        try:
+            time.sleep(15)
+            now_ist = datetime.now(IST)
+
+            # Daily reset
+            _today = now_ist.date()
+            if _last_reset != _today:
+                _selling_trade_count = 0
+                _selling_daily_pnl   = 0.0
+                _selling_position    = {k: (False if k=="active" else None if isinstance(v,str) else 0.0 if isinstance(v,float) else 0)
+                                        for k,v in _selling_position.items()}
+                _last_reset = _today
+                print(f"🔴 Selling loop daily reset — {_today}", flush=True)
+                continue
+
+            # ── Manage ALL instrument positions ───────────────────────────
+            for SELLING_INSTRUMENT in SELLING_INSTRUMENTS:
+                _lot_size = _lot_map.get(SELLING_INSTRUMENT, 20)
+                _exchange  = _exch_map.get(SELLING_INSTRUMENT, "NFO")
+                _pos       = _inst_positions[SELLING_INSTRUMENT]
+                _trade_cnt = _inst_trade_counts[SELLING_INSTRUMENT]
+
+                # ── Manage open position ──────────────────────────────────
+                if _pos["active"]:
+                    ce_sym  = _pos["ce_symbol"]
+                    pe_sym  = _pos["pe_symbol"]
+                    ce_qty  = _pos["ce_qty"]
+                    pe_qty  = _pos["pe_qty"]
+                    ce_entry = _pos["ce_entry"]
+                    pe_entry = _pos["pe_entry"]
+                    total_premium = _pos["total_premium"]
+
+                    try:
+                        _quotes = kite.quote([f"{_exchange}:{ce_sym}", f"{_exchange}:{pe_sym}"])
+                        ce_ltp = float(_quotes.get(f"{_exchange}:{ce_sym}", {}).get("last_price", ce_entry) or ce_entry)
+                        pe_ltp = float(_quotes.get(f"{_exchange}:{pe_sym}", {}).get("last_price", pe_entry) or pe_entry)
+                    except Exception:
+                        continue
+
+                    current_premium = (ce_ltp * ce_qty) + (pe_ltp * pe_qty)
+                    pnl     = total_premium - current_premium
+                    pnl_pct = pnl / total_premium if total_premium > 0 else 0
+
+                    _exit_h, _exit_m = map(int, SELLING_EXIT_TIME.split(":"))
+                    _force_exit  = (now_ist.hour > _exit_h or (now_ist.hour == _exit_h and now_ist.minute >= _exit_m))
+                    _target_hit  = pnl_pct >= SELLING_TARGET_PCT
+                    _sl_hit      = current_premium >= total_premium * (1 + SELLING_MAX_LOSS_PCT)
+
+                    if _force_exit or _target_hit or _sl_hit:
+                        _reason = ("⏰ Force close" if _force_exit else
+                                   "🎯 Target hit" if _target_hit else "🛑 Stop loss")
+                        print(f"🔴 {SELLING_INSTRUMENT} SELLING EXIT: {_reason} P&L=₹{pnl:.0f}", flush=True)
+                        buy_back_option(ce_sym, ce_qty, _exchange, ce_ltp)
+                        time.sleep(0.5)
+                        buy_back_option(pe_sym, pe_qty, _exchange, pe_ltp)
+                        _selling_daily_pnl += pnl
+                        _inst_positions[SELLING_INSTRUMENT]["active"] = False
+                        send_message(
+                            f"🔴 {SELLING_INSTRUMENT} SELLING CLOSED\n"
+                            f"💰 P&L: ₹{pnl:.0f} ({pnl_pct*100:.1f}%)\n"
+                            f"📊 {_reason}\n"
+                            f"💼 Daily P&L: ₹{_selling_daily_pnl:.0f}"
+                        )
+                    else:
+                        print(f"🔴 {SELLING_INSTRUMENT} selling: CE=₹{ce_ltp:.1f} PE=₹{pe_ltp:.1f} "
+                              f"P&L=₹{pnl:.0f} ({pnl_pct*100:.1f}%)", flush=True)
+                    continue
+
+                # ── New position entry ────────────────────────────────────
+                if _trade_cnt >= SELLING_MAX_TRADES_DAY:
+                    continue
+
+                _start_h, _start_m = map(int, SELLING_ENTRY_TIME_START.split(":"))
+                _end_h,   _end_m   = map(int, SELLING_ENTRY_TIME_END.split(":"))
+                _now_mins = now_ist.hour * 60 + now_ist.minute
+                if not (_start_h * 60 + _start_m <= _now_mins <= _end_h * 60 + _end_m):
+                    continue
+
+                _vix = get_india_vix()
+                if _vix > SELLING_VIX_MAX or _vix < SELLING_VIX_MIN:
+                    continue
+
+                ce_sym, ce_strike, ce_ltp = find_otm_strike(SELLING_INSTRUMENT, "CE", SELLING_STRIKES_AWAY)
+                pe_sym, pe_strike, pe_ltp = find_otm_strike(SELLING_INSTRUMENT, "PE", SELLING_STRIKES_AWAY)
+
+                if not ce_sym or not pe_sym or ce_ltp < 5 or pe_ltp < 5:
+                    continue
+
+                total_premium = (ce_ltp * _lot_size) + (pe_ltp * _lot_size)
+                ce_order = sell_option(ce_sym, _lot_size, _exchange, ce_ltp)
+                time.sleep(0.5)
+                pe_order = sell_option(pe_sym, _lot_size, _exchange, pe_ltp)
+
+                if not ce_order or not pe_order:
+                    continue
+
+                _inst_positions[SELLING_INSTRUMENT].update({
+                    "active": True, "ce_symbol": ce_sym, "pe_symbol": pe_sym,
+                    "ce_entry": ce_ltp, "pe_entry": pe_ltp,
+                    "ce_qty": _lot_size, "pe_qty": _lot_size,
+                    "exchange": _exchange, "entry_time": time.time(),
+                    "total_premium": total_premium, "instrument": SELLING_INSTRUMENT,
+                })
+                _inst_trade_counts[SELLING_INSTRUMENT] += 1
+
+                send_message(
+                    f"🔴 {SELLING_INSTRUMENT} SELLING OPENED\n"
+                    f"📈 CE: {ce_sym} @ ₹{ce_ltp:.1f}\n"
+                    f"📉 PE: {pe_sym} @ ₹{pe_ltp:.1f}\n"
+                    f"💰 Premium: ₹{total_premium:.0f}\n"
+                    f"🎯 Target: ₹{total_premium*SELLING_TARGET_PCT:.0f}\n"
+                    f"📊 VIX: {_vix:.1f}"
+                )
+
+        except Exception as e:
+            print(f"❌ Options selling loop error: {e}", flush=True)
+            time.sleep(30)

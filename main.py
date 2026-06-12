@@ -6730,8 +6730,7 @@ def nifty_loop():
 
                 _kite_pos_cache.pop("NIFTY", None)   # invalidate position cache
 
-                # Always mark carryover_key so any future carry-over of the
-                # same direction today is blocked — even if this was a FRESH entry.
+                # Mark carryover during active trade — resets when trade closes
                 nifty_loop._carryover_done = carryover_key
 
                 if not is_fresh:

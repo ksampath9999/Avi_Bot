@@ -894,6 +894,38 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # Runs 24/7 as a separate thread alongside Kite F&O trading
 # ═══════════════════════════════════════════════════════════════════
 ENABLE_DELTA        = os.environ.get("ENABLE_DELTA",       "false").lower() == "true"
+
+# ── Options Selling ──────────────────────────────────────────────────────────
+ENABLE_OPTIONS_SELLING   = os.environ.get("ENABLE_OPTIONS_SELLING",   "false").lower() == "true"
+SELLING_STRATEGY         = os.environ.get("SELLING_STRATEGY",         "strangle")  # "strangle" | "condor"
+
+# Per-instrument enable flags for selling
+SELL_NIFTY     = os.environ.get("SELL_NIFTY",     "false").lower() == "true"
+SELL_BANKNIFTY = os.environ.get("SELL_BANKNIFTY", "false").lower() == "true"
+SELL_FINNIFTY  = os.environ.get("SELL_FINNIFTY",  "false").lower() == "true"
+SELL_SENSEX    = os.environ.get("SELL_SENSEX",    "true").lower()  == "true"  # default SENSEX only
+SELL_CRUDE     = os.environ.get("SELL_CRUDE",     "false").lower() == "true"
+
+SELLING_STRIKES_AWAY     = int(os.environ.get("SELLING_STRIKES_AWAY", "8"))        # OTM strikes from ATM (8 = safe distance from buying range)
+SELLING_MAX_LOSS_PCT     = float(os.environ.get("SELLING_MAX_LOSS_PCT","2.0"))      # exit if 2× premium
+SELLING_TARGET_PCT       = float(os.environ.get("SELLING_TARGET_PCT", "0.5"))      # exit at 50% profit
+SELLING_ENTRY_TIME_START = os.environ.get("SELLING_ENTRY_TIME_START", "09:30")     # entry window start
+SELLING_ENTRY_TIME_END   = os.environ.get("SELLING_ENTRY_TIME_END",   "10:30")     # entry window end
+SELLING_EXIT_TIME        = os.environ.get("SELLING_EXIT_TIME",        "15:10")     # force close
+SELLING_MAX_TRADES_DAY   = int(os.environ.get("SELLING_MAX_TRADES_DAY","1"))       # per instrument/day
+SELLING_VIX_MAX          = float(os.environ.get("SELLING_VIX_MAX",    "20.0"))     # skip VIX > 20
+SELLING_VIX_MIN          = float(os.environ.get("SELLING_VIX_MIN",    "12.0"))     # skip VIX < 12
+
+# Instruments to sell — list built from flags
+SELLING_INSTRUMENTS = [
+    inst for inst, flag in [
+        ("NIFTY",     SELL_NIFTY),
+        ("BANKNIFTY", SELL_BANKNIFTY),
+        ("FINNIFTY",  SELL_FINNIFTY),
+        ("SENSEX",    SELL_SENSEX),
+        ("CRUDE",     SELL_CRUDE),
+    ] if flag
+]
 DELTA_API_KEY       = os.environ.get("DELTA_API_KEY",       "")
 DELTA_API_SECRET    = os.environ.get("DELTA_API_SECRET",    "")
 DELTA_SYMBOL        = os.environ.get("DELTA_SYMBOL",        "BTCUSD")   # BTCUSD / ETHUSD
@@ -12553,36 +12585,7 @@ def get_combined_session_signal(df, instrument, ht_signal, now_ist=None):
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Config ────────────────────────────────────────────────────────────────
-ENABLE_OPTIONS_SELLING   = os.environ.get("ENABLE_OPTIONS_SELLING",   "false").lower() == "true"
-SELLING_STRATEGY         = os.environ.get("SELLING_STRATEGY",         "strangle")  # "strangle" | "condor"
-
-# Per-instrument enable flags for selling
-SELL_NIFTY     = os.environ.get("SELL_NIFTY",     "false").lower() == "true"
-SELL_BANKNIFTY = os.environ.get("SELL_BANKNIFTY", "false").lower() == "true"
-SELL_FINNIFTY  = os.environ.get("SELL_FINNIFTY",  "false").lower() == "true"
-SELL_SENSEX    = os.environ.get("SELL_SENSEX",    "true").lower()  == "true"  # default SENSEX only
-SELL_CRUDE     = os.environ.get("SELL_CRUDE",     "false").lower() == "true"
-
-SELLING_STRIKES_AWAY     = int(os.environ.get("SELLING_STRIKES_AWAY", "8"))        # OTM strikes from ATM (8 = safe distance from buying range)
-SELLING_MAX_LOSS_PCT     = float(os.environ.get("SELLING_MAX_LOSS_PCT","2.0"))      # exit if 2× premium
-SELLING_TARGET_PCT       = float(os.environ.get("SELLING_TARGET_PCT", "0.5"))      # exit at 50% profit
-SELLING_ENTRY_TIME_START = os.environ.get("SELLING_ENTRY_TIME_START", "09:30")     # entry window start
-SELLING_ENTRY_TIME_END   = os.environ.get("SELLING_ENTRY_TIME_END",   "10:30")     # entry window end
-SELLING_EXIT_TIME        = os.environ.get("SELLING_EXIT_TIME",        "15:10")     # force close
-SELLING_MAX_TRADES_DAY   = int(os.environ.get("SELLING_MAX_TRADES_DAY","1"))       # per instrument/day
-SELLING_VIX_MAX          = float(os.environ.get("SELLING_VIX_MAX",    "20.0"))     # skip VIX > 20
-SELLING_VIX_MIN          = float(os.environ.get("SELLING_VIX_MIN",    "12.0"))     # skip VIX < 12
-
-# Instruments to sell — list built from flags
-SELLING_INSTRUMENTS = [
-    inst for inst, flag in [
-        ("NIFTY",     SELL_NIFTY),
-        ("BANKNIFTY", SELL_BANKNIFTY),
-        ("FINNIFTY",  SELL_FINNIFTY),
-        ("SENSEX",    SELL_SENSEX),
-        ("CRUDE",     SELL_CRUDE),
-    ] if flag
-]
+# Options selling config moved to top of file
 
 # ── State ─────────────────────────────────────────────────────────────────
 _selling_position = {

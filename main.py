@@ -4372,6 +4372,12 @@ def find_option(signal, instrument):
             print(f"   🚫 Strike blocked (max-loss exit today): {tradingsym}", flush=True)
             continue
 
+        # ── Block strike that was exited at a loss earlier today ──────────────
+        # (separate from max-loss block — this covers HT-flip/theta/SL losses too)
+        if tradingsym == _last_exited_symbol.get(instrument):
+            print(f"   🚫 Strike blocked (loss exit earlier today): {tradingsym}", flush=True)
+            continue
+
         p = safe_ltp(sym)
 
         if p is None or p <= 0:
@@ -4502,6 +4508,10 @@ def find_option(signal, instrument):
 
         # Block max-loss strikes in fallback too
         if i['tradingsymbol'] in _blocked_strikes.get(instrument, set()):
+            continue
+
+        # Block loss-exited strike in fallback too
+        if i['tradingsymbol'] == _last_exited_symbol.get(instrument):
             continue
 
         p = safe_ltp(sym)

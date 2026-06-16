@@ -5214,7 +5214,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # Rule: if HalfTrend trend direction changes → exit immediately.
             # No filters apply to exits — only to new entries.
             try:
-                _exit_tf = "15minute" if instrument == "CRUDE" else "5minute"
+                _exit_tf = "15minute"   # SAME as entry timeframe — was "5minute", caused mismatch
                 _exit_token = (CRUDE_TOKEN         if instrument == "CRUDE"
                                else BANKNIFTY_TOKEN if instrument == "BANKNIFTY"
                                else FINNIFTY_TOKEN  if instrument == "FINNIFTY"

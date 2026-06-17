@@ -1037,7 +1037,7 @@ MAX_LOSS_PER_LOT   = int(os.environ.get("MAX_LOSS_PER_LOT",   "800"))   # ₹800
 # Max carry-over age in trading days — block signals older than this
 # 0 = today only, 1 = allow yesterday, 2 = allow up to 2 days old (default)
 HT_MAX_CARRYOVER_DAYS = int(os.environ.get("HT_MAX_CARRYOVER_DAYS", "1"))
-HT_AMPLITUDE       = int(os.environ.get("HT_AMPLITUDE",      "4"))    # amplitude (1=sensitive, 4=smooth)
+HT_AMPLITUDE       = int(os.environ.get("HT_AMPLITUDE",      "1"))    # amplitude (1=sensitive, 4=smooth)
 HT_LOOKBACK_CANDLES = int(os.environ.get("HT_LOOKBACK_CANDLES", "400")) # candles (200=~2.5 days on 15min)
 
 # ── Spike reversal exit settings ──────────────────────────────────────────────
@@ -2529,7 +2529,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 
 USE_HULL_FILTER  = os.environ.get("USE_HULL_FILTER", "true").lower() == "true"
 HULL_MODE        = os.environ.get("HULL_MODE",   "Hma")   # "Hma" | "Ehma" | "Thma"
-HULL_LENGTH      = int(os.environ.get("HULL_LENGTH", "25"))  # 25 = your TV setting
+HULL_LENGTH      = int(os.environ.get("HULL_LENGTH", "10"))  # 10 = faster/more sensitive
 HULL_SOURCE      = os.environ.get("HULL_SOURCE", "open")    # "open" | "close" | "hl2"
 
 # ── SuperTrend Filter ──────────────────────────────────────────────────────────

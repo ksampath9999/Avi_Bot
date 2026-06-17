@@ -13,18 +13,76 @@ import pyotp
 from datetime import datetime, timedelta
 from telegram_bot import send_message as _raw_send_message
 
+# ── ntfy.sh push notifications (optional, alongside Telegram) ─────────────
+# Free, official, no API keys, no account linking — just a topic name.
+# Install the ntfy app (iOS/Android) and subscribe to your topic to receive
+# instant push notifications identical to your Telegram alerts.
+ENABLE_NTFY   = os.environ.get("ENABLE_NTFY",   "false").lower() == "true"
+NTFY_TOPIC    = os.environ.get("NTFY_TOPIC",    "")          # e.g. "avi-trading-bot-x7f2"
+NTFY_SERVER   = os.environ.get("NTFY_SERVER",   "https://ntfy.sh")  # self-host URL if desired
+_ntfy_fail_logged = False   # one-time config-missing alert flag
+
+
+def send_ntfy(text, title="Trading Bot Alert"):
+    """Send a push notification via ntfy.sh. Silently no-ops if not configured."""
+    global _ntfy_fail_logged
+    if not ENABLE_NTFY:
+        return
+    if not NTFY_TOPIC:
+        if not _ntfy_fail_logged:
+            _ntfy_fail_logged = True
+            print("⚠️ ntfy enabled but NTFY_TOPIC not set — skipping push alerts", flush=True)
+        return
+    try:
+        resp = requests.post(
+            f"{NTFY_SERVER}/{NTFY_TOPIC}",
+            data=str(text).encode("utf-8"),
+            headers={"Title": title},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            print(f"⚠️ ntfy send failed: HTTP {resp.status_code} {resp.text[:150]}", flush=True)
+    except Exception as _ntfy_err:
+        print(f"⚠️ ntfy send error: {_ntfy_err}", flush=True)
+
+
 def send_message(text):
     """
     HTML-safe wrapper around telegram_bot.send_message.
     Replaces < and > with safe equivalents so Telegram never
     throws 'Unsupported start tag' errors regardless of what
     filter reason strings or error messages contain.
+
+    Telegram is sent on a background thread with a hard 8-second
+    timeout — if Telegram is blocked/banned/unreachable (e.g. India
+    ban), it can never delay or block this function, the trading
+    loop, or the ntfy.sh delivery below.
+
+    Also forwards the same alert to ntfy.sh push notifications when
+    ENABLE_NTFY=true — both channels receive identical alerts.
     """
+    def _tg_worker(_safe_text):
+        try:
+            _raw_send_message(_safe_text)
+        except Exception as _tg_err:
+            print(f"⚠️ Telegram send failed: {_tg_err}", flush=True)
+
     try:
         safe = str(text).replace("<", "‹").replace(">", "›")
-        _raw_send_message(safe)
-    except Exception as _tg_err:
-        print(f"⚠️ Telegram send failed: {_tg_err}", flush=True)
+        _t = threading.Thread(target=_tg_worker, args=(safe,), daemon=True)
+        _t.start()
+        _t.join(timeout=8)   # don't wait forever if Telegram is unreachable
+        if _t.is_alive():
+            print("⚠️ Telegram send timed out (>8s) — likely blocked/unreachable, "
+                  "continuing without waiting", flush=True)
+    except Exception as _tg_outer_err:
+        print(f"⚠️ Telegram send setup failed: {_tg_outer_err}", flush=True)
+
+    # ntfy.sh — best effort, never blocks or breaks the trading loop
+    try:
+        send_ntfy(str(text))
+    except Exception as _ntfy_err2:
+        print(f"⚠️ ntfy forward failed: {_ntfy_err2}", flush=True)
 
 # ── FIX: CSV header matches log_trade_full() column order exactly ──
 if not os.path.exists("trade_log.csv"):

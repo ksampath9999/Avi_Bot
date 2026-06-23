@@ -1352,9 +1352,9 @@ _blocked_strikes    = {    # strikes blocked after max-loss exit — cleared dai
 _flip_timestamps    = {    # {instrument: [timestamp, ...]} — last N flip times
     "NIFTY": [], "BANKNIFTY": [], "FINNIFTY": [], "SENSEX": [], "CRUDE": []
 }
-WHIPSAW_WINDOW_SECS  = 1800   # 30-min window
-WHIPSAW_MAX_FLIPS    = 3      # if >= 3 flips in 30 min → whipsaw detected
-WHIPSAW_PAUSE_SECS   = 1800   # pause 30 min after whipsaw detected
+WHIPSAW_WINDOW_SECS  = int(os.environ.get("WHIPSAW_WINDOW_SECS", "1800"))  # 30-min window
+WHIPSAW_MAX_FLIPS    = int(os.environ.get("WHIPSAW_MAX_FLIPS",   "3"))      # flips before pause
+WHIPSAW_PAUSE_SECS   = int(os.environ.get("WHIPSAW_PAUSE_SECS",  "1800"))  # 30-min pause
 USE_WHIPSAW_FILTER   = os.environ.get("USE_WHIPSAW_FILTER", "true").lower() == "true"
 _whipsaw_pause_until = {}    # {instrument: timestamp}
 
@@ -3425,17 +3425,23 @@ _claude_flip_counter  = {}   # {instrument: count} — increments on each HT fli
 
 
 def _get_recent_trades(instrument, n=5):
-    """Read last N trades for instrument from trade_log.csv."""
+    """Read last N trades for instrument from trade_log.csv — TODAY ONLY."""
     try:
         import csv as _csv
         trades = []
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
         if not os.path.exists(TRADE_LOG_FILE):
             return []
         with open(TRADE_LOG_FILE, "r") as _f:
             reader = _csv.DictReader(_f)
             for row in reader:
-                if row.get("instrument", "").upper() == instrument.upper():
-                    trades.append(row)
+                if row.get("instrument", "").upper() != instrument.upper():
+                    continue
+                # Only include today's trades
+                _trade_time = row.get("time", "")
+                if today_str not in _trade_time:
+                    continue
+                trades.append(row)
         return trades[-n:] if len(trades) >= n else trades
     except Exception:
         return []
@@ -3480,20 +3486,20 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
             print(f"🤖 Claude cache expired [{instrument}] — calling fresh", flush=True)
 
     try:
-        # ── Pre-check: consecutive losses → block without calling Claude ─────
+        # ── Pre-check: consecutive losses → pause 30 min, not block all day ────
         _recent = _get_recent_trades(instrument, n=5)
         if len(_recent) >= 3:
             _last3 = [float(t.get("pnl", 0)) for t in _recent[-3:]]
             if all(p < 0 for p in _last3):
-                _msg = f"3 consecutive losses (₹{_last3[-3]:.0f}, ₹{_last3[-2]:.0f}, ₹{_last3[-1]:.0f}) — strategy not working today"
-                print(f"🤖 Claude pre-check [{instrument}]: BLOCKED — {_msg}", flush=True)
-                send_message(
-                    f"🚫 SIGNAL FILTER BLOCKED\n"
-                    f"📌 {instrument} {signal}\n"
-                    f"📊 Confidence: 0% — pre-check failed\n"
-                    f"💭 {_msg}"
-                )
-                return False, _msg, 0
+                # Only block if last loss was within 30 min (not hours ago)
+                _last_loss_ts = _last_loss_exit_time.get(instrument, 0)
+                _mins_since_loss = (time.time() - _last_loss_ts) / 60
+                if _mins_since_loss < 30:
+                    _msg = (f"3 consecutive losses (₹{_last3[-3]:.0f}, ₹{_last3[-2]:.0f}, "
+                            f"₹{_last3[-1]:.0f}) — pausing {30 - _mins_since_loss:.0f} more min")
+                    print(f"🤖 Signal pre-check [{instrument}]: BLOCKED — {_msg}", flush=True)
+                    return False, _msg, 0
+                # else: 30+ min since last loss → allow re-entry
 
         # Build context for Claude API call
         _recent = _get_recent_trades(instrument, n=5)
@@ -3517,12 +3523,17 @@ def claude_trade_filter(signal, instrument, df, ht_df, hull_band_pct):
         _allowed    = True
         _reason     = "All rules pass — signal accepted"
 
-        # RULE 1: 3 consecutive losses → block
+        # RULE 1: 3 consecutive losses → pause 30 min (not block all day)
         _inst_streak = _loss_streak.get(instrument, 0)
         if _inst_streak >= 3:
-            _confidence = 40
-            _allowed    = False
-            _reason     = f"3 consecutive losses on {instrument} — strategy not working today"
+            _last_loss_ts  = _last_loss_exit_time.get(instrument, 0)
+            _mins_since    = (time.time() - _last_loss_ts) / 60
+            if _mins_since < 30:
+                _confidence = 40
+                _allowed    = False
+                _reason     = (f"3 consecutive losses on {instrument} — "
+                               f"pausing {30 - _mins_since:.0f} more min")
+            # else: 30+ min passed → streak penalty expired → allow
 
         # RULE 2: After 3:10 PM → block
         elif _now_ist.hour > 15 or (_now_ist.hour == 15 and _now_ist.minute >= 10):
@@ -4427,13 +4438,12 @@ def find_option(signal, instrument):
 
         # ── Block strikes stopped out by max-loss today ───────────────────────
         if tradingsym in _blocked_strikes.get(instrument, set()):
-            print(f"   🚫 Strike blocked (max-loss exit today): {tradingsym}", flush=True)
+            print(f"   🚫 [{instrument}] Strike blocked (max-loss exit): {tradingsym}", flush=True)
             continue
 
         # ── Block strike that was exited at a loss earlier today ──────────────
-        # (separate from max-loss block — this covers HT-flip/theta/SL losses too)
         if tradingsym == _last_exited_symbol.get(instrument):
-            print(f"   🚫 Strike blocked (loss exit earlier today): {tradingsym}", flush=True)
+            print(f"   🚫 [{instrument}] Strike blocked (loss exit): {tradingsym} → trying next strike", flush=True)
             continue
 
         p = safe_ltp(sym)
@@ -5641,6 +5651,14 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             # Pass pnl back to run_trade_wrapper for same-strike guard
             if pnl_out is not None:
                 pnl_out[0] = pnl
+
+            # ── Same-strike block — set HERE (not in finally) to avoid race ──
+            # With fast HT flips (amplitude=1), the finally block may run after
+            # a new trade has already started, missing the block entirely
+            if pnl < 0:
+                _last_exited_symbol[instrument] = symbol
+                _last_loss_exit_time[instrument] = time.time()   # for consecutive loss timer
+                print(f"🚫 [{instrument}] Same-strike blocked after loss: {symbol}", flush=True)
 
             trade_count += 1
 
@@ -9438,6 +9456,7 @@ def reset_daily_pnl():
             _loss_streak[_inst] = 0
             _win_streak[_inst]  = 0
         _last_exited_symbol.clear()
+        _last_loss_exit_time.clear()   # reset consecutive loss timer for new day
         for _inst in _blocked_strikes:
             _blocked_strikes[_inst].clear()
         for _inst in _flip_timestamps:

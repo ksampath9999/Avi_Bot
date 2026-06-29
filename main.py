@@ -5962,7 +5962,6 @@ def restore_daily_state():
 
 
 #exit sell orders
-_mark_exiting(instrument)
 def exit_position(symbol, qty, exchange):
     """
     Exit (sell) an open option position.

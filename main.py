@@ -797,11 +797,14 @@ def daily_profit_target_monitor():
                         ("CRUDE",     crude_position,      crude_trade_active),
                     ]:
                         with lock:
-                            _sym  = _pos.get("symbol")
-                            _qty  = _pos.get("qty", 0)
-                            _exc  = _pos.get("exchange")
+                            _sym    = _pos.get("symbol")
+                            _qty    = _pos.get("qty", 0)
+                            _exc    = _pos.get("exchange")
                             _active = _pos.get("active", False)
-                        if _active and _sym and _qty > 0:
+                            # Skip if manage_trade is already handling this exit
+                            # (exit_done flag set means profit lock/SL/HT already exiting)
+                            _exiting = _pos.get("exiting", False)
+                        if _active and not _exiting and _sym and _qty > 0:
                             print(f"   🔴 Protection exit {_inst}: {_sym}", flush=True)
                             _ep_ok = exit_position(_sym, _qty, _exc)
                             if not _ep_ok:
@@ -1920,6 +1923,10 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
 
     # ── Daily profit target — stop new entries once hit ───────────────────────
     if DAILY_PROFIT_TARGET > 0 and _daily_target_exited:
+        # If profit protection already triggered → hard stop, no more trades today
+        if getattr(daily_profit_target_monitor, '_protection_triggered', False):
+            return False, "🛡️ Profit protection triggered — no more trades today"
+
         if USE_PROFIT_PROTECTION and _profit_protection_floor > 0:
             pass   # protection mode active — monitor handles floor, allow new entries
         else:
@@ -4889,6 +4896,24 @@ def update_exit_time(instrument):
 # -----------------------------
 # TRADE MGMT
 # -----------------------------
+
+def _mark_exiting(instrument):
+    """Mark position as exiting to prevent protection monitor double-exit.
+    Applies to ALL instruments: NIFTY, BANKNIFTY, FINNIFTY, SENSEX, CRUDE.
+    """
+    try:
+        with lock:
+            _pos = (nifty_position      if instrument == "NIFTY"
+                    else banknifty_position if instrument == "BANKNIFTY"
+                    else finnifty_position  if instrument == "FINNIFTY"
+                    else sensex_position    if instrument == "SENSEX"
+                    else crude_position     if instrument == "CRUDE"
+                    else None)
+            if _pos is not None:
+                _pos["exiting"] = True
+    except Exception:
+        pass
+
 def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, market_type,
                  gen_id=None, pnl_out=None):
     """
@@ -5014,6 +5039,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     f"💰 P&L: ₹{_pnl_now:.0f}\n"
                     f"🚪 Exiting to avoid overnight / weekend hold"
                 )
+                _mark_exiting(instrument)
                 _fc_ok = exit_position(symbol, remaining_qty, exchange)
                 if not _fc_ok:
                     # Check if already gone
@@ -5072,6 +5098,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     if half_qty > 0 and half_qty < remaining_qty:
                         # Calculate partial P&L: profit = ltp - entry (already computed above)
                         _partial_pnl = profit * half_qty
+                        _mark_exiting(instrument)
                         _exit_ok_partial = exit_position(symbol, half_qty, exchange)
 
                         if _exit_ok_partial:
@@ -5132,6 +5159,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                             f"📉 Current:     ₹{current_pnl:.0f}\n"
                             f"⏱️ Reversed in {_spike_age:.0f}s — locking gains"
                         )
+                        _mark_exiting(instrument)
                         _sr_fill = exit_position(symbol, remaining_qty, exchange)
                         if not _sr_fill:
                             send_message(f"🚨 SPIKE EXIT FAILED — EXIT {symbol} MANUALLY")
@@ -5177,6 +5205,15 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     _profit_lock_exit_time[instrument] = time.time()
 
                     if not exit_done:
+                        # Mark as exiting to prevent protection monitor double-exit
+                        with lock:
+                            _cur_pos = (nifty_position     if instrument == "NIFTY"
+                                        else banknifty_position if instrument == "BANKNIFTY"
+                                        else finnifty_position  if instrument == "FINNIFTY"
+                                        else sensex_position    if instrument == "SENSEX"
+                                        else crude_position)
+                            _cur_pos["exiting"] = True
+                        _mark_exiting(instrument)
                         _exit_fill = exit_position(symbol, remaining_qty, exchange)
                         if _exit_fill:
                             exit_fill_price = _exit_fill if isinstance(_exit_fill, float) else None
@@ -5238,6 +5275,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         break
                     else:
                         # Still open — retry exit silently
+                        _mark_exiting(instrument)
                         _exit_fill = exit_position(symbol, remaining_qty, exchange)
                         if _exit_fill:
                             exit_fill_price = _exit_fill if isinstance(_exit_fill, float) else None
@@ -5346,6 +5384,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         )
 
                     if not exit_done:
+                        _mark_exiting(instrument)
                         _exit_fill = exit_position(symbol, remaining_qty, exchange)
                         if _exit_fill:
                             exit_fill_price = _exit_fill if isinstance(_exit_fill, float) else None
@@ -5427,6 +5466,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                         f"💔 P&L: ₹{current_pnl:.0f}\n"
                         f"📊 Entry: ₹{entry:.1f}  |  Loss: {((ltp-entry)/entry*100):.1f}%"
                     )
+                    _mark_exiting(instrument)
                     _sl_fill = exit_position(symbol, remaining_qty, exchange)
                     if not _sl_fill:
                         send_message(f"🚨 SL EXIT FAILED — EXIT {symbol} MANUALLY NOW")
@@ -5458,6 +5498,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     f"📊 Entry: ₹{entry:.1f}  |  LTP: ₹{ltp:.1f}\n"
                     f"🚫 {symbol} blocked for rest of day — same strike won't re-enter"
                 )
+                _mark_exiting(instrument)
                 _ml_fill = exit_position(symbol, remaining_qty, exchange)
                 if not _ml_fill:
                     send_message(f"🚨 MAX LOSS EXIT FAILED — EXIT {symbol} MANUALLY NOW")
@@ -5500,6 +5541,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     f"💰 P&L: ₹{current_pnl:.0f}\n"
                     f"💡 Exiting before theta erodes further"
                 )
+                _mark_exiting(instrument)
                 _ed_fill = exit_position(symbol, remaining_qty, exchange)
                 if not _ed_fill:
                     send_message(f"🚨 EARLY DECAY EXIT FAILED — EXIT {symbol} MANUALLY")
@@ -5539,6 +5581,7 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
                     if not _will_reenter:
                         _blocked_strikes[instrument].add(symbol)
                         print(f"🚫 {symbol} blocked for re-entry — loss too large", flush=True)
+                    _mark_exiting(instrument)
                     _te_fill = exit_position(symbol, remaining_qty, exchange)
                     if not _te_fill:
                         send_message(f"🚨 THETA EXIT FAILED — EXIT {symbol} MANUALLY")
@@ -5919,6 +5962,7 @@ def restore_daily_state():
 
 
 #exit sell orders
+_mark_exiting(instrument)
 def exit_position(symbol, qty, exchange):
     """
     Exit (sell) an open option position.
@@ -6232,7 +6276,7 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
                     print(f"🚫 {instrument} {symbol} blocked (loss exit) — same strike won't re-enter today", flush=True)
 
                 pos_dict.update({"symbol": None, "qty": 0, "exchange": None,
-                                 "signal": None, "active": False})
+                                 "signal": None, "active": False, "exiting": False})
 
                 if instrument == "NIFTY":
                     nifty_active = False

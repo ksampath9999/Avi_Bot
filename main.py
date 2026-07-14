@@ -6772,6 +6772,13 @@ def nifty_loop():
 
             now_dt = datetime.now(IST)
 
+            # ── Heartbeat ──────────────────────────────────────────────
+            __nifty_hb = getattr(nifty_loop, '_hb_t', 0)
+            if time.time() - __nifty_hb > 300:
+                nifty_loop._hb_t = time.time()
+                print(f"💓 NIFTY loop alive — {now_dt.strftime('%H:%M')}", flush=True)
+
+
             # ── Weekend: sleep and do nothing ────────────────────────────────
             if now_dt.weekday() >= 5:   # Saturday=5, Sunday=6
                 if not _nifty_weekend_msg_sent[0]:
@@ -7186,6 +7193,13 @@ def crude_loop():
                 continue
 
             now_dt = datetime.now(IST)
+
+            # ── Heartbeat ──────────────────────────────────────────────
+            __banknifty_hb = getattr(banknifty_loop, '_hb_t', 0)
+            if time.time() - __banknifty_hb > 300:
+                banknifty_loop._hb_t = time.time()
+                print(f"💓 BANKNIFTY loop alive — {now_dt.strftime('%H:%M')}", flush=True)
+
 
             # ── Weekend: sleep and do nothing ────────────────────────────────
             if now_dt.weekday() >= 5:   # Saturday=5, Sunday=6
@@ -8124,6 +8138,13 @@ def finnifty_loop():
 
             now_dt = datetime.now(IST)
 
+            # ── Heartbeat ──────────────────────────────────────────────
+            __finnifty_hb = getattr(finnifty_loop, '_hb_t', 0)
+            if time.time() - __finnifty_hb > 300:
+                finnifty_loop._hb_t = time.time()
+                print(f"💓 FINNIFTY loop alive — {now_dt.strftime('%H:%M')}", flush=True)
+
+
             # ── Weekend: sleep and do nothing ────────────────────────────────
             if now_dt.weekday() >= 5:
                 if not _fn_weekend_msg_sent[0]:
@@ -8574,6 +8595,13 @@ def sensex_loop():
                 continue
 
             now_dt = datetime.now(IST)
+
+            # ── Heartbeat ──────────────────────────────────────────────
+            __sensex_hb = getattr(sensex_loop, '_hb_t', 0)
+            if time.time() - __sensex_hb > 300:
+                sensex_loop._hb_t = time.time()
+                print(f"💓 SENSEX loop alive — {now_dt.strftime('%H:%M')}", flush=True)
+
 
             # ── Weekend: sleep and do nothing ────────────────────────────────
             if now_dt.weekday() >= 5:

@@ -1009,7 +1009,7 @@ ENABLE_NIFTY      = os.environ.get("ENABLE_NIFTY",      "true").lower()  == "tru
 ENABLE_BANKNIFTY  = os.environ.get("ENABLE_BANKNIFTY",  "false").lower() == "true"
 ENABLE_FINNIFTY   = os.environ.get("ENABLE_FINNIFTY",   "false").lower() == "true"
 ENABLE_SENSEX     = os.environ.get("ENABLE_SENSEX",     "true").lower()  == "true"
-LOW_BALANCE_THRESHOLD = 1500   # if equity balance < ₹1,500 → only SENSEX allowed
+LOW_BALANCE_THRESHOLD = int(os.environ.get("LOW_BALANCE_THRESHOLD", "1000"))  # skip NIFTY/BN below this
 
 # ── Lot sizes — configurable via Railway Variables ────────────────────────────
 # Change without redeploying: set NIFTY_LOT_SIZE=65 in Railway Variables

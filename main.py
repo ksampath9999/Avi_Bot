@@ -4357,14 +4357,15 @@ def find_option(signal, instrument):
             max_price = 400       # ₹400 × 65 = ₹26,000 per lot
 
     # ── Minimum balance check ─────────────────────────────────────────────────
+    # Use LOW_BALANCE_THRESHOLD from Railway if set, else per-instrument minimums
     min_balance_map = {
-        "NIFTY": 650,      # ₹10 × 65 = ₹650 minimum
-        "BANKNIFTY": 600,  # ₹20 × 30 = ₹600 minimum
-        "FINNIFTY": 600,   # ₹10 × 60 = ₹600 minimum
-        "SENSEX": 400,     # ₹20 × 20 = ₹400 minimum
-        "CRUDE": 1000,     # ₹10 × 100 = ₹1000 minimum
+        "NIFTY":     max(LOW_BALANCE_THRESHOLD, 200),   # absolute floor ₹200
+        "BANKNIFTY": max(LOW_BALANCE_THRESHOLD, 200),
+        "FINNIFTY":  max(LOW_BALANCE_THRESHOLD, 200),
+        "SENSEX":    max(LOW_BALANCE_THRESHOLD, 200),
+        "CRUDE":     max(LOW_BALANCE_THRESHOLD, 200),
     }
-    _min_bal = min_balance_map.get(instrument, 500)
+    _min_bal = min_balance_map.get(instrument, LOW_BALANCE_THRESHOLD)
     if balance < _min_bal:
         msg = (f"⚠️ Balance ₹{balance:.0f} too low to trade {instrument} "
                f"(minimum ₹{_min_bal}) — skipping")

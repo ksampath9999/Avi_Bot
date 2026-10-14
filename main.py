@@ -67,6 +67,8 @@ def send_message(text):
         except Exception as _tg_err:
             print(f"⚠️ Telegram send failed: {_tg_err}", flush=True)
 
+    if globals().get("PAPER_TRADE"):
+        text = "📝 [PAPER] " + str(text)
     try:
         safe = str(text).replace("<", "‹").replace(">", "›")
         _t = threading.Thread(target=_tg_worker, args=(safe,), daemon=True)
@@ -96,6 +98,311 @@ lock = threading.Lock()
 IST = pytz.timezone("Asia/Kolkata")
 _KITE_API_KEY = os.environ.get("KITE_API_KEY") or config.API_KEY
 kite = KiteConnect(api_key=_KITE_API_KEY)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📝 PAPER TRADING MODE
+# ─────────────────────────────────────────────────────────────────────────────
+# PAPER_TRADE=true → the bot runs exactly as live (real prices, candles,
+# quotes, all filters and exits) but orders/positions/balance are simulated.
+# Wraps the `kite` object so every existing call site works unchanged:
+#   simulated : place_order, modify_order, cancel_order, orders,
+#               order_history, trades, positions, margins
+#   real      : everything else (ltp, quote, historical_data, instruments, login)
+# Charges are deducted per filled order (PAPER_CHARGES_PER_ORDER, default ₹26
+# ≈ ₹52 per round trip — matches the Apr–Oct 2026 Zerodha statement).
+# State persists in PAPER_STATE_FILE. NOTE: Railway's disk resets on redeploy
+# unless you attach a Volume and point PAPER_STATE_FILE at it (e.g. /data/...).
+PAPER_TRADE             = os.environ.get("PAPER_TRADE", "false").lower() == "true"
+PAPER_CAPITAL           = float(os.environ.get("PAPER_CAPITAL", "10000"))
+PAPER_CHARGES_PER_ORDER = float(os.environ.get("PAPER_CHARGES_PER_ORDER", "26"))
+PAPER_AUTOSQ_CHARGE     = 59.0   # Zerodha auto square-off fee (₹50 + GST)
+PAPER_STATE_FILE        = os.environ.get("PAPER_STATE_FILE", "paper_state.json")
+
+
+class PaperKite:
+    """Drop-in stand-in for KiteConnect that simulates order execution."""
+
+    _SIMULATED = {"place_order", "modify_order", "cancel_order", "orders",
+                  "order_history", "trades", "positions", "margins"}
+
+    def __init__(self, real, capital, charge_per_order, state_file):
+        self._real      = real
+        self._capital   = capital
+        self._charge    = charge_per_order
+        self._file      = state_file
+        self._plock     = threading.RLock()
+        self._orders    = {}     # order_id -> order dict (today, in memory)
+        self._fills     = []
+        self._seq       = int(time.time()) % 100000 * 1000
+        self._state     = {"cash": capital, "start_capital": capital,
+                           "realized": 0.0, "charges": 0.0, "round_trips": 0,
+                           "positions": {}}
+        self._load()
+
+    # ── passthrough for everything not simulated ─────────────────────────────
+    def __getattr__(self, name):
+        if name.startswith("_"):          # avoid recursion before __init__ finishes
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+    # ── persistence ──────────────────────────────────────────────────────────
+    def _load(self):
+        try:
+            import json as _json
+            if os.path.exists(self._file):
+                with open(self._file) as f:
+                    self._state.update(_json.load(f))
+                print(f"📝 Paper state loaded: cash ₹{self._state['cash']:,.0f}", flush=True)
+        except Exception as e:
+            print(f"⚠️ Paper state load failed ({e}) — starting fresh ₹{self._capital:,.0f}", flush=True)
+
+    def _save(self):
+        try:
+            import json as _json
+            tmp = self._file + ".tmp"
+            with open(tmp, "w") as f:
+                _json.dump(self._state, f, indent=1, default=str)
+            os.replace(tmp, self._file)
+        except Exception as e:
+            print(f"⚠️ Paper state save failed: {e}", flush=True)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _today(self):
+        return datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+
+    def _ltp(self, exchange, symbol):
+        key = f"{exchange}:{symbol}"
+        try:
+            return float(self._real.ltp([key])[key]["last_price"])
+        except Exception as e:
+            print(f"⚠️ Paper LTP failed {key}: {e}", flush=True)
+            return None
+
+    def _pkey(self, exchange, symbol, product):
+        return f"{exchange}|{symbol}|{product}"
+
+    def _notify(self, text):
+        try:
+            send_message(text)
+        except Exception:
+            pass
+
+    def _try_fill(self, o):
+        """Fill an OPEN order if it is marketable at the current LTP."""
+        if o["status"] != "OPEN":
+            return
+        ltp = self._ltp(o["exchange"], o["tradingsymbol"])
+        if ltp is None or ltp <= 0:
+            return
+        buy = o["transaction_type"] == "BUY"
+        if o["order_type"] == "MARKET" or not o.get("price"):
+            fill = ltp
+        elif buy and o["price"] >= ltp:
+            fill = o["price"]          # conservative: fill at our limit, not better
+        elif (not buy) and o["price"] <= ltp:
+            fill = o["price"]
+        else:
+            return                      # not marketable yet — stays OPEN
+
+        qty   = int(o["quantity"])
+        pkey  = self._pkey(o["exchange"], o["tradingsymbol"], o["product"])
+        pos   = self._state["positions"].get(pkey)
+        cur_q = pos["quantity"] if pos else 0
+
+        # Naked short selling is not simulated (needs ~₹1L+ margin)
+        if (not buy) and cur_q - qty < 0:
+            o.update(status="REJECTED",
+                     status_message="PAPER: opening short positions is not simulated")
+            return
+        value = fill * qty
+        if buy and value + self._charge > self._state["cash"]:
+            o.update(status="REJECTED",
+                     status_message=f"PAPER: insufficient funds (need ₹{value:,.0f}, "
+                                    f"have ₹{self._state['cash']:,.0f})")
+            return
+
+        if pos is None:
+            pos = {"tradingsymbol": o["tradingsymbol"], "exchange": o["exchange"],
+                   "product": o["product"], "quantity": 0, "average_price": 0.0,
+                   "buy_quantity": 0, "buy_value": 0.0, "sell_quantity": 0,
+                   "sell_value": 0.0, "realised": 0.0, "last_price": fill,
+                   "day": self._today()}
+            self._state["positions"][pkey] = pos
+
+        realized_now = 0.0
+        if buy:
+            new_q = cur_q + qty
+            pos["average_price"] = ((pos["average_price"] * cur_q) + value) / new_q
+            pos["quantity"]      = new_q
+            pos["buy_quantity"] += qty
+            pos["buy_value"]    += value
+            self._state["cash"] -= value
+        else:
+            realized_now = (fill - pos["average_price"]) * qty
+            pos["quantity"]      = cur_q - qty
+            pos["sell_quantity"] += qty
+            pos["sell_value"]    += value
+            pos["realised"]      += realized_now
+            self._state["cash"]  += value
+            self._state["realized"] += realized_now
+        pos["last_price"] = fill
+        pos["day"]        = self._today()
+        self._state["cash"]    -= self._charge
+        self._state["charges"] += self._charge
+
+        o.update(status="COMPLETE", average_price=fill, filled_quantity=qty,
+                 pending_quantity=0,
+                 exchange_timestamp=datetime.now(pytz.timezone("Asia/Kolkata")))
+        self._fills.append({"order_id": o["order_id"], "tradingsymbol": o["tradingsymbol"],
+                            "exchange": o["exchange"], "transaction_type": o["transaction_type"],
+                            "quantity": qty, "average_price": fill, "product": o["product"]})
+        print(f"📝 PAPER FILL {o['transaction_type']} {qty} {o['tradingsymbol']} @ ₹{fill:.2f} "
+              f"| cash ₹{self._state['cash']:,.0f}", flush=True)
+
+        if (not buy) and pos["quantity"] == 0:
+            self._state["round_trips"] += 1
+            self._save()
+            net = self._state["cash"] - self._state["start_capital"]
+            self._notify(
+                f"📒 PAPER LEDGER\n"
+                f"📌 {o['tradingsymbol']} closed: ₹{realized_now:+,.0f} (before charges)\n"
+                f"💸 Charges so far: ₹{self._state['charges']:,.0f} "
+                f"({self._state['round_trips']} round trips)\n"
+                f"💼 Balance: ₹{self._state['cash']:,.0f}  "
+                f"(start ₹{self._state['start_capital']:,.0f}, net ₹{net:+,.0f})"
+            )
+        else:
+            self._save()
+
+    def _eod_squareoff(self):
+        """Previous-day MIS positions → close at last price + auto square-off fee."""
+        today = self._today()
+        for pkey, pos in list(self._state["positions"].items()):
+            if pos.get("day") == today:
+                continue
+            if pos["quantity"] > 0 and pos["product"] == "MIS":
+                px  = pos.get("last_price") or pos["average_price"]
+                q   = pos["quantity"]
+                rz  = (px - pos["average_price"]) * q
+                self._state["cash"]     += px * q - self._charge - PAPER_AUTOSQ_CHARGE
+                self._state["charges"]  += self._charge + PAPER_AUTOSQ_CHARGE
+                self._state["realized"] += rz
+                self._state["round_trips"] += 1
+                print(f"📝 PAPER auto square-off {pos['tradingsymbol']} @ ₹{px:.2f} ({rz:+.0f})", flush=True)
+            if pos["quantity"] == 0 or pos["product"] == "MIS":
+                del self._state["positions"][pkey]
+            else:
+                pos["day"] = today   # NRML/CNC carry forward
+        self._save()
+
+    # ── simulated API ────────────────────────────────────────────────────────
+    def place_order(self, variety=None, exchange=None, tradingsymbol=None,
+                    transaction_type=None, quantity=None, product=None,
+                    order_type=None, price=None, **kwargs):
+        with self._plock:
+            self._seq += 1
+            oid = f"PAPER{self._seq}"
+            o = {"order_id": oid, "variety": variety, "exchange": exchange,
+                 "tradingsymbol": tradingsymbol, "transaction_type": transaction_type,
+                 "quantity": int(quantity), "product": product,
+                 "order_type": order_type or "LIMIT",
+                 "price": float(price) if price else 0.0,
+                 "status": "OPEN", "average_price": 0.0, "filled_quantity": 0,
+                 "pending_quantity": int(quantity), "status_message": None, "tag": "PAPER",
+                 "order_timestamp": datetime.now(pytz.timezone("Asia/Kolkata"))}
+            self._orders[oid] = o
+            self._try_fill(o)
+            return oid
+
+    def modify_order(self, variety=None, order_id=None, **kwargs):
+        with self._plock:
+            o = self._orders.get(order_id)
+            if not o:
+                raise Exception(f"PAPER: unknown order {order_id}")
+            if o["status"] != "OPEN":
+                raise Exception(f"PAPER: order {order_id} is {o['status']}")
+            if kwargs.get("price") is not None:
+                o["price"] = float(kwargs["price"])
+            if kwargs.get("order_type"):
+                o["order_type"] = kwargs["order_type"]
+            if kwargs.get("quantity"):
+                o["quantity"] = int(kwargs["quantity"])
+            self._try_fill(o)
+            return order_id
+
+    def cancel_order(self, variety=None, order_id=None, **kwargs):
+        with self._plock:
+            o = self._orders.get(order_id)
+            if o and o["status"] == "OPEN":
+                o["status"] = "CANCELLED"
+            return order_id
+
+    def orders(self):
+        with self._plock:
+            for o in self._orders.values():
+                self._try_fill(o)
+            return [dict(o) for o in self._orders.values()]
+
+    def order_history(self, order_id):
+        with self._plock:
+            o = self._orders.get(order_id)
+            if o:
+                self._try_fill(o)
+                return [dict(o)]
+            return []
+
+    def trades(self):
+        with self._plock:
+            return [dict(t) for t in self._fills]
+
+    def positions(self):
+        with self._plock:
+            self._eod_squareoff()
+            out = []
+            for pos in self._state["positions"].values():
+                p = dict(pos)
+                if p["quantity"] != 0:
+                    lp = self._ltp(p["exchange"], p["tradingsymbol"])
+                    if lp:
+                        pos["last_price"] = p["last_price"] = lp
+                unreal = (p["last_price"] - p["average_price"]) * p["quantity"]
+                p.update({
+                    "pnl": round(p["realised"] + unreal, 2),
+                    "m2m": round(p["realised"] + unreal, 2),
+                    "unrealised": round(unreal, 2),
+                    "buy_price":  p["buy_value"] / p["buy_quantity"] if p["buy_quantity"] else 0,
+                    "sell_price": p["sell_value"] / p["sell_quantity"] if p["sell_quantity"] else 0,
+                    "overnight_quantity": 0, "multiplier": 1, "instrument_token": 0,
+                    "value": p["sell_value"] - p["buy_value"],
+                })
+                out.append(p)
+            return {"net": out, "day": [dict(x) for x in out]}
+
+    def margins(self, segment=None):
+        with self._plock:
+            cash = round(self._state["cash"], 2)
+            used = sum(p["average_price"] * p["quantity"]
+                       for p in self._state["positions"].values() if p["quantity"] > 0)
+            seg = {"enabled": True, "net": cash,
+                   "available": {"cash": cash, "live_balance": cash, "opening_balance": cash,
+                                 "collateral": 0, "adhoc_margin": 0, "intraday_payin": 0},
+                   "utilised": {"debits": round(used, 2), "exposure": 0, "span": 0,
+                                "option_premium": round(used, 2)}}
+            full = {"equity": seg, "commodity": dict(seg)}
+            return full.get(segment, full) if segment else full
+
+    def summary(self):
+        s = self._state
+        return (f"💼 Paper balance ₹{s['cash']:,.0f} (start ₹{s['start_capital']:,.0f}, "
+                f"net ₹{s['cash'] - s['start_capital']:+,.0f}) | gross P&L ₹{s['realized']:+,.0f} "
+                f"| charges ₹{s['charges']:,.0f} | {s['round_trips']} round trips")
+
+
+if PAPER_TRADE:
+    kite = PaperKite(kite, PAPER_CAPITAL, PAPER_CHARGES_PER_ORDER, PAPER_STATE_FILE)
+    print("📝" * 20, flush=True)
+    print(f"📝 PAPER TRADING MODE — no real orders will be placed. {kite.summary()}", flush=True)
+    print("📝" * 20, flush=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔑 AUTO LOGIN — Zerodha TOTP + Kite Connect token refresh
@@ -996,6 +1303,17 @@ DELTA_MAX_LOSS_USD  = float(os.environ.get("DELTA_MAX_LOSS_USD", "20"))  # $20 d
 DELTA_PROFIT_USD    = float(os.environ.get("DELTA_PROFIT_USD",  "30"))   # $30 daily target
 DELTA_CANDLE_TF     = os.environ.get("DELTA_CANDLE_TF",    "15m")       # 15m / 1h / 4h
 DELTA_TESTNET       = os.environ.get("DELTA_TESTNET",      "false").lower() == "true"
+
+if PAPER_TRADE:
+    _paper_warn = ""
+    if ENABLE_DELTA and not DELTA_TESTNET:
+        _paper_warn = ("\n⚠️ Delta Exchange is NOT simulated — ENABLE_DELTA=true with live keys "
+                       "will place REAL crypto orders. Set ENABLE_DELTA=false or DELTA_TESTNET=true.")
+        print(_paper_warn, flush=True)
+    try:
+        send_message(f"📝 PAPER TRADING MODE ON — no real Kite orders\n{kite.summary()}{_paper_warn}")
+    except Exception:
+        pass
 DELTA_BASE_URL      = ("https://cdn-ind.testnet.deltaex.org" if DELTA_TESTNET
                        else "https://api.india.delta.exchange")
 
@@ -1063,11 +1381,100 @@ ENABLE_CRUDE      = os.environ.get("ENABLE_CRUDE",      "false").lower() == "tru
 ENABLE_SWING      = os.environ.get("ENABLE_SWING",      "false").lower() == "true"
 
 # ── Daily Trade Limits ────────────────────────────────────────────────────────
-MAX_NIFTY_TRADES_PER_DAY      = int(os.environ.get("MAX_NIFTY_TRADES",     "4"))
-MAX_BANKNIFTY_TRADES_PER_DAY  = int(os.environ.get("MAX_BANKNIFTY_TRADES", "4"))
-MAX_FINNIFTY_TRADES_PER_DAY   = int(os.environ.get("MAX_FINNIFTY_TRADES",  "4"))
-MAX_SENSEX_TRADES_PER_DAY     = int(os.environ.get("MAX_SENSEX_TRADES",    "4"))
+# P&L review (Apr–Oct 2026): 438 round trips, charges ≈ ₹52 per round trip,
+# gross edge ≈ -₹17/trade → every extra trade costs money. Defaults cut to 3.
+MAX_NIFTY_TRADES_PER_DAY      = int(os.environ.get("MAX_NIFTY_TRADES",     "3"))
+MAX_BANKNIFTY_TRADES_PER_DAY  = int(os.environ.get("MAX_BANKNIFTY_TRADES", "3"))
+MAX_FINNIFTY_TRADES_PER_DAY   = int(os.environ.get("MAX_FINNIFTY_TRADES",  "3"))
+MAX_SENSEX_TRADES_PER_DAY     = int(os.environ.get("MAX_SENSEX_TRADES",    "3"))
 MAX_CRUDE_TRADES_PER_DAY      = int(os.environ.get("MAX_CRUDE_TRADES",     "3"))
+
+# ── Minimum option premium (P&L review) ───────────────────────────────────────
+# NIFTY options bought at ₹20–35 lost ₹4,384 gross over 149 lots (+~₹7,800
+# charges). Cheap far-OTM strikes need a huge move just to cover ₹52 charges.
+MIN_PREMIUM_NIFTY     = float(os.environ.get("MIN_PREMIUM_NIFTY",     "40"))
+MIN_PREMIUM_BANKNIFTY = float(os.environ.get("MIN_PREMIUM_BANKNIFTY", "60"))
+MIN_PREMIUM_FINNIFTY  = float(os.environ.get("MIN_PREMIUM_FINNIFTY",  "40"))
+MIN_PREMIUM_SENSEX    = float(os.environ.get("MIN_PREMIUM_SENSEX",    "60"))
+MIN_PREMIUM_CRUDE     = float(os.environ.get("MIN_PREMIUM_CRUDE",     "10"))
+
+# ── Entry cutoff / force-exit time (index options) ────────────────────────────
+# 10 Zerodha auto square-offs (₹59 each) in the statement → exit earlier so
+# retries have time to fill before the broker's 3:25 PM square-off.
+ENTRY_CUTOFF_TIME = os.environ.get("ENTRY_CUTOFF_TIME", "14:45")   # no new entries after
+FORCE_EXIT_TIME   = os.environ.get("FORCE_EXIT_TIME",   "15:12")   # close open trades at
+
+def _hhmm(s, default):
+    try:
+        h, m = str(s).strip().split(":")
+        return int(h), int(m)
+    except Exception:
+        return default
+
+_ENTRY_CUTOFF_HM = _hhmm(ENTRY_CUTOFF_TIME, (14, 45))
+_FORCE_EXIT_HM   = _hhmm(FORCE_EXIT_TIME,   (15, 12))
+
+def _past_hm(now, hm):
+    return (now.hour, now.minute) >= hm
+
+# ── One trade per trend leg ───────────────────────────────────────────────────
+# Each HalfTrend arrow = one trend leg. After one entry on a leg, no further
+# entries in that direction until a NEW arrow prints. Stops the repeated
+# "carry-over" re-entries (6 SENSEX PUT re-entries in one morning, 16 Jun).
+ONE_TRADE_PER_TREND = os.environ.get("ONE_TRADE_PER_TREND", "true").lower() == "true"
+_trend_leg_traded   = {}   # instrument -> (signal, arrow_bar_time) already traded
+_pending_leg        = {}   # instrument -> leg that last passed entry filters
+
+def _trend_leg_key(signal, ht_df):
+    """Identify the current trend leg by its HalfTrend arrow bar time."""
+    try:
+        if ht_df is None or len(ht_df) < 4:
+            return None
+        _sig, _idx, _fresh = get_last_active_signal(ht_df)
+        if _idx is None:
+            return None
+        _row = ht_df.iloc[_idx]
+        _t = _row["date"] if "date" in _row else ht_df.index[_idx]
+        return (signal, str(_t))
+    except Exception as _e:
+        print(f"⚠️ trend-leg key failed: {_e}", flush=True)
+        return None
+
+# ── Monthly loss stop ─────────────────────────────────────────────────────────
+# Stops new entries for the rest of the calendar month once this month's
+# P&L (trade log, minus estimated charges per round trip) reaches -limit.
+MONTHLY_MAX_LOSS       = float(os.environ.get("MONTHLY_MAX_LOSS", "2000"))
+CHARGES_PER_TRADE_EST  = float(os.environ.get("CHARGES_PER_TRADE_EST", "52"))
+_month_pnl_cache       = {"t": 0, "v": 0.0, "n": 0}
+
+def _month_pnl_net():
+    """This calendar month's P&L from the trade log, net of estimated charges."""
+    if time.time() - _month_pnl_cache["t"] < 60:
+        return _month_pnl_cache["v"], _month_pnl_cache["n"]
+    total, n = 0.0, 0
+    try:
+        import csv as _csv
+        _month = datetime.now(IST).strftime("%Y-%m")
+        _log = globals().get("TRADE_LOG_FILE", "trade_log.csv")
+        if os.path.exists(_log):
+            with open(_log) as _f:
+                for row in _csv.DictReader(_f):
+                    if not str(row.get("time", "")).startswith(_month):
+                        continue
+                    try:
+                        total += float(row.get("pnl") or 0) - CHARGES_PER_TRADE_EST
+                        n += 1
+                    except ValueError:
+                        pass
+    except Exception as _e:
+        print(f"⚠️ monthly P&L read failed: {_e}", flush=True)
+    _month_pnl_cache.update(t=time.time(), v=total, n=n)
+    return total, n
+
+print(f"⚙️ Trade limits/day: NIFTY={MAX_NIFTY_TRADES_PER_DAY} BN={MAX_BANKNIFTY_TRADES_PER_DAY} "
+      f"SENSEX={MAX_SENSEX_TRADES_PER_DAY} | Min premium NIFTY=₹{MIN_PREMIUM_NIFTY:.0f} "
+      f"BN=₹{MIN_PREMIUM_BANKNIFTY:.0f} SENSEX=₹{MIN_PREMIUM_SENSEX:.0f} | "
+      f"Entry cutoff {ENTRY_CUTOFF_TIME} | Force exit {FORCE_EXIT_TIME}", flush=True)
 
 # ── Swing Trade Settings ──────────────────────────────────────────────────────
 SWING_STOCKS_FILE        = "stocks.txt"  # one NSE symbol per line (e.g. RELIANCE)
@@ -1198,7 +1605,12 @@ last_exit_time_nifty = 0
 REENTRY_COOLDOWN = 600  # 10 min
 CRUDE_SYMBOL = None
 
-TRADE_LOG_FILE = "trade_log.csv"
+# Paper trades go to a separate log so they never mix with live history
+# (consecutive-loss checks, monthly stop, reports all read this file).
+TRADE_LOG_FILE = "paper_trade_log.csv" if PAPER_TRADE else "trade_log.csv"
+if not os.path.exists(TRADE_LOG_FILE):
+    with open(TRADE_LOG_FILE, "w") as _tlf:
+        _tlf.write("time,instrument,symbol,signal,entry,exit,pnl,probability\n")
 last_executed_signal_crude = None
 CRUDE_TOKEN = config.CRUDE_TOKEN
 BANKNIFTY_TOKEN = getattr(config, "BANKNIFTY_TOKEN", None)
@@ -1906,6 +2318,30 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                     print(f"✅ IP check passed — resuming", flush=True)
         return False, "🚫 IP blocked — fix whitelist at developers.kite.trade"
     now_ist = datetime.now(IST)
+
+    # ── Monthly loss stop ─────────────────────────────────────────────────────
+    if MONTHLY_MAX_LOSS > 0:
+        _mp, _mn = _month_pnl_net()
+        if _mp <= -MONTHLY_MAX_LOSS:
+            _mkey = now_ist.strftime("%Y-%m-%d")
+            if getattr(apply_entry_filters, "_monthly_alerted", None) != _mkey:
+                apply_entry_filters._monthly_alerted = _mkey
+                send_message(
+                    f"🛑 MONTHLY STOP HIT\n"
+                    f"📉 This month: ₹{_mp:,.0f} after est. charges ({_mn} trades)\n"
+                    f"🔒 No new entries until next month (MONTHLY_MAX_LOSS=₹{MONTHLY_MAX_LOSS:,.0f})\n"
+                    f"👉 Review the trades before changing settings"
+                )
+            return False, (f"🛑 Monthly loss stop — ₹{_mp:,.0f} this month "
+                           f"(limit -₹{MONTHLY_MAX_LOSS:,.0f}) — paused until next month")
+
+    # ── One trade per trend leg ───────────────────────────────────────────────
+    if ONE_TRADE_PER_TREND:
+        _leg = _trend_leg_key(signal, kwargs.get("ht_df"))
+        if _leg and _trend_leg_traded.get(instrument) == _leg:
+            return False, (f"🔂 One trade per trend — {signal} leg (arrow {_leg[1][:16]}) "
+                           f"already traded; waiting for next HalfTrend arrow")
+        _pending_leg[instrument] = _leg
 
     # ── Daily max loss — stop all trading if loss too deep ───────────────────
     if DAILY_MAX_LOSS > 0 and _daily_max_loss_hit:
@@ -4192,6 +4628,12 @@ def find_option(signal, instrument):
 
     print("🧠 find_option received:", signal)
 
+    # ⏰ Entry cutoff for index options — skip the option-chain scan entirely
+    if instrument != "CRUDE" and _past_hm(datetime.now(IST), _ENTRY_CUTOFF_HM):
+        print(f"⏰ {instrument}: past entry cutoff {ENTRY_CUTOFF_TIME} — no new entries", flush=True)
+        time.sleep(50)   # loop sleeps 10s more → ~1 check/min instead of hammering quotes
+        return None, None, None, None
+
     symbol = None
     price = None
     lot = None
@@ -4425,12 +4867,30 @@ def find_option(signal, instrument):
     # CRUDE:  ₹10  (1 lot = 100 barrels — below ₹10 is too illiquid)
     # SENSEX: ₹30  (lot size = 10 — need meaningful premium)
     # NIFTY / BANKNIFTY: ₹20
-    if instrument == "CRUDE":
-        min_price = 10
-    elif instrument == "SENSEX":
-        min_price = 30
-    else:
-        min_price = 20
+    min_price = {
+        "NIFTY":     MIN_PREMIUM_NIFTY,
+        "BANKNIFTY": MIN_PREMIUM_BANKNIFTY,
+        "FINNIFTY":  MIN_PREMIUM_FINNIFTY,
+        "SENSEX":    MIN_PREMIUM_SENSEX,
+        "CRUDE":     MIN_PREMIUM_CRUDE,
+    }.get(instrument, 40)
+
+    # Balance tier allows only premiums below the minimum → no viable strike.
+    if max_price < min_price:
+        msg = (f"⚠️ {instrument}: balance ₹{balance:.0f} only allows premium ≤ ₹{max_price} "
+               f"but minimum premium is ₹{min_price:.0f} — skipping (cheap far-OTM options "
+               f"lost money in the P&L review)")
+        print(msg, flush=True)
+        _k = f"_minprem_alert_{instrument}"
+        if time.time() - getattr(find_option, _k, 0) > 86400:
+            setattr(find_option, _k, time.time())
+            send_message(
+                f"💸 {instrument} SKIPPED — premium too cheap\n"
+                f"💰 Balance ₹{balance:.0f} → max premium ₹{max_price}\n"
+                f"📏 Min premium ₹{min_price:.0f} (MIN_PREMIUM_{instrument})\n"
+                f"👉 Add funds or lower MIN_PREMIUM_{instrument} in Railway"
+            )
+        return None, None, None, None
 
     candidates = []
 
@@ -4523,13 +4983,14 @@ def find_option(signal, instrument):
     # =====================================
     if candidates:
         if balance <= 10000:
-            # low balance = cheapest first
+            # low balance: closest to target strike first (NOT cheapest —
+            # cheapest-first kept picking ₹20–35 far-OTM strikes that lost money)
             best = sorted(
                 candidates,
                 key=lambda x: (
-                    x["price"],
                     x["diff"],
-                    -x["score"]
+                    -x["score"],
+                    x["price"]
                 )
             )[0]
         else:
@@ -4630,8 +5091,8 @@ def find_option(signal, instrument):
             best = sorted(
                 fallback,
                 key=lambda x: (
-                    x["price"],
-                    x["diff"]
+                    x["diff"],
+                    x["price"]
                 )
             )[0]
         else:
@@ -4679,6 +5140,16 @@ def place_order(symbol, qty, exchange, instrument):
         (now.hour == 15 and now.minute < 20)
     ):
         print("🚫 Market closed or before 9:20 AM — skipping order")
+        return None
+
+    # ⏰ Entry cutoff — late entries have no time to develop and end in
+    # force-close / broker auto square-off (₹59 each).
+    if exchange in ("NFO", "BFO") and _past_hm(now, _ENTRY_CUTOFF_HM):
+        print(f"🚫 {instrument}: past entry cutoff {ENTRY_CUTOFF_TIME} — skipping new order", flush=True)
+        _k = f"_cutoff_alert_{instrument}"
+        if time.time() - getattr(place_order, _k, 0) > 43200:
+            setattr(place_order, _k, time.time())
+            send_message(f"⏰ {instrument}: no new entries after {ENTRY_CUTOFF_TIME} (ENTRY_CUTOFF_TIME)")
         return None
 
     # 🚫 STRICT OPTION ONLY (REPLACE THIS BLOCK)
@@ -5023,12 +5494,12 @@ def manage_trade(symbol, entry, qty, exchange, instrument, signal, probability, 
             _now = datetime.now(IST)
             _is_weekend = _now.weekday() >= 5   # Saturday=5, Sunday=6
             _nifty_time_over     = (instrument in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX") and
-                                    (_now.hour > 15 or (_now.hour == 15 and _now.minute >= 20)))
+                                    _past_hm(_now, _FORCE_EXIT_HM))
             _crude_time_over     = (instrument == "CRUDE" and
                                     (_now.hour == 23 and _now.minute >= 25))
             if (_is_weekend or _nifty_time_over or _crude_time_over) and not exit_done:
                 _reason = ("weekend" if _is_weekend
-                           else f"{instrument} 3:20 PM force close" if _nifty_time_over
+                           else f"{instrument} {FORCE_EXIT_TIME} force close" if _nifty_time_over
                            else "CRUDE 11:25 PM force close")
                 # Compute live P&L for the message (current_pnl computed later in loop)
                 _ltp_now = ltp if ltp else entry
@@ -6245,6 +6716,13 @@ def run_trade_wrapper(symbol, price, lot, exchange, instrument, signal, probabil
             else:                           crude_trade_active = False
             global_trade_active = nifty_trade_active or banknifty_trade_active or finnifty_trade_active or sensex_trade_active or crude_trade_active
         return
+
+    # ── Record this trend leg as used (one trade per trend) ──────────────────
+    if ONE_TRADE_PER_TREND:
+        _leg = _pending_leg.get(instrument)
+        if _leg and _leg[0] == signal:
+            _trend_leg_traded[instrument] = _leg
+            print(f"🔂 {instrument}: trend leg {_leg} marked as traded", flush=True)
 
     _pnl_result = [0]   # mutable container to receive pnl from manage_trade
     pnl = 0             # fallback if manage_trade exits abnormally

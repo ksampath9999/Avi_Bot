@@ -1540,6 +1540,16 @@ BE_BUFFER_RS     = float(os.environ.get("BE_BUFFER_RS",     "60"))   # covers ~�
 _BSO = os.environ.get("BUY_STRIKE_OFFSET", "").strip()
 BUY_STRIKE_OFFSET = int(_BSO) if _BSO.lstrip("-").isdigit() else None
 
+# ── Option-buying direction confirmation ──────────────────────────────────────
+# The HalfTrend arrow still TRIGGERS entries. BUY_SIGNAL must AGREE (on the last
+# closed entry-timeframe candle) before the order goes in.
+#   halftrend (default) = no extra check │ supertrend │ ema │ hull │ donchian │
+#   vote (≥BUY_VOTE_MIN of 5 agree).  BUY_ADX_MIN>0 also blocks weak trends.
+# Pick the winner with: python3 backtest_option_buying.py --compare-signals
+BUY_SIGNAL   = os.environ.get("BUY_SIGNAL", "halftrend").lower()
+BUY_ADX_MIN  = float(os.environ.get("BUY_ADX_MIN", "0"))
+BUY_VOTE_MIN = int(os.environ.get("BUY_VOTE_MIN", "4"))
+
 # ── One trade per trend leg ───────────────────────────────────────────────────
 # Each HalfTrend arrow = one trend leg. After one entry on a leg, no further
 # entries in that direction until a NEW arrow prints. Stops the repeated
@@ -2457,6 +2467,22 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
                 )
             return False, (f"🛑 Monthly loss stop — ₹{_mp:,.0f} this month "
                            f"(limit -₹{MONTHLY_MAX_LOSS:,.0f}) — paused until next month")
+
+    # ── Direction confirmation (BUY_SIGNAL / BUY_ADX_MIN) ─────────────────────
+    if (BUY_SIGNAL != "halftrend" or BUY_ADX_MIN > 0) and df_15m is not None and len(df_15m) >= 60:
+        try:
+            if BUY_SIGNAL not in CS_SIGNAL_METHODS:
+                raise ValueError(f"unknown BUY_SIGNAL {BUY_SIGNAL!r}")
+            _bs_sig = cs_direction_series(df_15m, BUY_SIGNAL, ht_amplitude=HT_AMPLITUDE,
+                                          adx_min=BUY_ADX_MIN, vote_min=BUY_VOTE_MIN)
+            _bs_last = int(_bs_sig[-2])                       # last CLOSED candle
+            _want = 1 if signal == "CALL" else -1
+            if _bs_last != _want:
+                _says = {1: "bullish", -1: "bearish", 0: "no clear trend"}[_bs_last]
+                return False, (f"🧭 {BUY_SIGNAL}{f'+ADX≥{BUY_ADX_MIN:.0f}' if BUY_ADX_MIN else ''} "
+                               f"says {_says} — {signal} not confirmed")
+        except Exception as _bse:
+            print(f"⚠️ BUY_SIGNAL check skipped: {_bse}", flush=True)
 
     # ── One trade per trend leg ───────────────────────────────────────────────
     if ONE_TRADE_PER_TREND:
@@ -13259,9 +13285,122 @@ def options_selling_loop():
             time.sleep(30)
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 🧭 DIRECTION SIGNALS — shared by the credit-spread module AND the backtest
+# (backtest_credit_spread.py loads these exact functions from this file)
+# Each returns a numpy array per bar: +1 bullish, -1 bearish, 0 no signal.
+# ═══════════════════════════════════════════════════════════════════════════
+def _csig_ema(df, fast=20, slow=50):
+    c = df["close"].astype(float)
+    f = c.ewm(span=fast, adjust=False).mean()
+    s = c.ewm(span=slow, adjust=False).mean()
+    return np.where(f > s, 1, -1)
+
+
+def _csig_hma(df, length=55):
+    """Hull Suite style: HMA rising vs 2 bars ago → bullish."""
+    c = df["close"].astype(float)
+    def wma(x, n):
+        w = np.arange(1, n + 1, dtype=float)
+        v = np.convolve(x.to_numpy(dtype=float), w[::-1] / w.sum(), mode="full")[:len(x)]
+        v[:n - 1] = np.nan
+        return pd.Series(v, index=x.index)
+    half, sq = max(1, length // 2), max(1, int(round(length ** 0.5)))
+    hma = wma(2 * wma(c, half) - wma(c, length), sq)
+    sig = np.where(hma > hma.shift(2), 1, -1)
+    sig[hma.isna().to_numpy() | hma.shift(2).isna().to_numpy()] = 0
+    return sig
+
+
+def _csig_supertrend(df, period=10, mult=3.0):
+    h, l, c = (df[k].astype(float).to_numpy() for k in ("high", "low", "close"))
+    n = len(c)
+    tr = np.maximum(h[1:] - l[1:], np.maximum(abs(h[1:] - c[:-1]), abs(l[1:] - c[:-1])))
+    tr = np.concatenate([[h[0] - l[0]], tr])
+    atr = pd.Series(tr).ewm(alpha=1 / period, adjust=False).mean().to_numpy()
+    hl2 = (h + l) / 2
+    ub, lb = hl2 + mult * atr, hl2 - mult * atr
+    fub, flb = ub.copy(), lb.copy()
+    sig = np.zeros(n, dtype=int)
+    sig[0] = 1
+    for i in range(1, n):
+        fub[i] = ub[i] if (ub[i] < fub[i - 1] or c[i - 1] > fub[i - 1]) else fub[i - 1]
+        flb[i] = lb[i] if (lb[i] > flb[i - 1] or c[i - 1] < flb[i - 1]) else flb[i - 1]
+        if sig[i - 1] == 1:
+            sig[i] = -1 if c[i] < flb[i] else 1
+        else:
+            sig[i] = 1 if c[i] > fub[i] else -1
+    sig[:period] = 0
+    return sig
+
+
+def _csig_donchian(df, n=20):
+    """Breakout regime: close above prior n-bar high → bull until close below prior n-bar low."""
+    c = df["close"].astype(float)
+    hh = df["high"].astype(float).rolling(n).max().shift(1)
+    ll = df["low"].astype(float).rolling(n).min().shift(1)
+    sig = np.zeros(len(df), dtype=int)
+    state = 0
+    for i, (ci, hi, lo) in enumerate(zip(c, hh, ll)):
+        if not np.isnan(hi):
+            if ci > hi:
+                state = 1
+            elif ci < lo:
+                state = -1
+        sig[i] = state
+    return sig
+
+
+def _csig_adx(df, period=14):
+    h, l, c = (df[k].astype(float) for k in ("high", "low", "close"))
+    up, dn = h.diff(), -l.diff()
+    pdm = np.where((up > dn) & (up > 0), up, 0.0)
+    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    a = 1 / period
+    atr = tr.ewm(alpha=a, adjust=False).mean()
+    pdi = 100 * pd.Series(pdm, index=df.index).ewm(alpha=a, adjust=False).mean() / atr
+    mdi = 100 * pd.Series(mdm, index=df.index).ewm(alpha=a, adjust=False).mean() / atr
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return dx.ewm(alpha=a, adjust=False).mean().fillna(0).to_numpy()
+
+
+CS_SIGNAL_METHODS = ("halftrend", "supertrend", "ema", "hull", "donchian", "vote")
+
+
+def cs_direction_series(df, method="halftrend", ht_amplitude=2, adx_min=0.0, vote_min=4):
+    """
+    Direction per bar for credit spreads: +1 bull, -1 bear, 0 = stand aside.
+    method   : halftrend | supertrend | ema | hull | donchian | vote
+    vote     : needs ≥ vote_min of the 5 indicators agreeing, else 0
+    adx_min  : >0 → also 0 when ADX(14) below this (weak / no trend)
+    """
+    df = df.reset_index(drop=True)
+    def ht():
+        t = halftrend_tv(df[["open", "high", "low", "close"]].copy(),
+                         amplitude=ht_amplitude, channel_deviation=2)["trend"].to_numpy()
+        return np.where(t == 0, 1, -1)
+    makers = {"halftrend": ht, "supertrend": lambda: _csig_supertrend(df),
+              "ema": lambda: _csig_ema(df), "hull": lambda: _csig_hma(df),
+              "donchian": lambda: _csig_donchian(df)}
+    if method == "vote":
+        stack = np.vstack([m() for m in makers.values()])
+        bull, bear = (stack == 1).sum(axis=0), (stack == -1).sum(axis=0)
+        sig = np.where(bull >= vote_min, 1, np.where(bear >= vote_min, -1, 0))
+    elif method in makers:
+        sig = np.asarray(makers[method]())
+    else:
+        raise ValueError(f"unknown signal method {method!r} — use one of {CS_SIGNAL_METHODS}")
+    if adx_min and adx_min > 0:
+        sig = np.where(_csig_adx(df) >= adx_min, sig, 0)
+    return sig.astype(int)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 🟦 CREDIT SPREAD MODULE — trend-directional, defined-risk premium selling
 # ═══════════════════════════════════════════════════════════════════════════
-# Uptrend   (HalfTrend bullish on CS_TIMEFRAME) → BULL PUT SPREAD
+# Direction : CS_SIGNAL on CS_TIMEFRAME — halftrend | supertrend | ema | hull |
+#             donchian | vote (≥CS_VOTE_MIN of 5 agree); optional ADX gate.
+# Uptrend   (signal bullish on CS_TIMEFRAME)    → BULL PUT SPREAD
 #           sell OTM put (~CS_SHORT_DELTA), buy put CS_WIDTH points lower
 # Downtrend (HalfTrend bearish)                 → BEAR CALL SPREAD
 #           sell OTM call (~CS_SHORT_DELTA), buy call CS_WIDTH points higher
@@ -13304,6 +13443,13 @@ CS_STOP_MULT     = float(os.environ.get("CS_STOP_MULT", "0"))
 CS_EXIT_ON_FLIP  = os.environ.get("CS_EXIT_ON_FLIP", "false").lower() == "true"
 CS_TIMEFRAME     = os.environ.get("CS_TIMEFRAME", "60minute")
 CS_HT_AMPLITUDE  = int(os.environ.get("CS_HT_AMPLITUDE", "2"))
+# Direction source — pick the winner from: python3 backtest_credit_spread.py --compare-signals
+CS_SIGNAL        = os.environ.get("CS_SIGNAL", "halftrend").lower()
+if CS_SIGNAL not in CS_SIGNAL_METHODS:
+    print(f"⚠️ CS_SIGNAL={CS_SIGNAL!r} unknown — using halftrend. Options: {CS_SIGNAL_METHODS}", flush=True)
+    CS_SIGNAL = "halftrend"
+CS_ADX_MIN       = float(os.environ.get("CS_ADX_MIN", "0"))     # 0 = off; e.g. 20 = skip weak trends
+CS_VOTE_MIN      = int(os.environ.get("CS_VOTE_MIN", "4"))      # for CS_SIGNAL=vote: agree out of 5
 CS_ENTRY_START   = os.environ.get("CS_ENTRY_START", "09:45")
 CS_ENTRY_END     = os.environ.get("CS_ENTRY_END", "14:30")
 CS_VIX_MAX       = float(os.environ.get("CS_VIX_MAX", "24"))
@@ -13392,14 +13538,21 @@ def _cs_years_to_expiry(expiry_date, now):
 
 # ── market helpers ───────────────────────────────────────────────────────────
 def _cs_trend(instrument):
-    """Returns ("BULL"|"BEAR"|None, stable_2bars: bool)."""
+    """Returns ("BULL"|"BEAR"|None, stable_2bars: bool) from CS_SIGNAL on closed bars."""
     spec = _CS_SPEC[instrument]
     df = get_cached_data(spec["token"], CS_TIMEFRAME, 300)
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 60:
         return None, False
-    ht = halftrend_tv(df, amplitude=CS_HT_AMPLITUDE, channel_deviation=2)
-    t1, t2 = int(ht.iloc[-2]["trend"]), int(ht.iloc[-3]["trend"])
-    return ("BULL" if t1 == 0 else "BEAR"), (t1 == t2)
+    try:
+        sig = cs_direction_series(df, CS_SIGNAL, ht_amplitude=CS_HT_AMPLITUDE,
+                                  adx_min=CS_ADX_MIN, vote_min=CS_VOTE_MIN)
+    except Exception as e:
+        print(f"⚠️ CS signal error ({CS_SIGNAL}): {e}", flush=True)
+        return None, False
+    s1, s2 = int(sig[-2]), int(sig[-3])          # last two CLOSED bars
+    if s1 == 0:
+        return None, False                       # signal says stand aside
+    return ("BULL" if s1 > 0 else "BEAR"), (s1 == s2)
 
 
 def _cs_ltps(exchange, symbols):
@@ -13730,7 +13883,8 @@ def credit_spread_loop(instrument):
                 reason = "monthly loss stop active"
             trend, stable = _cs_trend(instrument)
             if not reason and (trend is None or not stable):
-                reason = "trend not stable for 2 closed bars"
+                reason = (f"{CS_SIGNAL}: no clear direction" if trend is None
+                          else f"{CS_SIGNAL}: direction not stable for 2 closed bars")
             if trend and meta.get("blocked_dir") and meta["blocked_dir"] != trend:
                 meta["blocked_dir"] = None            # trend flipped → unblock
                 _cs_save()
@@ -14028,7 +14182,8 @@ if __name__ == "__main__":
         for _csi in CS_INSTRUMENTS:
             threading.Thread(target=credit_spread_loop, args=(_csi,), daemon=True,
                              name=f"CreditSpread_{_csi}").start()
-        send_message(f"🟦 Credit spreads ON — {', '.join(CS_INSTRUMENTS)} │ "
+        send_message(f"🟦 Credit spreads ON — {', '.join(CS_INSTRUMENTS)} │ signal {CS_SIGNAL}"
+                     f"{f' (ADX≥{CS_ADX_MIN:.0f})' if CS_ADX_MIN > 0 else ''} │ "
                      f"Δ{CS_SHORT_DELTA} │ target {CS_TARGET_PCT:.0%} │ "
                      f"{'stop ' + str(CS_STOP_MULT) + '× credit' if CS_STOP_MULT > 0 else 'loss capped by hedge'}")
     else:

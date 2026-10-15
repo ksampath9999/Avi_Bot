@@ -1,13 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║  CREDIT-SPREAD BACKTEST — trend-directional bull put / bear call spreads ║
-║  Mirrors the bot's credit_spread_loop rules (same HalfTrend code).       ║
+║  Mirrors the bot's credit_spread_loop rules and uses the bot's own       ║
+║  direction-signal code (HalfTrend, Supertrend, EMA, Hull, Donchian, vote)║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 HOW TO RUN (pick one data source)
 
   A) From Kite — on Railway (uses the bot's own auto-login, no token needed):
-       python3 backtest_credit_spread.py --days 730 --compare
+       python3 backtest_credit_spread.py --days 730 --compare-signals
+       (ranks every direction signal; then dig into one with --signal X --compare)
      or anywhere with a token:
        KITE_API_KEY=xxx KITE_ACCESS_TOKEN=yyy python3 backtest_credit_spread.py --days 730 --compare
 
@@ -19,7 +21,10 @@ HOW TO RUN (pick one data source)
        python3 backtest_credit_spread.py --synthetic
 
 Useful flags
-  --instrument NIFTY|SENSEX     --compare   (also runs random-direction baseline)
+  --signal halftrend|supertrend|ema|hull|donchian|vote   (default: CS_SIGNAL or halftrend)
+  --adx-min 20                  skip entries when ADX(14) < 20 (weak trend)
+  --compare-signals             table of ALL signals + put-only + random baselines
+  --instrument NIFTY|SENSEX     --compare   (random-direction baseline for one signal)
   --capital 150000              --out cs_backtest_trades.csv
 
 WHAT THIS IS — AND IS NOT
@@ -42,18 +47,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def _load_bot_functions():
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
     tree = ast.parse(src)
-    want = {"ATR", "halftrend_tv"}
+    want = {"ATR", "halftrend_tv", "_csig_ema", "_csig_hma", "_csig_supertrend",
+            "_csig_donchian", "_csig_adx", "cs_direction_series"}
     code = [ast.get_source_segment(src, n) for n in tree.body
             if isinstance(n, ast.FunctionDef) and n.name in want]
     ns = {"np": np, "pd": pd}
+    for n in tree.body:                      # CS_SIGNAL_METHODS constant
+        if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "CS_SIGNAL_METHODS" for t in n.targets):
+            code.append(ast.get_source_segment(src, n))
     for c in code:
         exec(c, ns)
     missing = want - set(ns)
     if missing:
-        sys.exit(f"Could not load {missing} from main.py")
-    return ns["halftrend_tv"]
+        sys.exit(f"Could not load {missing} from main.py — use the matching main.py version")
+    return ns
 
-halftrend_tv = _load_bot_functions()
+_BOT = _load_bot_functions()
+halftrend_tv = _BOT["halftrend_tv"]
+cs_direction_series = _BOT["cs_direction_series"]
+SIGNALS = _BOT.get("CS_SIGNAL_METHODS", ("halftrend", "supertrend", "ema", "hull", "donchian", "vote"))
 
 # ── Defaults = bot defaults (override with flags) ────────────────────────────
 SPEC = {"NIFTY":  {"token": 256265, "step": 50,  "lot": 65, "width": 100},
@@ -102,9 +114,33 @@ def next_expiry(inst, d, min_dte, max_dte):
             return e
     return None
 
+SESSION_MIN = 375          # 09:15–15:30
+YEAR_MIN = 252 * SESSION_MIN
+
 def years_to(exp, ts):
-    end = datetime.combine(exp, dtime(15, 30))
-    return max((end - ts).total_seconds(), 60) / (365 * 24 * 3600)
+    """
+    Time to expiry on a TRADING-TIME clock (only market minutes count).
+    Price variance accrues only while the market is open, so decay must too —
+    a calendar clock under-charges intraday decay and makes intraday option
+    buying look artificially profitable. India VIX (30 calendar days ≈ 21
+    trading days) maps to this clock within ~1.5%.
+    """
+    open_t, close_t = dtime(9, 15), dtime(15, 30)
+    d0 = ts.date()
+    if d0 > exp:
+        return 60 / (YEAR_MIN * 60)
+    def mins_left_today():
+        t = ts.time()
+        if t <= open_t:
+            return SESSION_MIN
+        if t >= close_t:
+            return 0
+        return (datetime.combine(d0, close_t) - ts).total_seconds() / 60
+    total = mins_left_today() if d0.weekday() < 5 else 0
+    if exp > d0:
+        days_between = int(np.busday_count(d0 + timedelta(days=1), exp))   # full sessions before expiry day
+        total += days_between * SESSION_MIN + SESSION_MIN                  # + expiry-day session
+    return max(total, 1.0) / YEAR_MIN
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
@@ -182,12 +218,17 @@ def charges(sell_turnover, total_turnover):
 
 
 # ── Backtest engine ──────────────────────────────────────────────────────────
+_SIG_CACHE = {}
 def run(df, a, direction_mode="trend", seed=0):
     rng = random.Random(seed)
     sp = SPEC[a.instrument]
     lot, step, width = sp["lot"] * a.lots, sp["step"], a.width or sp["width"]
-    ht = halftrend_tv(df[["open", "high", "low", "close"]].copy(), amplitude=a.amplitude, channel_deviation=2)
-    trend = ht["trend"].to_numpy()
+    key = (id(df), len(df), a.signal, a.amplitude, a.adx_min, a.vote_min)
+    if key not in _SIG_CACHE:                 # indicators computed once per data+setting
+        _SIG_CACHE[key] = cs_direction_series(df[["open", "high", "low", "close"]].copy(), a.signal,
+                                              ht_amplitude=a.amplitude, adx_min=a.adx_min,
+                                              vote_min=a.vote_min)
+    sig = _SIG_CACHE[key]
     trades, pos = [], None
     blocked_dir, last_exit_day = None, None
     slip = lambda p: max(a.slip_min, p * a.slip_pct)
@@ -198,8 +239,8 @@ def run(df, a, direction_mode="trend", seed=0):
         if ts_close.hour == 16:                       # 15:15 bar closes 15:30
             ts_close = ts_close.replace(hour=15, minute=30)
         S, vix, d = float(bar["close"]), float(bar["vix"]), ts_close.date()
-        tr = "BULL" if trend[i] == 0 else "BEAR"
-        stable = trend[i] == trend[i - 1]
+        tr = "BULL" if sig[i] > 0 else "BEAR" if sig[i] < 0 else None
+        stable = tr is not None and sig[i] == sig[i - 1]
         last_bar_of_day = (i + 1 >= len(df)) or (df.iloc[i + 1]["date"].date() != bar["date"].date())
 
         if pos:
@@ -210,15 +251,20 @@ def run(df, a, direction_mode="trend", seed=0):
                         bs(spot, pos["kl"], T, iv_for(spot, pos["kl"], vix, call, a.put_skew, a.call_skew), call))
             adverse = float(bar["high"]) if call else float(bar["low"])
             s_adv, l_adv = legs(adverse)
+            s_op, l_op = legs(float(bar["open"]))
             s_cl, l_cl = legs(S)
             v_adv, v_close = s_adv - l_adv, s_cl - l_cl
             dte = (pos["exp"] - d).days
             reason, fill = None, None
             if a.stop_mult > 0 and v_adv >= pos["credit"] * (1 + a.stop_mult):
-                reason, fill = "STOP", (s_adv, l_adv)       # filled at the bar's worst price
+                stop_v = pos["credit"] * (1 + a.stop_mult)
+                if s_op - l_op >= stop_v:
+                    reason, fill = "STOP", (s_op, l_op)       # gapped through the stop → open price
+                else:                                         # stop level hit intrabar → fill at stop
+                    reason, fill = "STOP", (s_adv * stop_v / max(v_adv, 1e-9), l_adv * stop_v / max(v_adv, 1e-9))
             elif v_close <= pos["credit"] * (1 - a.target):
                 reason, fill = "TARGET", (s_cl, l_cl)
-            elif a.exit_on_flip and tr != pos["tr_entry"]:
+            elif a.exit_on_flip and tr is not None and tr != pos["tr_entry"]:
                 reason, fill = "FLIP", (s_cl, l_cl)
             elif dte < 0 or (dte <= a.exit_dte and last_bar_of_day):
                 reason, fill = "TIME", (s_cl, l_cl)
@@ -243,7 +289,7 @@ def run(df, a, direction_mode="trend", seed=0):
         hm = (ts_close.hour, ts_close.minute)
         if not ((10, 15) <= hm <= (14, 30)) or last_exit_day == d:
             continue
-        if blocked_dir and blocked_dir != tr:
+        if blocked_dir and tr and blocked_dir != tr:
             blocked_dir = None
         # Same gates for both modes; only the spread direction differs
         if not stable or blocked_dir == tr:
@@ -313,6 +359,58 @@ def summarize(t, capital, label):
     return out
 
 
+def _stats(t, capital):
+    if t.empty:
+        return dict(trades=0, win=0, total=0, pct=0, dd=0, worst=0)
+    eq = t["pnl"].cumsum()
+    yrs = max(1, (t["exit_time"].max() - t["entry_time"].min()).days) / 365
+    return dict(trades=len(t), win=(t.pnl > 0).mean() * 100, total=t.pnl.sum(),
+                pct=t.pnl.sum() / yrs / capital * 100, dd=(eq - eq.cummax()).min(), worst=t.pnl.min())
+
+
+def compare_signals(df, a):
+    """Rank every direction signal on the same data, rules and costs."""
+    import copy
+    rows = []
+    variants = [(m, 0.0) for m in SIGNALS]
+    if a.adx_min:
+        variants += [(m, a.adx_min) for m in SIGNALS]
+    for method, adx in variants:
+        b = copy.copy(a); b.signal, b.adx_min = method, adx
+        st = _stats(run(df, b, "trend"), a.capital)
+        rnd = [run(df, b, "random", seed=s).pnl.sum() for s in range(a.random_runs)]
+        st["beat"] = sum(st["total"] > x for x in rnd)
+        st["name"] = method + (f" +ADX≥{adx:.0f}" if adx else "")
+        rows.append(st)
+        print(f"  … {st['name']} done", flush=True)
+    b = copy.copy(a); b.signal, b.adx_min = "halftrend", 0.0
+    st = _stats(run(df, b, "bull"), a.capital); st["beat"] = None; st["name"] = "put spreads only (no direction)"
+    rows.append(st)
+
+    n = a.random_runs
+    print(f"\n━━ DIRECTION SIGNAL COMPARISON — {a.instrument}, {len(df)} hourly bars, "
+          f"₹{a.capital:,.0f} capital, all costs included ━━")
+    print(f"{'signal':<32}{'trades':>7}{'win%':>6}{'total ₹':>11}{'%/yr':>7}{'max DD ₹':>11}{'worst ₹':>9}{'beats random':>14}")
+    for r in sorted(rows, key=lambda r: r["total"], reverse=True):
+        beat = "—" if r["beat"] is None else f"{r['beat']}/{n}"
+        print(f"{r['name']:<32}{r['trades']:>7}{r['win']:>6.0f}{r['total']:>11,.0f}{r['pct']:>7.1f}"
+              f"{r['dd']:>11,.0f}{r['worst']:>9,.0f}{beat:>14}")
+    need = int(np.ceil(0.95 * n))
+    good = [r for r in rows if r["beat"] is not None and r["beat"] >= need and r["total"] > 0]
+    print("\nHow to read: a signal is worth using only if its total is positive AND it beats "
+          f"random direction in ≥{need}/{n} runs (same entry timing, exits and costs).")
+    if good:
+        best = max(good, key=lambda r: r["total"] / max(1, -r["dd"]))
+        print(f"✅ Best risk-adjusted signal that passes both tests: {best['name']}  "
+              f"→ set CS_SIGNAL={best['name'].split()[0]}"
+              + (f" and CS_ADX_MIN={a.adx_min:.0f}" if "ADX" in best["name"] else ""))
+        print(f"   Caution: {len(rows) - 1} rules were tested, so one can pass by luck. Treat it as a "
+              f"candidate — re-run on SENSEX / a different --days window, then paper-trade it.")
+    else:
+        print("⚠️ No signal passes both tests on this data. Direction isn't adding an edge — "
+              "if 'put spreads only' is positive, the edge is the option premium itself, not the indicator.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instrument", default="NIFTY", choices=list(SPEC))
@@ -344,6 +442,12 @@ def main():
                     choices=["trend", "bull", "bull_trend"],
                     help="trend = put spreads in uptrend / call spreads in downtrend; "
                          "bull = put spreads always; bull_trend = put spreads only in uptrends")
+    ap.add_argument("--signal", default=os.environ.get("CS_SIGNAL", "halftrend").lower(), choices=list(SIGNALS))
+    ap.add_argument("--adx-min", type=float, default=float(os.environ.get("CS_ADX_MIN", 0)))
+    ap.add_argument("--vote-min", type=int, default=int(os.environ.get("CS_VOTE_MIN", 4)))
+    ap.add_argument("--compare-signals", action="store_true",
+                    help="rank all direction signals (+ put-only and random baselines)")
+    ap.add_argument("--random-runs", type=int, default=40)
     ap.add_argument("--out", default="cs_backtest_trades.csv")
     a = ap.parse_args()
 
@@ -357,8 +461,13 @@ def main():
     df = prep(spot, vix)
     print(f"Data: {len(df)} hourly bars {df['date'].min():%Y-%m-%d} → {df['date'].max():%Y-%m-%d}")
 
+    if a.compare_signals:
+        compare_signals(df, a)
+        return
+
     t = run(df, a, a.direction)
-    res = summarize(t, a.capital, f"{a.instrument} credit spreads — direction={a.direction}")
+    res = summarize(t, a.capital, f"{a.instrument} credit spreads — signal={a.signal} direction={a.direction}"
+                                  + (f" ADX≥{a.adx_min:.0f}" if a.adx_min else ""))
     if not t.empty:
         t.to_csv(a.out, index=False)
         print(f"Trades saved → {a.out}")
@@ -367,7 +476,7 @@ def main():
 
     if a.compare:
         totals = []
-        for s_ in range(40):
+        for s_ in range(40):   # same signal timing, random direction
             r = run(df, a, "random", seed=s_)   # same gates, random direction
             totals.append(r["pnl"].sum() if not r.empty else 0)
         print(f"\n━━ RANDOM-DIRECTION baseline (40 runs, same entry timing & exits) ━━\n"

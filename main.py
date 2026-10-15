@@ -1118,7 +1118,7 @@ def daily_profit_target_monitor():
             try:
                 _net_positions = kite.positions().get("net", [])
                 for _p in _net_positions:
-                    if _p.get("quantity", 0) > 0:
+                    if _p.get("quantity", 0) > 0 and _is_buying_position(_p):
                         _live_pnl += float(_p.get("pnl", 0) or 0)
                 _combined += _live_pnl
             except Exception as _lp_err:
@@ -1520,6 +1520,24 @@ _FORCE_EXIT_HM   = _hhmm(FORCE_EXIT_TIME,   (15, 12))
 
 def _past_hm(now, hm):
     return (now.hour, now.minute) >= hm
+
+
+def _is_buying_position(p):
+    """
+    True if a Kite position belongs to the OPTION-BUYING side of the bot.
+    Option buying always uses MIS on NFO/BFO; credit spreads use NRML and are
+    tracked in _cs_state. Keeps the buying loops, startup restore and daily
+    P&L / max-loss monitors from ever touching (or counting) spread legs.
+    """
+    ex = p.get("exchange")
+    if ex in ("NFO", "BFO") and (p.get("product") or "MIS") != "MIS":
+        return False
+    cs = globals().get("_cs_state") or {}
+    sym = p.get("tradingsymbol")
+    for sp in list(cs.values()):
+        if sym in (sp.get("short_sym"), sp.get("long_sym")):
+            return False
+    return True
 
 # ── Option-buying exit mode ───────────────────────────────────────────────────
 # EXIT_MODE=R (default): one coherent risk-based exit plan.
@@ -2523,7 +2541,7 @@ def apply_entry_filters(signal, instrument, df_15m, token, **kwargs):
             try:
                 _net = kite.positions().get("net", [])
                 for _p in _net:
-                    if _p.get("quantity", 0) > 0:
+                    if _p.get("quantity", 0) > 0 and _is_buying_position(_p):
                         _combined_pnl += float(_p.get("pnl", 0) or 0)
             except Exception:
                 pass
@@ -6438,6 +6456,8 @@ def get_open_kite_position(instrument):
                 continue
             if p.get("exchange") != target_exchange:
                 continue
+            if not _is_buying_position(p):
+                continue          # credit-spread leg (NRML) — never the buying side's
             sym = p.get("tradingsymbol", "")
             if not (sym.endswith("CE") or sym.endswith("PE")):
                 continue
@@ -11019,6 +11039,8 @@ def _kite_day_pnl(instrument):
         for p in day_pos:
             if p.get("exchange") != target_exch:
                 continue
+            if not _is_buying_position(p):
+                continue          # exclude credit-spread legs from buying P&L
             sym = p.get("tradingsymbol", "")
             # Distinguish NFO instruments (NIFTY vs BANKNIFTY vs FINNIFTY)
             if instrument.upper() == "NIFTY":
@@ -11063,6 +11085,8 @@ def _kite_day_pnl(instrument):
                 continue
             if sym_prefix and not sym.startswith(sym_prefix):
                 continue
+            if not _is_buying_position(p):
+                continue          # exclude credit-spread legs
             if p.get("quantity", 0) > 0 and sym not in sym_pnl:
                 count += 1   # open trade not yet in day positions
 

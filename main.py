@@ -193,8 +193,10 @@ class PaperKite:
             print(f"⚠️ Paper LTP failed {key}: {e}", flush=True)
             return None
 
-    def _pkey(self, exchange, symbol, product):
-        return f"{exchange}|{symbol}|{product}"
+    def _pkey(self, exchange, symbol, product, tag=None):
+        # Strategy-tagged orders get their own position, so setups that use the
+        # same strike never net against each other (exact per-setup results).
+        return f"{exchange}|{symbol}|{product}" + (f"|{tag}" if tag else "")
 
     def _notify(self, text):
         try:
@@ -288,7 +290,7 @@ class PaperKite:
             return                      # not marketable yet — stays OPEN
 
         qty   = int(o["quantity"])
-        pkey  = self._pkey(o["exchange"], o["tradingsymbol"], o["product"])
+        pkey  = self._pkey(o["exchange"], o["tradingsymbol"], o["product"], o.get("ptag"))
         pos   = self._state["positions"].get(pkey)
         cur_q = pos["quantity"] if pos else 0
         value = fill * qty
@@ -321,7 +323,7 @@ class PaperKite:
                    "product": o["product"], "quantity": 0, "average_price": 0.0,
                    "buy_quantity": 0, "buy_value": 0.0, "sell_quantity": 0,
                    "sell_value": 0.0, "realised": 0.0, "last_price": fill,
-                   "day": self._today()}
+                   "day": self._today(), "tag": o.get("ptag")}
             self._state["positions"][pkey] = pos
 
         # ── Signed-quantity accounting (handles longs and shorts) ───────────
@@ -434,7 +436,8 @@ class PaperKite:
                  "order_type": order_type or "LIMIT",
                  "price": float(price) if price else 0.0,
                  "status": "OPEN", "average_price": 0.0, "filled_quantity": 0,
-                 "pending_quantity": int(quantity), "status_message": None, "tag": "PAPER",
+                 "pending_quantity": int(quantity), "status_message": None,
+                 "tag": kwargs.get("tag") or "PAPER", "ptag": kwargs.get("tag"),
                  "order_timestamp": datetime.now(pytz.timezone("Asia/Kolkata"))}
             self._orders[oid] = o
             self._try_fill(o)
@@ -1530,9 +1533,12 @@ def _is_buying_position(p):
     for sp in list(cs.values()):
         if sym in (sp.get("short_sym"), sp.get("long_sym")):
             return False
-    for ic in list((globals().get("_sell_state") or {}).values()):
-        if sym in (ic.get("ce_short"), ic.get("pe_short"), ic.get("ce_long"), ic.get("pe_long")):
-            return False
+    if p.get("tag"):                  # strategy-tagged paper position (CS / selling setups)
+        return False
+    for pos in list((globals().get("_sell_state") or {}).values()):
+        for sd in pos.get("sides", {}).values():
+            if sym in (sd.get("short"), sd.get("long")):
+                return False
     return True
 
 # ── Option-buying exit mode ───────────────────────────────────────────────────
@@ -1611,7 +1617,8 @@ def _month_pnl_net():
                     try:
                         _ins = str(row.get("instrument", ""))
                         _chg = (104.0 if _ins.endswith("_CS") else
-                                208.0 if _ins.endswith("_IC") else CHARGES_PER_TRADE_EST)
+                                208.0 if _ins.endswith(("_IC", "_IC20", "_IC10", "_STRAD"))
+                                else CHARGES_PER_TRADE_EST)
                         total += float(row.get("pnl") or 0) - _chg
                         n += 1
                     except ValueError:
@@ -13372,7 +13379,7 @@ def _cs_build_spread(instrument, direction, now):
             "delta": round(dlt, 3), "iv": round(iv, 3)}, None
 
 
-def _cs_order(exchange, symbol, side, qty, ref):
+def _cs_order(exchange, symbol, side, qty, ref, tag=None):
     """LIMIT order with a widening price ladder. Returns fill price or None."""
     ladder = [0.005, 0.01, 0.02, 0.035, 0.06]
     for step in ladder:
@@ -13381,7 +13388,7 @@ def _cs_order(exchange, symbol, side, qty, ref):
         try:
             oid = kite.place_order(variety="regular", exchange=exchange, tradingsymbol=symbol,
                                    transaction_type=side, quantity=qty, product=CS_PRODUCT,
-                                   order_type="LIMIT", price=px)
+                                   order_type="LIMIT", price=px, **({"tag": tag} if tag else {}))
         except Exception as e:
             print(f"⚠️ CS {side} {symbol} @ {px} failed: {e}", flush=True)
             time.sleep(1)
@@ -13424,11 +13431,13 @@ def _cs_lots_allowed(instrument, sp):
 
 
 def _cs_enter(instrument, sp):
-    _busy = set()
-    for _ic in list((globals().get("_sell_state") or {}).values()):
-        _busy.update({_ic.get("ce_short"), _ic.get("pe_short"), _ic.get("ce_long"), _ic.get("pe_long")})
-    if sp["short_sym"] in _busy or sp["long_sym"] in _busy:
-        return False, "a leg is already used by an open iron condor"
+    if not PAPER_TRADE:   # live Kite nets positions by symbol → never share a leg
+        _busy = set()
+        for _pos in list((globals().get("_sell_state") or {}).values()):
+            for _sd in _pos.get("sides", {}).values():
+                _busy.update({_sd.get("short"), _sd.get("long")})
+        if sp["short_sym"] in _busy or sp["long_sym"] in _busy:
+            return False, "a leg is already used by an open option-selling setup"
     lots, lot, max_loss_lot, capital = _cs_lots_allowed(instrument, sp)
     if lots < 1:
         return False, (f"capital ₹{capital:,.0f} too small: 1 lot risks ₹{max_loss_lot:,.0f} "
@@ -13448,12 +13457,13 @@ def _cs_enter(instrument, sp):
     except Exception as e:
         print(f"ℹ️ CS margin check skipped: {e}", flush=True)
 
-    lf = _cs_order(sp["exchange"], sp["long_sym"], "BUY", qty, sp["long_ref"])
+    sp["tag"] = "CS"     # own paper position bucket (older spreads have no tag)
+    lf = _cs_order(sp["exchange"], sp["long_sym"], "BUY", qty, sp["long_ref"], tag=sp["tag"])
     if lf is None:
         return False, "hedge leg did not fill — no position taken"
-    sf = _cs_order(sp["exchange"], sp["short_sym"], "SELL", qty, sp["short_ref"])
+    sf = _cs_order(sp["exchange"], sp["short_sym"], "SELL", qty, sp["short_ref"], tag=sp["tag"])
     if sf is None:
-        back = _cs_order(sp["exchange"], sp["long_sym"], "SELL", qty, lf)
+        back = _cs_order(sp["exchange"], sp["long_sym"], "SELL", qty, lf, tag=sp["tag"])
         send_message(f"⚠️ CREDIT SPREAD ABORTED — {instrument}\nShort leg {sp['short_sym']} did not fill.\n"
                      + ("Hedge sold back." if back else f"🚨 SELL {sp['long_sym']} ×{qty} MANUALLY"))
         return False, "short leg did not fill"
@@ -13482,12 +13492,13 @@ def _cs_exit(instrument, reason, spread_val=None):
     if not sp:
         return
     qty = sp["qty"]
-    sb = _cs_order(sp["exchange"], sp["short_sym"], "BUY", qty, spread_val or sp["short_entry"])
+    sb = _cs_order(sp["exchange"], sp["short_sym"], "BUY", qty, spread_val or sp["short_entry"],
+                   tag=sp.get("tag"))
     if sb is None:
         send_message(f"🚨 CREDIT SPREAD EXIT FAILED — BUY BACK {sp['short_sym']} ×{qty} MANUALLY NOW\n"
                      f"(hedge {sp['long_sym']} still protects you)")
         return
-    ls = _cs_order(sp["exchange"], sp["long_sym"], "SELL", qty, sp["long_entry"])
+    ls = _cs_order(sp["exchange"], sp["long_sym"], "SELL", qty, sp["long_entry"], tag=sp.get("tag"))
     if ls is None:
         send_message(f"⚠️ Short leg closed, but hedge {sp['long_sym']} ×{qty} did not sell — "
                      f"sell it manually (no risk, only leftover premium)")
@@ -13559,7 +13570,11 @@ def _cs_reconcile(instrument):
     if not sp:
         return
     try:
-        net = {p["tradingsymbol"]: p["quantity"] for p in kite.positions().get("net", [])}
+        net = {}
+        for p in kite.positions().get("net", []):
+            if PAPER_TRADE and p.get("tag") != sp.get("tag"):
+                continue
+            net[p["tradingsymbol"]] = net.get(p["tradingsymbol"], 0) + p["quantity"]
     except Exception as e:
         print(f"⚠️ CS reconcile skipped: {e}", flush=True)
         return
@@ -13636,25 +13651,27 @@ def credit_spread_loop(instrument):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🟥 OPTION SELLING MODULE — INTRADAY IRON CONDOR (hedged short strangle)
+# 🟥 OPTION SELLING MODULE — several setups side by side (paper comparison)
 # ═══════════════════════════════════════════════════════════════════════════
-# Non-directional premium selling on expiry week (works in PAPER_TRADE mode).
-#   SELL an OTM call + an OTM put at ~SELL_SHORT_DELTA   (collect premium)
-#   BUY  a call SELL_WING points higher + a put SELL_WING points lower (hedges)
-# Hedges are bought FIRST, so the position is never naked and margin is
-# ~₹40–60k instead of ~₹1.5–2L for a naked strangle. Worst case is capped at
-# (wing − credit) × qty.
+# Every setup is HEDGED (wings bought first) and flat the same day.
+#   IC20  : iron condor, shorts Δ≈0.20, expiry week (0–2 DTE), 50% target,
+#           stop when loss = 1× credit
+#   IC10  : far-OTM iron condor, shorts Δ≈0.10, expiry week, 50% target,
+#           stop when loss = 2× credit
+#   STRAD : "9:20 straddle" — sell ATM CE + PE at 9:20 on the nearest expiry
+#           every day, 30% stop on EACH leg; after one leg stops, the other
+#           leg's stop moves to cost; exit 15:15. Wings make it an iron fly.
+# The 4th setup is the credit spread module above (tag CS).
 #
-# Entry : SELL_ENTRY_START–SELL_ENTRY_END, nearest weekly expiry with
-#         SELL_MIN_DTE..SELL_MAX_DTE days left (default 0–2 → expiry week only,
-#         when time decay is fastest), VIX in SELL_VIX_MIN..SELL_VIX_MAX,
-#         total credit ≥ SELL_MIN_CREDIT_PCT of the wing, max loss ≤
-#         SELL_MAX_RISK_PCT of capital, monthly loss stop not hit.
-#         One condor per instrument per day.
-# Exit  : kept SELL_TARGET_PCT of credit │ loss reached SELL_STOP_MULT × credit
-#         │ SELL_EXIT_TIME (always flat same day). Shorts are bought back FIRST.
-# Products: NRML (never MIS) — keeps the option-buying side from touching legs.
-# Costs : 8 orders per condor ≈ ₹208 — included in alerts and the scorecard.
+# Paper: every order carries the setup's tag, and the paper engine keeps a
+# separate position per tag, so setups can use the same strike without
+# interfering and each result is exact. Live: Kite merges positions by
+# symbol, so setups are blocked from sharing a leg.
+#
+# Turn setups on/off: SELL_SETUPS=IC20,IC10,STRAD
+# Override any setting: <TAG>_<KEY>, e.g. IC10_DELTA=0.12, STRAD_LEG_SL_PCT=0.25,
+#   IC20_WING_NIFTY=200, IC20_MAX_DTE=1, STRAD_ENTRY_START=09:20
+# Logged to the trade log as <INSTRUMENT>_<TAG> (e.g. NIFTY_IC10).
 # ═══════════════════════════════════════════════════════════════════════════
 ENABLE_OPTIONS_SELLING = os.environ.get("ENABLE_OPTIONS_SELLING", "false").lower() == "true"
 
@@ -13667,28 +13684,59 @@ def _sell_instruments_from_env():
     return [x.strip().upper() for x in raw.split(",") if x.strip().upper() in _CS_SPEC]
 
 
-SELL_INSTRUMENTS    = _sell_instruments_from_env()
-SELL_LOTS           = int(os.environ.get("SELL_LOTS", "1"))
-SELL_SHORT_DELTA    = float(os.environ.get("SELL_SHORT_DELTA", "0.20"))
-SELL_WING           = {"NIFTY":  int(os.environ.get("SELL_WING_NIFTY",  "150")),
-                       "SENSEX": int(os.environ.get("SELL_WING_SENSEX", "500"))}
-SELL_MIN_DTE        = int(os.environ.get("SELL_MIN_DTE", "0"))
-SELL_MAX_DTE        = int(os.environ.get("SELL_MAX_DTE", "2"))
-SELL_MIN_CREDIT_PCT = float(os.environ.get("SELL_MIN_CREDIT_PCT", "0.10"))   # total credit / wing
-SELL_TARGET_PCT     = float(os.environ.get("SELL_TARGET_PCT", "0.50"))
-SELL_STOP_MULT      = float(os.environ.get("SELL_STOP_MULT", "1.0"))         # 0 = no stop (hedge caps)
-SELL_ENTRY_START    = os.environ.get("SELL_ENTRY_START", "09:30")
-SELL_ENTRY_END      = os.environ.get("SELL_ENTRY_END", "11:00")
-SELL_EXIT_TIME      = os.environ.get("SELL_EXIT_TIME", "15:10")
-SELL_VIX_MIN        = float(os.environ.get("SELL_VIX_MIN", "11"))
-SELL_VIX_MAX        = float(os.environ.get("SELL_VIX_MAX", "22"))
-SELL_MAX_RISK_PCT   = float(os.environ.get("SELL_MAX_RISK_PCT", "0.06"))
-SELL_STATE_FILE     = os.environ.get("SELL_STATE_FILE", "") or _data_path("iron_condor_state.json")
+SELL_INSTRUMENTS     = _sell_instruments_from_env()
+SELL_LOTS            = int(os.environ.get("SELL_LOTS", "1"))
+SELL_MAX_RISK_PCT    = float(os.environ.get("SELL_MAX_RISK_PCT", "0.06"))
+SELL_STATE_FILE      = os.environ.get("SELL_STATE_FILE", "") or _data_path("sell_setups_state.json")
 SELL_ORDERS_PER_TRIP = 8
+SELL_CHARGES_EST     = SELL_ORDERS_PER_TRIP * 26.0
+
+_SELL_DEFAULTS = {
+    "IC20": dict(label="Iron condor Δ0.20", kind="condor", delta=0.20,
+                 wing_nifty=150, wing_sensex=500, min_dte=0, max_dte=2,
+                 entry_start="09:30", entry_end="11:00", exit_time="15:10",
+                 target_pct=0.50, stop_mult=1.0, leg_sl_pct=0.0, sl_to_cost=False,
+                 min_credit_pct=0.10, vix_min=11.0, vix_max=22.0),
+    "IC10": dict(label="Iron condor Δ0.10", kind="condor", delta=0.10,
+                 wing_nifty=150, wing_sensex=500, min_dte=0, max_dte=2,
+                 entry_start="09:30", entry_end="11:00", exit_time="15:10",
+                 target_pct=0.50, stop_mult=2.0, leg_sl_pct=0.0, sl_to_cost=False,
+                 min_credit_pct=0.08, vix_min=11.0, vix_max=22.0),
+    "STRAD": dict(label="9:20 straddle (hedged)", kind="straddle", delta=0.50,
+                  wing_nifty=200, wing_sensex=600, min_dte=0, max_dte=7,
+                  entry_start="09:20", entry_end="09:25", exit_time="15:15",
+                  target_pct=0.0, stop_mult=0.0, leg_sl_pct=0.30, sl_to_cost=True,
+                  min_credit_pct=0.0, vix_min=0.0, vix_max=100.0),
+}
+
+
+def _sell_setups_from_env():
+    out = {}
+    tags = [t.strip().upper() for t in os.environ.get("SELL_SETUPS", "IC20,IC10,STRAD").split(",")]
+    for tag in tags:
+        if tag not in _SELL_DEFAULTS:
+            if tag:
+                print(f"⚠️ SELL_SETUPS: unknown setup {tag!r} — options {list(_SELL_DEFAULTS)}", flush=True)
+            continue
+        cfg = dict(_SELL_DEFAULTS[tag])
+        for k, dv in list(cfg.items()):
+            ev = os.environ.get(f"{tag}_{k.upper()}")
+            if ev is None or k in ("kind",):
+                continue
+            try:
+                cfg[k] = (ev.strip().lower() == "true") if isinstance(dv, bool) else type(dv)(ev)
+            except ValueError:
+                print(f"⚠️ {tag}_{k.upper()}={ev!r} invalid — keeping {dv}", flush=True)
+        cfg["tag"] = tag
+        out[tag] = cfg
+    return out
+
+
+SELL_SETUPS = _sell_setups_from_env()
 
 _sell_lock  = threading.RLock()
-_sell_state = {}     # instrument -> open condor
-_sell_meta  = {}     # instrument -> {"last_entry_day": "YYYY-MM-DD"}
+_sell_state = {}     # "TAG:INSTRUMENT" -> open position
+_sell_meta  = {}     # "TAG:INSTRUMENT" -> {"last_entry_day": "YYYY-MM-DD"}
 
 
 def _sell_load():
@@ -13698,9 +13746,9 @@ def _sell_load():
             with open(SELL_STATE_FILE) as f:
                 d = _cs_json.load(f)
             _sell_state, _sell_meta = d.get("open", {}), d.get("meta", {})
-            print(f"🟥 Iron-condor state loaded: {list(_sell_state)}", flush=True)
+            print(f"🟥 Option-selling state loaded: {list(_sell_state)}", flush=True)
     except Exception as e:
-        print(f"⚠️ Iron-condor state load failed: {e}", flush=True)
+        print(f"⚠️ Option-selling state load failed: {e}", flush=True)
 
 
 def _sell_save():
@@ -13711,37 +13759,52 @@ def _sell_save():
                 _cs_json.dump({"open": _sell_state, "meta": _sell_meta}, f, indent=1, default=str)
             os.replace(tmp, SELL_STATE_FILE)
     except Exception as e:
-        print(f"⚠️ Iron-condor state save failed: {e}", flush=True)
+        print(f"⚠️ Option-selling state save failed: {e}", flush=True)
 
 
-def _sell_symbols(ic):
-    return [ic["ce_short"], ic["pe_short"], ic["ce_long"], ic["pe_long"]]
+def _sell_pos_symbols(pos):
+    return [s for sd in pos["sides"].values() for s in (sd["short"], sd["long"])]
 
 
-def _sell_busy_symbols():
-    """Symbols held by any open credit spread or condor (they must never share a leg)."""
+def _sell_busy_symbols(exclude_key=None):
     out = set()
     for sp in list(_cs_state.values()):
         out.update({sp.get("short_sym"), sp.get("long_sym")})
-    for ic in list(_sell_state.values()):
-        out.update(_sell_symbols(ic))
+    for k, pos in list(_sell_state.items()):
+        if k != exclude_key:
+            out.update(_sell_pos_symbols(pos))
     out.discard(None)
     return out
 
 
-def _sell_pick_expiry(instrument, today):
+def _sell_net_positions(tag):
+    """{symbol: qty} — in paper only this tag's positions (exact per setup)."""
+    net = {}
+    for p in kite.positions().get("net", []):
+        if PAPER_TRADE and p.get("tag") != tag:
+            continue
+        net[p["tradingsymbol"]] = net.get(p["tradingsymbol"], 0) + p["quantity"]
+    return net
+
+
+def _sell_equity(instrument):
+    if PAPER_TRADE and hasattr(kite, "_state"):
+        return float(kite._state.get("cash", 0))        # size on equity, not on free margin
+    return get_balance(instrument) or 0
+
+
+def _sell_pick_expiry(instrument, today, cfg):
     spec = _CS_SPEC[instrument]
     exps = sorted({i["expiry"] for i in get_instruments_cached(spec["exchange"])
                    if i["name"] == spec["name"] and i["instrument_type"] in ("CE", "PE")
                    and i["expiry"] >= today})
     for e in exps:
-        if SELL_MIN_DTE <= (e - today).days <= SELL_MAX_DTE:
+        if cfg["min_dte"] <= (e - today).days <= cfg["max_dte"]:
             return e
     return None
 
 
-def _sell_pick_short(chain, ltps, S, T, is_call):
-    """Strike whose |delta| is closest to SELL_SHORT_DELTA (never above it by > 0.07)."""
+def _sell_pick_delta(chain, ltps, S, T, is_call, target):
     best = None
     for k, ins in chain.items():
         if (k <= S) if is_call else (k >= S):
@@ -13751,304 +13814,347 @@ def _sell_pick_short(chain, ltps, S, T, is_call):
         if not iv:
             continue
         d = abs(_cs_delta(S, k, T, CS_RISK_FREE, iv, is_call))
-        if d > SELL_SHORT_DELTA + 0.07:
+        if d > target + 0.07:
             continue
-        score = abs(d - SELL_SHORT_DELTA)
+        score = abs(d - target)
         if best is None or score < best[0]:
-            best = (score, k, p, d, iv)
+            best = (score, k, d)
     return best
 
 
-def _sell_build(instrument, now):
-    """Pick the four strikes. Returns (condor_dict, None) or (None, reason)."""
+def _sell_build(cfg, instrument, now):
+    """Pick strikes. Returns (position_dict, None) or (None, reason)."""
     spec  = _CS_SPEC[instrument]
-    expiry = _sell_pick_expiry(instrument, now.date())
+    expiry = _sell_pick_expiry(instrument, now.date(), cfg)
     if not expiry:
-        return None, f"no expiry {SELL_MIN_DTE}–{SELL_MAX_DTE} days out (not expiry week)"
+        return None, f"no expiry {cfg['min_dte']}–{cfg['max_dte']} days out"
     S = safe_ltp(spec["spot"])
     if not S:
         return None, "no spot price"
     T = _cs_years_to_expiry(expiry, now)
-    wing = SELL_WING[instrument]
-    legs = {}
+    wing = int(cfg["wing_nifty"] if instrument == "NIFTY" else cfg["wing_sensex"])
+    ins_all = get_instruments_cached(spec["exchange"])
+    sides = {}
+    atm = None
     for otype in ("CE", "PE"):
         is_call = otype == "CE"
-        chain = {int(i["strike"]): i for i in get_instruments_cached(spec["exchange"])
+        chain = {int(i["strike"]): i for i in ins_all
                  if i["name"] == spec["name"] and i["instrument_type"] == otype
-                 and i["expiry"] == expiry and abs(i["strike"] - S) <= S * 0.05}
+                 and i["expiry"] == expiry and abs(i["strike"] - S) <= S * 0.06}
         if not chain:
             return None, f"empty {otype} chain"
-        ltps = _cs_ltps(spec["exchange"], [c["tradingsymbol"] for c in chain.values()])
-        best = _sell_pick_short(chain, ltps, S, T, is_call)
-        if not best:
-            return None, f"no {otype} strike near delta {SELL_SHORT_DELTA}"
-        _, ks, ps, d, iv = best
+        if cfg["kind"] == "straddle":
+            atm = atm if atm is not None else min(chain, key=lambda k: abs(k - S))
+            ks, d = atm, 0.5
+        else:
+            ltps = _cs_ltps(spec["exchange"], [c["tradingsymbol"] for c in chain.values()])
+            best = _sell_pick_delta(chain, ltps, S, T, is_call, cfg["delta"])
+            if not best:
+                return None, f"no {otype} strike near delta {cfg['delta']}"
+            _, ks, d = best
         kl = ks + wing if is_call else ks - wing
-        if kl not in chain:
-            return None, f"{otype} hedge strike {kl} not listed"
-        lsym = chain[kl]["tradingsymbol"]
-        pl = ltps.get(lsym) or _cs_ltps(spec["exchange"], [lsym]).get(lsym)
-        if not pl:
-            return None, f"no {otype} hedge price"
-        legs[otype] = {"short_sym": chain[ks]["tradingsymbol"], "long_sym": lsym,
-                       "short_strike": ks, "long_strike": kl, "short_ref": ps, "long_ref": pl,
-                       "delta": round(d, 3), "iv": round(iv, 3)}
-    ce, pe = legs["CE"], legs["PE"]
-    credit = (ce["short_ref"] - ce["long_ref"]) + (pe["short_ref"] - pe["long_ref"])
-    if credit < SELL_MIN_CREDIT_PCT * wing:
-        return None, (f"credit ₹{credit:.1f} < {SELL_MIN_CREDIT_PCT:.0%} of {wing}-pt wing — "
-                      f"not worth the risk")
-    busy = _sell_busy_symbols()
-    clash = [s for s in (ce["short_sym"], ce["long_sym"], pe["short_sym"], pe["long_sym"]) if s in busy]
-    if clash:
-        return None, f"leg {clash[0]} already used by an open credit spread"
-    for sym, tol in ((ce["short_sym"], 0.10), (pe["short_sym"], 0.10),
-                     (ce["long_sym"], 0.40), (pe["long_sym"], 0.40)):
-        ok, why = _cs_liquid(spec["exchange"], sym, tol)
-        if not ok:
-            return None, why
-    return {"instrument": instrument, "exchange": spec["exchange"], "expiry": str(expiry),
-            "dte": (expiry - now.date()).days, "wing": wing, "spot": S,
-            "ce_short": ce["short_sym"], "ce_long": ce["long_sym"],
-            "pe_short": pe["short_sym"], "pe_long": pe["long_sym"],
-            "ce_short_strike": ce["short_strike"], "ce_long_strike": ce["long_strike"],
-            "pe_short_strike": pe["short_strike"], "pe_long_strike": pe["long_strike"],
-            "ref": {ce["short_sym"]: ce["short_ref"], ce["long_sym"]: ce["long_ref"],
-                    pe["short_sym"]: pe["short_ref"], pe["long_sym"]: pe["long_ref"]},
-            "ce_delta": ce["delta"], "pe_delta": pe["delta"], "credit_ref": round(credit, 2)}, None
+        if kl not in chain or ks not in chain:
+            return None, f"{otype} strike {kl} not listed"
+        sides[otype] = {"short": chain[ks]["tradingsymbol"], "long": chain[kl]["tradingsymbol"],
+                        "short_strike": ks, "long_strike": kl, "delta": round(d, 3), "open": True}
+    px = _cs_ltps(spec["exchange"], [s for sd in sides.values() for s in (sd["short"], sd["long"])])
+    for sd in sides.values():
+        sd["short_ref"], sd["long_ref"] = px.get(sd["short"]), px.get(sd["long"])
+        if not sd["short_ref"] or not sd["long_ref"]:
+            return None, "missing option prices"
+    credit = sum(sd["short_ref"] - sd["long_ref"] for sd in sides.values())
+    if credit < cfg["min_credit_pct"] * wing:
+        return None, f"credit ₹{credit:.1f} < {cfg['min_credit_pct']:.0%} of {wing}-pt wing"
+    if not PAPER_TRADE:
+        busy = _sell_busy_symbols()
+        clash = [s for sd in sides.values() for s in (sd["short"], sd["long"]) if s in busy]
+        if clash:
+            return None, f"leg {clash[0]} already used by another open strategy"
+    for sd in sides.values():
+        for sym, tol in ((sd["short"], 0.10), (sd["long"], 0.40)):
+            ok, why = _cs_liquid(spec["exchange"], sym, tol)
+            if not ok:
+                return None, why
+    return {"key": f"{cfg['tag']}:{instrument}", "tag": cfg["tag"], "instrument": instrument,
+            "exchange": spec["exchange"], "expiry": str(expiry), "dte": (expiry - now.date()).days,
+            "wing": wing, "spot": S, "sides": sides, "credit_ref": round(credit, 2)}, None
 
 
-def _sell_lots_allowed(instrument, ic):
-    lot = _get_lot_size(instrument)
-    max_loss_lot = max(ic["wing"] - ic["credit_ref"], 0) * lot
-    capital = get_balance(instrument) or 0
-    budget = capital * SELL_MAX_RISK_PCT
-    cap = int(budget // max_loss_lot) if max_loss_lot > 0 else 0
+def _sell_enter(cfg, pos):
+    inst, ex, tag = pos["instrument"], pos["exchange"], pos["tag"]
+    lot = _get_lot_size(inst)
+    max_loss_lot = max(pos["wing"] - pos["credit_ref"], 0) * lot
+    equity = _sell_equity(inst)
+    cap = int(equity * SELL_MAX_RISK_PCT // max_loss_lot) if max_loss_lot > 0 else 0
     lots = min(SELL_LOTS, cap) if SELL_LOTS > 0 else cap
-    return lots, lot, max_loss_lot, capital
-
-
-def _sell_enter(instrument, ic):
-    lots, lot, max_loss_lot, capital = _sell_lots_allowed(instrument, ic)
     if lots < 1:
-        return False, (f"capital ₹{capital:,.0f} too small: 1 lot risks ₹{max_loss_lot:,.0f} "
-                       f"> {SELL_MAX_RISK_PCT:.0%} of capital")
+        return False, (f"capital ₹{equity:,.0f} too small: 1 lot risks ₹{max_loss_lot:,.0f} "
+                       f"> {SELL_MAX_RISK_PCT:.0%}")
     qty = lots * lot
-    ex = ic["exchange"]
-    try:
-        basket = [{"exchange": ex, "tradingsymbol": s, "transaction_type": side, "variety": "regular",
-                   "product": CS_PRODUCT, "order_type": "MARKET", "quantity": qty, "price": 0}
-                  for s, side in ((ic["ce_long"], "BUY"), (ic["pe_long"], "BUY"),
-                                  (ic["ce_short"], "SELL"), (ic["pe_short"], "SELL"))]
-        m = kite.basket_order_margins(basket, consider_positions=True, mode="compact")
-        need = float((m.get("final") or m.get("initial") or {}).get("total", 0))
-        if need and need > capital:
-            return False, f"margin ₹{need:,.0f} > available ₹{capital:,.0f}"
-        ic["margin"] = round(need, 0)
-    except Exception as e:
-        print(f"ℹ️ Iron-condor margin check skipped: {e}", flush=True)
-
-    fills, done = {}, []      # done = [(symbol, side)] for unwinding
-    plan = [(ic["ce_long"], "BUY"), (ic["pe_long"], "BUY"),
-            (ic["ce_short"], "SELL"), (ic["pe_short"], "SELL")]
-    for sym, side in plan:
-        px = _cs_order(ex, sym, side, qty, ic["ref"][sym])
+    if not PAPER_TRADE:   # paper engine enforces its own hedge margin
+        try:
+            basket = [{"exchange": ex, "tradingsymbol": sd[leg], "transaction_type": side,
+                       "variety": "regular", "product": CS_PRODUCT, "order_type": "MARKET",
+                       "quantity": qty, "price": 0}
+                      for leg, side in (("long", "BUY"), ("short", "SELL")) for sd in pos["sides"].values()]
+            m = kite.basket_order_margins(basket, consider_positions=True, mode="compact")
+            need = float((m.get("final") or m.get("initial") or {}).get("total", 0))
+            avail = get_balance(inst) or 0
+            if need and need > avail:
+                return False, f"margin ₹{need:,.0f} > available ₹{avail:,.0f}"
+        except Exception as e:
+            print(f"ℹ️ {tag} margin check skipped: {e}", flush=True)
+    done = []   # (side_key, leg)
+    plan = [(k, "long") for k in pos["sides"]] + [(k, "short") for k in pos["sides"]]
+    for k, leg in plan:
+        sd = pos["sides"][k]
+        side = "BUY" if leg == "long" else "SELL"
+        px = _cs_order(ex, sd[leg], side, qty, sd[f"{leg}_ref"], tag=tag)
         if px is None:
             stuck = []
-            for usym, uside in reversed(done):      # shorts first, then hedges
-                back = "BUY" if uside == "SELL" else "SELL"
-                if _cs_order(ex, usym, back, qty, fills[usym]) is None:
-                    stuck.append(f"{back} {usym} ×{qty}")
-            send_message(f"⚠️ IRON CONDOR ABORTED — {instrument}\n{side} {sym} did not fill.\n"
-                         + ("Filled legs closed again." if not stuck else
-                            "🚨 CLOSE MANUALLY: " + ", ".join(stuck)))
-            return False, f"{side} {sym} did not fill"
-        fills[sym] = px
-        done.append((sym, side))
-    credit = (fills[ic["ce_short"]] - fills[ic["ce_long"]]) + (fills[ic["pe_short"]] - fills[ic["pe_long"]])
-    ic.update({"qty": qty, "lots": lots, "fills": fills, "credit": round(credit, 2),
-               "entry_time": datetime.now(IST).isoformat(),
-               "max_loss": round((ic["wing"] - credit) * qty, 0)})
+            for uk, uleg in reversed(done):         # shorts first, then hedges
+                usd = pos["sides"][uk]
+                back = "BUY" if uleg == "short" else "SELL"
+                if _cs_order(ex, usd[uleg], back, qty, usd[f"{uleg}_entry"], tag=tag) is None:
+                    stuck.append(f"{back} {usd[uleg]} ×{qty}")
+            send_message(f"⚠️ {cfg['label']} ABORTED — {inst}\n{side} {sd[leg]} did not fill.\n"
+                         + ("Filled legs closed again." if not stuck else "🚨 CLOSE MANUALLY: " + ", ".join(stuck)))
+            return False, f"{side} {sd[leg]} did not fill"
+        sd[f"{leg}_entry"] = px
+        done.append((k, leg))
+    for sd in pos["sides"].values():
+        sd["sl"] = round(sd["short_entry"] * (1 + cfg["leg_sl_pct"]), 2) if cfg["leg_sl_pct"] > 0 else None
+    credit = sum(sd["short_entry"] - sd["long_entry"] for sd in pos["sides"].values())
+    pos.update({"qty": qty, "lots": lots, "credit": round(credit, 2),
+                "entry_time": datetime.now(IST).isoformat(),
+                "max_loss": round((pos["wing"] - credit) * qty, 0)})
     with _sell_lock:
-        _sell_state[instrument] = ic
-        _sell_meta.setdefault(instrument, {})["last_entry_day"] = datetime.now(IST).strftime("%Y-%m-%d")
+        _sell_state[pos["key"]] = pos
+        _sell_meta.setdefault(pos["key"], {})["last_entry_day"] = datetime.now(IST).strftime("%Y-%m-%d")
     _sell_save()
+    ce, pe = pos["sides"]["CE"], pos["sides"]["PE"]
     cr_rs = credit * qty
-    stop_txt = (f"Stop −₹{cr_rs * SELL_STOP_MULT:,.0f}" if SELL_STOP_MULT > 0 else "No stop")
+    rules = []
+    if cfg["target_pct"] > 0:
+        rules.append(f"🎯 Target +₹{cr_rs * cfg['target_pct']:,.0f}")
+    if cfg["stop_mult"] > 0:
+        rules.append(f"🛑 Stop −₹{cr_rs * cfg['stop_mult']:,.0f}")
+    if cfg["leg_sl_pct"] > 0:
+        rules.append(f"🛑 Leg SL {cfg['leg_sl_pct']:.0%} (CE ₹{ce['sl']:.1f} / PE ₹{pe['sl']:.1f})"
+                     + (", then other leg to cost" if cfg["sl_to_cost"] else ""))
+    rules.append(f"Max loss −₹{pos['max_loss']:,.0f}")
     send_message(
-        f"🟥 IRON CONDOR OPENED — {instrument} ({ic['dte']} day(s) to expiry)\n"
-        f"📈 SELL {ic['ce_short']} @ ₹{fills[ic['ce_short']]:.1f} (Δ {ic['ce_delta']:.2f}) "
-        f"│ hedge {ic['ce_long']} @ ₹{fills[ic['ce_long']]:.1f}\n"
-        f"📉 SELL {ic['pe_short']} @ ₹{fills[ic['pe_short']]:.1f} (Δ {ic['pe_delta']:.2f}) "
-        f"│ hedge {ic['pe_long']} @ ₹{fills[ic['pe_long']]:.1f}\n"
-        f"🎯 Profit zone {ic['pe_short_strike']}–{ic['ce_short_strike']} │ Spot {ic['spot']:.0f}\n"
-        f"💰 Credit ₹{credit:.1f} × {qty} = ₹{cr_rs:,.0f}\n"
-        f"🎯 Target +₹{cr_rs * SELL_TARGET_PCT:,.0f} │ 🛑 {stop_txt} │ Max loss −₹{ic['max_loss']:,.0f}\n"
-        f"⏰ Closes by {SELL_EXIT_TIME} today │ charges ≈ ₹{SELL_ORDERS_PER_TRIP * 26}"
+        f"🟥 {cfg['label'].upper()} OPENED — {pos['instrument']} [{pos['tag']}] "
+        f"({pos['dte']}d to expiry)\n"
+        f"📈 SELL {ce['short']} @ ₹{ce['short_entry']:.1f} │ hedge {ce['long']} @ ₹{ce['long_entry']:.1f}\n"
+        f"📉 SELL {pe['short']} @ ₹{pe['short_entry']:.1f} │ hedge {pe['long']} @ ₹{pe['long_entry']:.1f}\n"
+        f"💰 Credit ₹{credit:.1f} × {qty} = ₹{cr_rs:,.0f} │ Spot {pos['spot']:.0f}\n"
+        + " │ ".join(rules) + f"\n⏰ Flat by {cfg['exit_time']}"
     )
     return True, ""
 
 
-def _sell_value(ic):
-    """Current cost to close the condor (per unit). None if prices missing."""
-    px = _cs_ltps(ic["exchange"], _sell_symbols(ic))
-    if any(px.get(s) is None for s in _sell_symbols(ic)):
-        return None, px
-    return (px[ic["ce_short"]] + px[ic["pe_short"]] - px[ic["ce_long"]] - px[ic["pe_long"]]), px
-
-
-def _sell_exit(instrument, reason):
-    with _sell_lock:
-        ic = _sell_state.get(instrument)
-    if not ic:
-        return
-    qty, ex, f = ic["qty"], ic["exchange"], ic["fills"]
-    _, px = _sell_value(ic)
-    out, failed = {}, []
-    for sym in (ic["ce_short"], ic["pe_short"]):               # shorts first
-        if sym in ic.get("closed_shorts", {}):
-            continue
-        r = _cs_order(ex, sym, "BUY", qty, px.get(sym) or f[sym])
-        if r is None:
-            failed.append(sym)
+def _sell_pnl(pos, px):
+    """Rupee P&L now (closed sides at exit prices, open sides at LTP). None if prices missing."""
+    tot = 0.0
+    for sd in pos["sides"].values():
+        if sd["open"]:
+            s, l = px.get(sd["short"]), px.get(sd["long"])
+            if s is None or l is None:
+                return None
         else:
-            out[sym] = r
-    if failed:
-        # keep the hedges on — they still protect the unclosed short(s)
-        with _sell_lock:
-            ic["closed_shorts"] = {**ic.get("closed_shorts", {}), **out}
-        _sell_save()
-        send_message(f"🚨 IRON CONDOR EXIT FAILED — {instrument}\nBUY BACK {', '.join(failed)} ×{qty} "
-                     f"MANUALLY NOW (hedges kept on so you stay protected). Will retry.")
-        return
-    out.update(ic.get("closed_shorts", {}))
-    for sym in (ic["ce_long"], ic["pe_long"]):
-        r = _cs_order(ex, sym, "SELL", qty, px.get(sym) or f[sym])
+            s, l = sd["short_exit"], sd["long_exit"]
+        tot += (sd["short_entry"] - s) - (sd["long_entry"] - l)
+    return tot * pos["qty"]
+
+
+def _sell_close_sides(cfg, key, side_keys, reason):
+    """Close the given sides (shorts first). Returns True if all of them closed."""
+    with _sell_lock:
+        pos = _sell_state.get(key)
+    if not pos:
+        return True
+    ex, qty, tag = pos["exchange"], pos["qty"], pos["tag"]
+    px = _cs_ltps(ex, _sell_pos_symbols(pos))
+    ok_all = True
+    for k in side_keys:
+        sd = pos["sides"][k]
+        if not sd["open"] or sd.get("short_exit") is not None:
+            continue
+        r = _cs_order(ex, sd["short"], "BUY", qty, px.get(sd["short"]) or sd["short_entry"], tag=tag)
         if r is None:
-            send_message(f"⚠️ Hedge {sym} ×{qty} did not sell — sell it manually (no risk, "
-                         f"only leftover premium)")
+            ok_all = False
+            send_message(f"🚨 {cfg['label']} [{tag}] {pos['instrument']}: BUY BACK {sd['short']} ×{qty} "
+                         f"FAILED — buy it back manually (hedge kept on). Will retry.")
+        else:
+            sd["short_exit"] = r
+    for k in side_keys:
+        sd = pos["sides"][k]
+        if not sd["open"] or sd.get("short_exit") is None:
+            continue
+        r = _cs_order(ex, sd["long"], "SELL", qty, px.get(sd["long"]) or sd["long_entry"], tag=tag)
+        if r is None:
+            send_message(f"⚠️ Hedge {sd['long']} ×{qty} did not sell — sell it manually (no risk)")
             r = 0.0
-        out[sym] = r
-    exit_val = out[ic["ce_short"]] + out[ic["pe_short"]] - out[ic["ce_long"]] - out[ic["pe_long"]]
-    pnl = (ic["credit"] - exit_val) * qty
+        sd["long_exit"], sd["open"] = r, False
+        sd["exit_reason"] = reason
+    with _sell_lock:
+        _sell_state[key] = pos
+    _sell_save()
+    return ok_all
+
+
+def _sell_finalize(cfg, key, reason):
+    with _sell_lock:
+        pos = _sell_state.get(key)
+    if not pos or any(sd["open"] for sd in pos["sides"].values()):
+        return
+    pnl = _sell_pnl(pos, {})
+    exit_val = sum(sd["short_exit"] - sd["long_exit"] for sd in pos["sides"].values())
     est = SELL_ORDERS_PER_TRIP * (PAPER_CHARGES_PER_ORDER if PAPER_TRADE else 26)
     try:
-        log_trade_full(f"{ic['pe_short']}/{ic['ce_short']}", ic["credit"], round(exit_val, 2),
-                       round(pnl, 2), f"{instrument}_IC", "IRON_CONDOR", 0)
+        log_trade_full(f"{pos['sides']['PE']['short']}/{pos['sides']['CE']['short']}", pos["credit"],
+                       round(exit_val, 2), round(pnl, 2), f"{pos['instrument']}_{pos['tag']}",
+                       cfg["kind"].upper(), 0)
     except Exception as e:
-        print(f"⚠️ Iron-condor log failed: {e}", flush=True)
+        print(f"⚠️ {pos['tag']} log failed: {e}", flush=True)
     with _sell_lock:
-        _sell_state.pop(instrument, None)
+        _sell_state.pop(key, None)
     _sell_save()
     _month_pnl_cache["t"] = 0
+    legs = " │ ".join(f"{k}: {sd.get('exit_reason', '')[:22]}" for k, sd in pos["sides"].items())
     send_message(
-        f"{'✅' if pnl > 0 else '❌'} IRON CONDOR CLOSED — {instrument}\n"
-        f"📌 {reason}\n"
-        f"💰 Credit ₹{ic['credit']:.1f} → closed at ₹{exit_val:.1f}\n"
+        f"{'✅' if pnl > 0 else '❌'} {cfg['label'].upper()} CLOSED — {pos['instrument']} [{pos['tag']}]\n"
+        f"📌 {reason}" + (f"\n🦵 {legs}" if cfg["kind"] == "straddle" else "") + "\n"
+        f"💰 Credit ₹{pos['credit']:.1f} → closed at ₹{exit_val:.1f}\n"
         f"📊 P&L ₹{pnl:+,.0f} (≈ ₹{pnl - est:+,.0f} after ~₹{est:.0f} charges)"
         + (f"\n{kite.summary()}" if PAPER_TRADE and hasattr(kite, "summary") else "")
     )
 
 
-def _sell_manage(instrument, now):
+def _sell_manage(cfg, key, now):
     with _sell_lock:
-        ic = dict(_sell_state.get(instrument) or {})
-    if not ic:
+        pos = _sell_state.get(key)
+    if not pos:
+        return
+    open_sides = [k for k, sd in pos["sides"].items() if sd["open"]]
+    if not open_sides:
+        _sell_finalize(cfg, key, "closed")
         return
     reason = None
-    entry_day = str(ic.get("entry_time", ""))[:10]
-    if entry_day and entry_day != now.strftime("%Y-%m-%d"):
-        reason = "CARRIED OVER — closing a condor left open from a previous day"
-    elif _past_hm(now, _hhmm(SELL_EXIT_TIME, (15, 10))):
-        reason = f"TIME — {SELL_EXIT_TIME} intraday close"
-    elif ic.get("closed_shorts"):
-        reason = "RETRY — finishing a partly closed condor"
-    val, px = _sell_value(ic)
-    if val is None and not reason:
+    if str(pos.get("entry_time", ""))[:10] != now.strftime("%Y-%m-%d"):
+        reason = "CARRIED OVER — closing a position left open from a previous day"
+    elif _past_hm(now, _hhmm(cfg["exit_time"], (15, 10))):
+        reason = f"TIME — {cfg['exit_time']} intraday close"
+    px = _cs_ltps(pos["exchange"], _sell_pos_symbols(pos))
+    pnl = _sell_pnl(pos, px)
+    if pnl is None and not reason:
         return
-    if val is not None:
-        pnl = (ic["credit"] - val) * ic["qty"]
-        if not reason and val <= ic["credit"] * (1 - SELL_TARGET_PCT):
-            reason = f"TARGET — kept {SELL_TARGET_PCT:.0%} of credit"
-        elif not reason and SELL_STOP_MULT > 0 and val >= ic["credit"] * (1 + SELL_STOP_MULT):
-            reason = f"STOP — loss reached {SELL_STOP_MULT:g}× credit"
-        hb = getattr(_sell_manage, f"_hb_{instrument}", 0)
-        if time.time() - hb > 900:
-            setattr(_sell_manage, f"_hb_{instrument}", time.time())
-            print(f"🟥 {instrument} condor val ₹{val:.1f} (credit ₹{ic['credit']:.1f}) "
-                  f"P&L ₹{pnl:+,.0f}", flush=True)
+    full = pos["credit"] * pos["qty"]
+    if not reason and pnl is not None:
+        if cfg["target_pct"] > 0 and pnl >= full * cfg["target_pct"]:
+            reason = f"TARGET — kept {cfg['target_pct']:.0%} of credit"
+        elif cfg["stop_mult"] > 0 and pnl <= -full * cfg["stop_mult"]:
+            reason = f"STOP — loss reached {cfg['stop_mult']:g}× credit"
     if reason:
-        print(f"🟥 {instrument} condor exit: {reason}", flush=True)
-        _sell_exit(instrument, reason)
+        print(f"🟥 {key} exit: {reason}", flush=True)
+        _sell_close_sides(cfg, key, open_sides, reason)
+        _sell_finalize(cfg, key, reason)
+        return
+    # per-leg stops (straddle)
+    if cfg["leg_sl_pct"] > 0:
+        for k in open_sides:
+            sd = pos["sides"][k]
+            ltp = px.get(sd["short"])
+            if sd.get("sl") and ltp is not None and ltp >= sd["sl"]:
+                why = f"{k} leg SL ₹{sd['sl']:.1f} hit"
+                if _sell_close_sides(cfg, key, [k], why):
+                    msg = (f"🟨 [{pos['tag']}] {pos['instrument']} {k} leg stopped — bought back "
+                           f"{sd['short']} @ ₹{sd['short_exit']:.1f} (sold ₹{sd['short_entry']:.1f})")
+                    other = [o for o in pos["sides"] if o != k and pos["sides"][o]["open"]]
+                    if other and cfg["sl_to_cost"]:
+                        osd = pos["sides"][other[0]]
+                        osd["sl"] = min(osd["sl"] or osd["short_entry"], osd["short_entry"])
+                        msg += f"\n➡️ {other[0]} stop moved to cost ₹{osd['sl']:.1f}"
+                        _sell_save()
+                    send_message(msg)
+        if not any(sd["open"] for sd in pos["sides"].values()):
+            _sell_finalize(cfg, key, "both legs stopped")
+            return
+    hb = getattr(_sell_manage, f"_hb_{key}", 0)
+    if pnl is not None and time.time() - hb > 900:
+        setattr(_sell_manage, f"_hb_{key}", time.time())
+        print(f"🟥 {key} P&L ₹{pnl:+,.0f} (credit ₹{full:,.0f}) open: {open_sides}", flush=True)
 
 
-def _sell_reconcile(instrument):
-    """After a restart: drop saved state whose short legs are no longer open."""
+def _sell_reconcile(cfg, key):
     with _sell_lock:
-        ic = _sell_state.get(instrument)
-    if not ic:
+        pos = _sell_state.get(key)
+    if not pos:
         return
     try:
-        net = {p["tradingsymbol"]: p["quantity"] for p in kite.positions().get("net", [])}
+        net = _sell_net_positions(pos["tag"])
     except Exception as e:
-        print(f"⚠️ Iron-condor reconcile skipped: {e}", flush=True)
+        print(f"⚠️ {key} reconcile skipped: {e}", flush=True)
         return
-    open_shorts = [s for s in (ic["ce_short"], ic["pe_short"])
-                   if s not in ic.get("closed_shorts", {}) and net.get(s, 0) < 0]
-    if not open_shorts:
-        send_message(f"ℹ️ {instrument} iron condor in saved state but its short legs are not open "
+    live_shorts = [sd["short"] for sd in pos["sides"].values() if sd["open"] and net.get(sd["short"], 0) < 0]
+    if not live_shorts:
+        send_message(f"ℹ️ {cfg['label']} [{key}] in saved state but its short legs are not open "
                      f"in Kite — clearing state. Check Kite.")
         with _sell_lock:
-            _sell_state.pop(instrument, None)
+            _sell_state.pop(key, None)
         _sell_save()
 
 
-def options_selling_loop(instrument):
-    print(f"🟥 Iron-condor loop started — {instrument}", flush=True)
-    _sell_reconcile(instrument)
+def options_selling_loop(tag, instrument):
+    cfg = SELL_SETUPS[tag]
+    key = f"{tag}:{instrument}"
+    print(f"🟥 Option-selling loop started — {cfg['label']} {instrument}", flush=True)
+    _sell_reconcile(cfg, key)
     last_reason = None
     while True:
         try:
             now = datetime.now(IST)
-            hb = getattr(options_selling_loop, f"_alive_{instrument}", 0)
-            if time.time() - hb > 300:
-                setattr(options_selling_loop, f"_alive_{instrument}", time.time())
-                print(f"💓 IC {instrument} loop alive — {now.strftime('%H:%M')}", flush=True)
+            hb = getattr(options_selling_loop, f"_alive_{key}", 0)
+            if time.time() - hb > 600:
+                setattr(options_selling_loop, f"_alive_{key}", time.time())
+                print(f"💓 {key} loop alive — {now.strftime('%H:%M')}", flush=True)
             if not (now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 29)):
                 time.sleep(60)
                 continue
-            if _sell_state.get(instrument):
-                _sell_manage(instrument, now)
-                time.sleep(10)
+            if _sell_state.get(key):
+                _sell_manage(cfg, key, now)
+                time.sleep(15)
                 continue
-            if not (_past_hm(now, _hhmm(SELL_ENTRY_START, (9, 30)))
-                    and not _past_hm(now, _hhmm(SELL_ENTRY_END, (11, 0)))):
-                time.sleep(60)
+            if not (_past_hm(now, _hhmm(cfg["entry_start"], (9, 30)))
+                    and not _past_hm(now, _hhmm(cfg["entry_end"], (11, 0)))):
+                time.sleep(30)
                 continue
-            if _sell_meta.get(instrument, {}).get("last_entry_day") == now.strftime("%Y-%m-%d"):
-                time.sleep(300)                       # one condor per day
+            if _sell_meta.get(key, {}).get("last_entry_day") == now.strftime("%Y-%m-%d"):
+                time.sleep(300)
                 continue
             reason = None
-            if MONTHLY_MAX_LOSS > 0 and _month_pnl_net()[0] <= -MONTHLY_MAX_LOSS:
+            # Paper: no monthly stop, so every setup gets a full sample to compare.
+            if not PAPER_TRADE and MONTHLY_MAX_LOSS > 0 and _month_pnl_net()[0] <= -MONTHLY_MAX_LOSS:
                 reason = "monthly loss stop active"
-            if not reason:
+            if not reason and (cfg["vix_min"] > 0 or cfg["vix_max"] < 100):
                 vix = get_india_vix()
-                if vix and not (SELL_VIX_MIN <= vix <= SELL_VIX_MAX):
-                    reason = f"VIX {vix:.1f} outside {SELL_VIX_MIN:g}–{SELL_VIX_MAX:g}"
-            ic = None
+                if vix and not (cfg["vix_min"] <= vix <= cfg["vix_max"]):
+                    reason = f"VIX {vix:.1f} outside {cfg['vix_min']:g}–{cfg['vix_max']:g}"
+            pos = None
             if not reason:
-                ic, reason = _sell_build(instrument, now)
-            if ic:
-                ok, reason = _sell_enter(instrument, ic)
+                pos, reason = _sell_build(cfg, instrument, now)
+            if pos:
+                ok, reason = _sell_enter(cfg, pos)
                 if ok:
                     last_reason = None
                     continue
             if reason and reason != last_reason:
-                print(f"🟥 {instrument} condor no entry: {reason}", flush=True)
+                print(f"🟥 {key} no entry: {reason}", flush=True)
                 last_reason = reason
-            time.sleep(120)
+            time.sleep(20 if cfg["kind"] == "straddle" else 60)
         except Exception as e:
-            print(f"❌ Iron-condor loop error [{instrument}]: {e}", flush=True)
+            print(f"❌ Option-selling loop error [{key}]: {e}", flush=True)
             time.sleep(30)
 
 
@@ -14088,62 +14194,55 @@ def _scorecard_text(now=None):
         except ValueError:
             return 0.0
 
-    cs  = [r for r in rows if str(r.get("instrument", "")).endswith("_CS")]
-    ic  = [r for r in rows if str(r.get("instrument", "")).endswith("_IC")]
-    buy = [r for r in rows if r.get("instrument")
-           and not str(r.get("instrument")).endswith(("_CS", "_IC"))]
     week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
     mode = "PAPER" if globals().get("PAPER_TRADE") else "LIVE"
-    lines = [f"📊 WEEKLY SCORECARD ({mode}) — {now.strftime('%d %b %Y')}"]
+    lines = [f"📊 WEEKLY SCORECARD ({mode}) — {now.strftime('%d %b %Y')}",
+             "Option-selling setups side by side (net of estimated charges):"]
 
-    def _block(rows_, title, suffix, charges, wr_target, min_n, judge_txt):
-        nets = [_pnl(r) - charges for r in rows_]
+    # (suffix, label, charges per trip, judge-after count)
+    groups = [("_CS", f"🟦 CS  Credit spread Δ{CS_SHORT_DELTA:g} ({CS_SIGNAL})", SC_SPREAD_CHARGES, 20)]
+    for _tag, _cfg in globals().get("SELL_SETUPS", {}).items():
+        groups.append((f"_{_tag}", f"🟥 {_tag}  {_cfg['label']}", SC_CONDOR_CHARGES, 30))
+    known = tuple(g[0] for g in groups) + ("_IC", "_IC20", "_IC10", "_STRAD")
+    buy = [r for r in rows if r.get("instrument") and not str(r.get("instrument")).endswith(known)]
+
+    leader = []
+    for suffix, label, charges, min_n in groups:
+        g = [r for r in rows if str(r.get("instrument", "")).endswith(suffix)]
+        nets = [_pnl(r) - charges for r in g]
+        lines.append(label)
         if not nets:
-            return [f"{title}: none closed yet"]
+            lines.append("   no closed trades yet")
+            continue
         wins   = [x for x in nets if x > 0]
         losses = [x for x in nets if x <= 0]
         n, wr  = len(nets), len(wins) / len(nets) * 100
         avg_w  = sum(wins) / len(wins) if wins else 0.0
         avg_l  = -sum(losses) / len(losses) if losses else 0.0
         total  = sum(nets)
-        eq, peak, dd = 0.0, 0.0, 0.0
+        eq = peak = dd = 0.0
         for x in nets:
             eq += x; peak = max(peak, eq); dd = min(dd, eq - peak)
-        be_wr  = (avg_l / (avg_w + avg_l) * 100) if (avg_w + avg_l) > 0 and losses else 0.0
-        wk     = [_pnl(r) - charges for r in rows_ if str(r.get("time", "")) >= week_start]
-        by_inst = {}
-        for r, x in zip(rows_, nets):
-            k = r["instrument"].replace(suffix, "")
-            v = by_inst.setdefault(k, [0, 0, 0.0]); v[0] += 1; v[1] += x > 0; v[2] += x
-        ok = lambda c: "✅" if c else "❌"
-        out = [
-            f"{title} — {n} closed ({len(wk)} this week, ₹{sum(wk):+,.0f})",
-            f"   Win rate: {wr:.0f}%  ({len(wins)}W / {len(losses)}L)",
-            f"   Avg win ₹{avg_w:,.0f} │ Avg loss {('₹' + format(-avg_l, ',.0f')) if losses else '—'} │ Worst ₹{min(nets):+,.0f}",
-            f"   Net P&L ₹{total:+,.0f} │ per trade ₹{total / n:+,.0f} │ Max drawdown ₹{dd:,.0f}",
-            "   " + " │ ".join(f"{k}: {v[0]} ({v[1]}W) ₹{v[2]:+,.0f}" for k, v in by_inst.items()),
-            "   🎯 Targets",
-            f"   {ok(wr >= wr_target)} Win rate ≥ {wr_target:.0f}%  (now {wr:.0f}%)",
-            f"   {ok(not losses or avg_l <= SC_TARGET_MAX_AVG_LOSS)} Avg loss ≤ ₹{SC_TARGET_MAX_AVG_LOSS:,.0f}"
-            f"  (now {'none yet' if not losses else f'₹{avg_l:,.0f}'})",
-            f"   {ok(total > 0)} Net P&L > 0 after charges  (now ₹{total:+,.0f})",
+        be = (avg_l / (avg_w + avg_l) * 100) if losses and (avg_w + avg_l) > 0 else 0.0
+        wk = sum(_pnl(r) - charges for r in g if str(r.get("time", "")) >= week_start)
+        by = {}
+        for r, x in zip(g, nets):
+            k = r["instrument"][: -len(suffix)]
+            v = by.setdefault(k, [0, 0.0]); v[0] += 1; v[1] += x
+        verdict = ("⏳" if n < min_n else "✅" if total > 0 and wr > be else "❌")
+        lines += [
+            f"   {n} trades │ win {wr:.0f}%" + (f" (break-even {be:.0f}%)" if losses and wins else "")
+            + f" │ net ₹{total:+,.0f} │ ₹{total / n:+,.0f}/trade │ week ₹{wk:+,.0f}",
+            f"   avg win ₹{avg_w:,.0f} │ avg loss " + (f"₹{avg_l:,.0f}" if losses else "—")
+            + f" │ worst ₹{min(nets):+,.0f} │ drawdown ₹{dd:,.0f} │ "
+            + " ".join(f"{k} ₹{v[1]:+,.0f}" for k, v in by.items()) + f" {verdict}",
         ]
-        if losses:
-            out.append(f"   ℹ️ Break-even win rate at these sizes: {be_wr:.0f}%")
-        if n < min_n:
-            out.append(f"   ⏳ Only {n} — judge after ~{min_n} ({judge_txt})")
-        elif total > 0 and wr >= wr_target:
-            out.append("   ✅ On track")
-        else:
-            out.append("   ⚠️ Below target — review before trading real money")
-        return out
-
-    if cs or globals().get("ENABLE_CREDIT_SPREAD"):
-        lines += _block(cs, "🟦 CREDIT SPREADS", "_CS", SC_SPREAD_CHARGES,
-                        SC_TARGET_WIN_RATE, 20, "≈3 months")
-    if ic or globals().get("ENABLE_OPTIONS_SELLING"):
-        lines += _block(ic, "🟥 IRON CONDORS (option selling)", "_IC", SC_CONDOR_CHARGES,
-                        SC_IC_TARGET_WIN_RATE, 30, "≈6–8 weeks")
+        leader.append((total / n, n, label.split("  ")[0][2:].strip()))
+    if leader:
+        best = max(leader)
+        lines.append(f"🏆 Best per trade so far: {best[2]} (₹{best[0]:+,.0f}/trade over {best[1]})"
+                     + ("" if min(x[1] for x in leader) >= 20 else " — still too few trades to decide"))
+    lines.append("⏳ = too few trades │ ✅ = profitable & above break-even │ ❌ = not working")
 
     # ── Option buying (one line) ──────────────────────────────────────────
     if buy:
@@ -14152,7 +14251,7 @@ def _scorecard_text(now=None):
                      f"│ net ₹{sum(bn):+,.0f}")
     if globals().get("PAPER_TRADE") and hasattr(kite, "summary"):
         lines.append(kite.summary())
-    lines.append("(charges estimated: ₹104/spread, ₹208/condor, ₹52/buy trade)")
+    lines.append("(charges est.: ₹104/spread, ₹208/condor or straddle, ₹52/buy trade)")
     return "\n".join(lines)
 
 
@@ -14432,17 +14531,22 @@ if __name__ == "__main__":
     else:
         print("⚠️ Delta loop disabled (ENABLE_DELTA=false)", flush=True)
 
-    if ENABLE_OPTIONS_SELLING and SELL_INSTRUMENTS:
-        for _sli in SELL_INSTRUMENTS:
-            threading.Thread(target=options_selling_loop, args=(_sli,), daemon=True,
-                             name=f"IronCondor_{_sli}").start()
-        send_message(f"🟥 Option selling ON — iron condor {', '.join(SELL_INSTRUMENTS)} │ "
-                     f"Δ{SELL_SHORT_DELTA} shorts │ wings "
-                     + ", ".join(f"{i} {SELL_WING[i]}" for i in SELL_INSTRUMENTS)
-                     + f" │ expiry week ({SELL_MIN_DTE}–{SELL_MAX_DTE} DTE) │ "
-                     f"target {SELL_TARGET_PCT:.0%} │ "
-                     f"{'stop ' + format(SELL_STOP_MULT, 'g') + '× credit' if SELL_STOP_MULT > 0 else 'no stop'}"
-                     f" │ flat by {SELL_EXIT_TIME}")
+    if ENABLE_OPTIONS_SELLING and SELL_INSTRUMENTS and SELL_SETUPS:
+        for _stag in SELL_SETUPS:
+            for _sli in SELL_INSTRUMENTS:
+                threading.Thread(target=options_selling_loop, args=(_stag, _sli), daemon=True,
+                                 name=f"Sell_{_stag}_{_sli}").start()
+        _lines = []
+        for _stag, _c in SELL_SETUPS.items():
+            _rule = (f"Δ{_c['delta']:g}, target {_c['target_pct']:.0%}, stop {_c['stop_mult']:g}× credit"
+                     if _c["kind"] == "condor" else
+                     f"ATM, {_c['leg_sl_pct']:.0%} SL per leg" + (" → other to cost" if _c["sl_to_cost"] else ""))
+            _lines.append(f"• {_stag}: {_c['label']} — {_rule}, {_c['min_dte']}–{_c['max_dte']} DTE, "
+                          f"entry {_c['entry_start']}–{_c['entry_end']}, flat {_c['exit_time']}")
+        send_message(f"🟥 Option selling ON — {', '.join(SELL_INSTRUMENTS)} │ {SELL_LOTS} lot, hedged\n"
+                     + "\n".join(_lines)
+                     + ("\n📝 Paper: each setup tracked separately; monthly stop off for setups so "
+                        "every setup gets a full sample" if PAPER_TRADE else ""))
     else:
         print("⚠️ Options selling disabled (ENABLE_OPTIONS_SELLING=false)", flush=True)
 

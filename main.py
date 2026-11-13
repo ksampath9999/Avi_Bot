@@ -112,11 +112,26 @@ kite = KiteConnect(api_key=_KITE_API_KEY)
 # ≈ ₹52 per round trip — matches the Apr–Oct 2026 Zerodha statement).
 # State persists in PAPER_STATE_FILE. NOTE: Railway's disk resets on redeploy
 # unless you attach a Volume and point PAPER_STATE_FILE at it (e.g. /data/...).
+# ── Persistent data folder ────────────────────────────────────────────────────
+# Railway wipes the container disk on every redeploy. Attach a Railway Volume
+# (e.g. mounted at /data) and set DATA_DIR=/data so the paper balance, trade
+# log and open credit spreads survive redeploys. Empty = current folder.
+DATA_DIR = os.environ.get("DATA_DIR", "").strip()
+if DATA_DIR:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception as _dd_e:
+        print(f"⚠️ DATA_DIR {DATA_DIR} not usable ({_dd_e}) — using current folder", flush=True)
+        DATA_DIR = ""
+
+def _data_path(name):
+    return os.path.join(DATA_DIR, name) if DATA_DIR else name
+
 PAPER_TRADE             = os.environ.get("PAPER_TRADE", "false").lower() == "true"
 PAPER_CAPITAL           = float(os.environ.get("PAPER_CAPITAL", "10000"))
 PAPER_CHARGES_PER_ORDER = float(os.environ.get("PAPER_CHARGES_PER_ORDER", "26"))
 PAPER_AUTOSQ_CHARGE     = 59.0   # Zerodha auto square-off fee (₹50 + GST)
-PAPER_STATE_FILE        = os.environ.get("PAPER_STATE_FILE", "paper_state.json")
+PAPER_STATE_FILE        = os.environ.get("PAPER_STATE_FILE", "") or _data_path("paper_state.json")
 
 
 class PaperKite:
@@ -358,6 +373,14 @@ class PaperKite:
             self._state["round_trips"] += 1
             self._save()
             net = self._state["cash"] - self._state["start_capital"]
+            _isbuy = globals().get("_is_buying_position")
+            if _isbuy and not _isbuy(pos):
+                # Credit-spread leg: one leg always shows a "loss" even when the
+                # spread wins — don't alert per leg. The spread's own
+                # "CREDIT SPREAD CLOSED" message carries the real result.
+                print(f"📒 Paper ledger (spread leg {o['tradingsymbol']} {realized_now:+,.0f}) "
+                      f"balance ₹{self._state['cash']:,.0f}", flush=True)
+                return
             self._notify(
                 f"📒 PAPER LEDGER\n"
                 f"📌 {o['tradingsymbol']} closed: ₹{realized_now:+,.0f} (before charges)\n"
@@ -1367,37 +1390,7 @@ USE_SESSION_FILTER = False  # Session dead-zone filter (off)
 # ═══════════════════════════════════════════════════════════════════
 ENABLE_DELTA        = os.environ.get("ENABLE_DELTA",       "false").lower() == "true"
 
-# ── Options Selling ──────────────────────────────────────────────────────────
-ENABLE_OPTIONS_SELLING   = os.environ.get("ENABLE_OPTIONS_SELLING",   "false").lower() == "true"
-SELLING_STRATEGY         = os.environ.get("SELLING_STRATEGY",         "strangle")  # "strangle" | "condor"
-
-# Per-instrument enable flags for selling
-SELL_NIFTY     = os.environ.get("SELL_NIFTY",     "false").lower() == "true"
-SELL_BANKNIFTY = os.environ.get("SELL_BANKNIFTY", "false").lower() == "true"
-SELL_FINNIFTY  = os.environ.get("SELL_FINNIFTY",  "false").lower() == "true"
-SELL_SENSEX    = os.environ.get("SELL_SENSEX",    "true").lower()  == "true"  # default SENSEX only
-SELL_CRUDE     = os.environ.get("SELL_CRUDE",     "false").lower() == "true"
-
-SELLING_STRIKES_AWAY     = int(os.environ.get("SELLING_STRIKES_AWAY", "8"))        # OTM strikes from ATM (8 = safe distance from buying range)
-SELLING_MAX_LOSS_PCT     = float(os.environ.get("SELLING_MAX_LOSS_PCT","2.0"))      # exit if 2× premium
-SELLING_TARGET_PCT       = float(os.environ.get("SELLING_TARGET_PCT", "0.5"))      # exit at 50% profit
-SELLING_ENTRY_TIME_START = os.environ.get("SELLING_ENTRY_TIME_START", "09:30")     # entry window start
-SELLING_ENTRY_TIME_END   = os.environ.get("SELLING_ENTRY_TIME_END",   "10:30")     # entry window end
-SELLING_EXIT_TIME        = os.environ.get("SELLING_EXIT_TIME",        "15:10")     # force close
-SELLING_MAX_TRADES_DAY   = int(os.environ.get("SELLING_MAX_TRADES_DAY","1"))       # per instrument/day
-SELLING_VIX_MAX          = float(os.environ.get("SELLING_VIX_MAX",    "20.0"))     # skip VIX > 20
-SELLING_VIX_MIN          = float(os.environ.get("SELLING_VIX_MIN",    "12.0"))     # skip VIX < 12
-
-# Instruments to sell — list built from flags
-SELLING_INSTRUMENTS = [
-    inst for inst, flag in [
-        ("NIFTY",     SELL_NIFTY),
-        ("BANKNIFTY", SELL_BANKNIFTY),
-        ("FINNIFTY",  SELL_FINNIFTY),
-        ("SENSEX",    SELL_SENSEX),
-        ("CRUDE",     SELL_CRUDE),
-    ] if flag
-]
+# Options selling (iron condor) config lives in the OPTION SELLING MODULE below.
 DELTA_API_KEY       = os.environ.get("DELTA_API_KEY",       "")
 DELTA_API_SECRET    = os.environ.get("DELTA_API_SECRET",    "")
 DELTA_SYMBOL        = os.environ.get("DELTA_SYMBOL",        "BTCUSD")   # BTCUSD / ETHUSD
@@ -1537,6 +1530,9 @@ def _is_buying_position(p):
     for sp in list(cs.values()):
         if sym in (sp.get("short_sym"), sp.get("long_sym")):
             return False
+    for ic in list((globals().get("_sell_state") or {}).values()):
+        if sym in (ic.get("ce_short"), ic.get("pe_short"), ic.get("ce_long"), ic.get("pe_long")):
+            return False
     return True
 
 # ── Option-buying exit mode ───────────────────────────────────────────────────
@@ -1613,7 +1609,10 @@ def _month_pnl_net():
                     if not str(row.get("time", "")).startswith(_month):
                         continue
                     try:
-                        total += float(row.get("pnl") or 0) - CHARGES_PER_TRADE_EST
+                        _ins = str(row.get("instrument", ""))
+                        _chg = (104.0 if _ins.endswith("_CS") else
+                                208.0 if _ins.endswith("_IC") else CHARGES_PER_TRADE_EST)
+                        total += float(row.get("pnl") or 0) - _chg
                         n += 1
                     except ValueError:
                         pass
@@ -1758,7 +1757,7 @@ CRUDE_SYMBOL = None
 
 # Paper trades go to a separate log so they never mix with live history
 # (consecutive-loss checks, monthly stop, reports all read this file).
-TRADE_LOG_FILE = "paper_trade_log.csv" if PAPER_TRADE else "trade_log.csv"
+TRADE_LOG_FILE = _data_path("paper_trade_log.csv" if PAPER_TRADE else "trade_log.csv")
 if not os.path.exists(TRADE_LOG_FILE):
     with open(TRADE_LOG_FILE, "w") as _tlf:
         _tlf.write("time,instrument,symbol,signal,entry,exit,pnl,probability\n")
@@ -13004,311 +13003,6 @@ def delta_loop():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🔴 OPTIONS SELLING MODULE — Iron Condor / Short Strangle
-# Strategy: Sell OTM CE + Sell OTM PE → collect premium
-# Win rate: 70-80% (market stays in range)
-# Requires: ₹50,000+ margin per instrument
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ── Config ────────────────────────────────────────────────────────────────
-# Options selling config moved to top of file
-
-# ── State ─────────────────────────────────────────────────────────────────
-_selling_position = {
-    "active":       False,
-    "ce_symbol":    None,
-    "pe_symbol":    None,
-    "ce_entry":     0.0,
-    "pe_entry":     0.0,
-    "ce_qty":       0,
-    "pe_qty":       0,
-    "exchange":     None,
-    "entry_time":   0,
-    "total_premium":0.0,
-    "instrument":   None,
-}
-_selling_trade_count = 0
-_selling_daily_pnl   = 0.0
-
-
-def _selling_get_india_vix():
-    """Get India VIX from Kite."""
-    try:
-        vix_data = kite.quote(["NSE:INDIA VIX"])
-        return float(vix_data.get("NSE:INDIA VIX", {}).get("last_price", 16.0) or 16.0)
-    except Exception:
-        return 16.0   # default — assume normal VIX
-
-
-def find_otm_strike(instrument, option_type, strikes_away):
-    """
-    Find OTM strike for selling.
-    strikes_away: number of strikes away from ATM
-    Returns (symbol, strike, ltp) or (None, None, None)
-    """
-    try:
-        # Get ATM
-        _token_map = {
-            "SENSEX":    SENSEX_TOKEN,
-            "NIFTY":     config.NIFTY_TOKEN,
-            "BANKNIFTY": BANKNIFTY_TOKEN,
-        }
-        _ltp_map = {
-            "SENSEX":    "BSE:SENSEX",
-            "NIFTY":     "NSE:NIFTY 50",
-            "BANKNIFTY": "NSE:NIFTY BANK",
-        }
-        _step_map = {
-            "SENSEX":    100,
-            "NIFTY":     50,
-            "BANKNIFTY": 100,
-        }
-        _exchange_map = {
-            "SENSEX": "BFO",
-            "NIFTY":  "NFO",
-            "BANKNIFTY": "NFO",
-        }
-
-        _ltp_sym = _ltp_map.get(instrument)
-        _step    = _step_map.get(instrument, 50)
-        _exchange = _exchange_map.get(instrument, "NFO")
-
-        spot = float(kite.quote([_ltp_sym])[_ltp_sym]["last_price"])
-        atm  = round(spot / _step) * _step
-
-        # OTM strike — CE above ATM, PE below ATM
-        if option_type == "CE":
-            target_strike = atm + (strikes_away * _step)
-        else:
-            target_strike = atm - (strikes_away * _step)
-
-        # Get expiry instruments
-        instruments = kite.instruments(_exchange)
-        today = datetime.now(IST).date()
-
-        candidates = [
-            i for i in instruments
-            if i["name"] == instrument
-            and i["instrument_type"] == option_type
-            and i["expiry"] >= today
-            and abs(i["strike"] - target_strike) <= _step * 2
-        ]
-
-        if not candidates:
-            return None, None, None
-
-        # Sort by expiry (nearest first), then by strike proximity
-        candidates.sort(key=lambda x: (x["expiry"], abs(x["strike"] - target_strike)))
-        best = candidates[0]
-
-        sym = best["tradingsymbol"]
-        ltp_data = kite.quote([f"{_exchange}:{sym}"])
-        ltp = float(ltp_data.get(f"{_exchange}:{sym}", {}).get("last_price", 0) or 0)
-
-        if ltp < 1:
-            return None, None, None
-
-        return sym, best["strike"], ltp
-
-    except Exception as e:
-        print(f"⚠️ find_otm_strike error [{instrument} {option_type}]: {e}", flush=True)
-        return None, None, None
-
-
-def sell_option(symbol, qty, exchange, price):
-    """Place SELL order for options selling."""
-    try:
-        # SELL order — collect premium
-        order_id = kite.place_order(
-            variety   = "regular",
-            exchange  = exchange,
-            tradingsymbol = symbol,
-            transaction_type = "SELL",
-            quantity  = qty,
-            order_type = "LIMIT",
-            price     = round(price * 0.99, 1),   # 1% below LTP
-            product   = "MIS",
-        )
-        print(f"✅ SELL order placed: {symbol} qty={qty} @ ₹{price:.1f} id={order_id}", flush=True)
-        return order_id
-    except Exception as e:
-        print(f"❌ Sell order failed [{symbol}]: {e}", flush=True)
-        return None
-
-
-def buy_back_option(symbol, qty, exchange, price):
-    """Buy back sold option to close position."""
-    try:
-        order_id = kite.place_order(
-            variety   = "regular",
-            exchange  = exchange,
-            tradingsymbol = symbol,
-            transaction_type = "BUY",
-            quantity  = qty,
-            order_type = "LIMIT",
-            price     = round(price * 1.02, 1),   # 2% above LTP
-            product   = "MIS",
-        )
-        print(f"✅ BUY-BACK order placed: {symbol} qty={qty} @ ₹{price:.1f}", flush=True)
-        return order_id
-    except Exception as e:
-        print(f"❌ Buy-back failed [{symbol}]: {e}", flush=True)
-        return None
-
-
-def options_selling_loop():
-    """
-    Options Selling Loop — Iron Condor / Short Strangle.
-
-    Strategy:
-      Morning (9:30-10:30): Sell OTM CE + OTM PE
-      Collect premium
-      Exit when:
-        a) 50% profit (target hit) ← SELLING_TARGET_PCT
-        b) 2× premium loss (stop) ← SELLING_MAX_LOSS_PCT
-        c) 3:10 PM force close
-    """
-    global _selling_position, _selling_trade_count, _selling_daily_pnl
-
-    print(f"🔴 Options Selling loop started — {SELLING_INSTRUMENT} {SELLING_STRATEGY}", flush=True)
-    send_message(
-        f"🔴 OPTIONS SELLING STARTED\n"
-        f"📌 Instrument: {SELLING_INSTRUMENT}\n"
-        f"📊 Strategy: {SELLING_STRATEGY.upper()}\n"
-        f"🎯 Strikes away: {SELLING_STRIKES_AWAY}\n"
-        f"💰 Target: {SELLING_TARGET_PCT*100:.0f}% profit\n"
-        f"🛑 Stop: {SELLING_MAX_LOSS_PCT*100:.0f}% loss\n"
-        f"⏰ Entry window: {SELLING_ENTRY_TIME_START}-{SELLING_ENTRY_TIME_END}"
-    )
-
-    _lot_map  = {"SENSEX": 20, "NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "CRUDE": 100}
-    _exch_map = {"SENSEX": "BFO", "NIFTY": "NFO", "BANKNIFTY": "NFO", "FINNIFTY": "NFO", "CRUDE": "MCX"}
-    _last_reset = None
-
-    # Per-instrument state
-    _inst_positions    = {inst: dict(_selling_position) for inst in SELLING_INSTRUMENTS}
-    _inst_trade_counts = {inst: 0 for inst in SELLING_INSTRUMENTS}
-
-    while True:
-        try:
-            time.sleep(15)
-            now_ist = datetime.now(IST)
-
-            # Daily reset
-            _today = now_ist.date()
-            if _last_reset != _today:
-                _selling_trade_count = 0
-                _selling_daily_pnl   = 0.0
-                _selling_position    = {k: (False if k=="active" else None if isinstance(v,str) else 0.0 if isinstance(v,float) else 0)
-                                        for k,v in _selling_position.items()}
-                _last_reset = _today
-                print(f"🔴 Selling loop daily reset — {_today}", flush=True)
-                continue
-
-            # ── Manage ALL instrument positions ───────────────────────────
-            for SELLING_INSTRUMENT in SELLING_INSTRUMENTS:
-                _lot_size = _lot_map.get(SELLING_INSTRUMENT, 20)
-                _exchange  = _exch_map.get(SELLING_INSTRUMENT, "NFO")
-                _pos       = _inst_positions[SELLING_INSTRUMENT]
-                _trade_cnt = _inst_trade_counts[SELLING_INSTRUMENT]
-
-                # ── Manage open position ──────────────────────────────────
-                if _pos["active"]:
-                    ce_sym  = _pos["ce_symbol"]
-                    pe_sym  = _pos["pe_symbol"]
-                    ce_qty  = _pos["ce_qty"]
-                    pe_qty  = _pos["pe_qty"]
-                    ce_entry = _pos["ce_entry"]
-                    pe_entry = _pos["pe_entry"]
-                    total_premium = _pos["total_premium"]
-
-                    try:
-                        _quotes = kite.quote([f"{_exchange}:{ce_sym}", f"{_exchange}:{pe_sym}"])
-                        ce_ltp = float(_quotes.get(f"{_exchange}:{ce_sym}", {}).get("last_price", ce_entry) or ce_entry)
-                        pe_ltp = float(_quotes.get(f"{_exchange}:{pe_sym}", {}).get("last_price", pe_entry) or pe_entry)
-                    except Exception:
-                        continue
-
-                    current_premium = (ce_ltp * ce_qty) + (pe_ltp * pe_qty)
-                    pnl     = total_premium - current_premium
-                    pnl_pct = pnl / total_premium if total_premium > 0 else 0
-
-                    _exit_h, _exit_m = map(int, SELLING_EXIT_TIME.split(":"))
-                    _force_exit  = (now_ist.hour > _exit_h or (now_ist.hour == _exit_h and now_ist.minute >= _exit_m))
-                    _target_hit  = pnl_pct >= SELLING_TARGET_PCT
-                    _sl_hit      = current_premium >= total_premium * (1 + SELLING_MAX_LOSS_PCT)
-
-                    if _force_exit or _target_hit or _sl_hit:
-                        _reason = ("⏰ Force close" if _force_exit else
-                                   "🎯 Target hit" if _target_hit else "🛑 Stop loss")
-                        print(f"🔴 {SELLING_INSTRUMENT} SELLING EXIT: {_reason} P&L=₹{pnl:.0f}", flush=True)
-                        buy_back_option(ce_sym, ce_qty, _exchange, ce_ltp)
-                        time.sleep(0.5)
-                        buy_back_option(pe_sym, pe_qty, _exchange, pe_ltp)
-                        _selling_daily_pnl += pnl
-                        _inst_positions[SELLING_INSTRUMENT]["active"] = False
-                        send_message(
-                            f"🔴 {SELLING_INSTRUMENT} SELLING CLOSED\n"
-                            f"💰 P&L: ₹{pnl:.0f} ({pnl_pct*100:.1f}%)\n"
-                            f"📊 {_reason}\n"
-                            f"💼 Daily P&L: ₹{_selling_daily_pnl:.0f}"
-                        )
-                    else:
-                        print(f"🔴 {SELLING_INSTRUMENT} selling: CE=₹{ce_ltp:.1f} PE=₹{pe_ltp:.1f} "
-                              f"P&L=₹{pnl:.0f} ({pnl_pct*100:.1f}%)", flush=True)
-                    continue
-
-                # ── New position entry ────────────────────────────────────
-                if _trade_cnt >= SELLING_MAX_TRADES_DAY:
-                    continue
-
-                _start_h, _start_m = map(int, SELLING_ENTRY_TIME_START.split(":"))
-                _end_h,   _end_m   = map(int, SELLING_ENTRY_TIME_END.split(":"))
-                _now_mins = now_ist.hour * 60 + now_ist.minute
-                if not (_start_h * 60 + _start_m <= _now_mins <= _end_h * 60 + _end_m):
-                    continue
-
-                _vix = _selling_get_india_vix()
-                if _vix > SELLING_VIX_MAX or _vix < SELLING_VIX_MIN:
-                    continue
-
-                ce_sym, ce_strike, ce_ltp = find_otm_strike(SELLING_INSTRUMENT, "CE", SELLING_STRIKES_AWAY)
-                pe_sym, pe_strike, pe_ltp = find_otm_strike(SELLING_INSTRUMENT, "PE", SELLING_STRIKES_AWAY)
-
-                if not ce_sym or not pe_sym or ce_ltp < 5 or pe_ltp < 5:
-                    continue
-
-                total_premium = (ce_ltp * _lot_size) + (pe_ltp * _lot_size)
-                ce_order = sell_option(ce_sym, _lot_size, _exchange, ce_ltp)
-                time.sleep(0.5)
-                pe_order = sell_option(pe_sym, _lot_size, _exchange, pe_ltp)
-
-                if not ce_order or not pe_order:
-                    continue
-
-                _inst_positions[SELLING_INSTRUMENT].update({
-                    "active": True, "ce_symbol": ce_sym, "pe_symbol": pe_sym,
-                    "ce_entry": ce_ltp, "pe_entry": pe_ltp,
-                    "ce_qty": _lot_size, "pe_qty": _lot_size,
-                    "exchange": _exchange, "entry_time": time.time(),
-                    "total_premium": total_premium, "instrument": SELLING_INSTRUMENT,
-                })
-                _inst_trade_counts[SELLING_INSTRUMENT] += 1
-
-                send_message(
-                    f"🔴 {SELLING_INSTRUMENT} SELLING OPENED\n"
-                    f"📈 CE: {ce_sym} @ ₹{ce_ltp:.1f}\n"
-                    f"📉 PE: {pe_sym} @ ₹{pe_ltp:.1f}\n"
-                    f"💰 Premium: ₹{total_premium:.0f}\n"
-                    f"🎯 Target: ₹{total_premium*SELLING_TARGET_PCT:.0f}\n"
-                    f"📊 VIX: {_vix:.1f}"
-                )
-
-        except Exception as e:
-            print(f"❌ Options selling loop error: {e}", flush=True)
-            time.sleep(30)
-
-# ═══════════════════════════════════════════════════════════════════════════
 # 🧭 DIRECTION SIGNALS — shared by the credit-spread module AND the backtest
 # (backtest_credit_spread.py loads these exact functions from this file)
 # Each returns a numpy array per bar: +1 bullish, -1 bearish, 0 no signal.
@@ -13478,7 +13172,7 @@ CS_ENTRY_START   = os.environ.get("CS_ENTRY_START", "09:45")
 CS_ENTRY_END     = os.environ.get("CS_ENTRY_END", "14:30")
 CS_VIX_MAX       = float(os.environ.get("CS_VIX_MAX", "24"))
 CS_PRODUCT       = os.environ.get("CS_PRODUCT", "NRML")
-CS_STATE_FILE    = os.environ.get("CS_STATE_FILE", "credit_spread_state.json")
+CS_STATE_FILE    = os.environ.get("CS_STATE_FILE", "") or _data_path("credit_spread_state.json")
 CS_RISK_FREE     = 0.065
 
 _CS_SPEC = {
@@ -13730,6 +13424,11 @@ def _cs_lots_allowed(instrument, sp):
 
 
 def _cs_enter(instrument, sp):
+    _busy = set()
+    for _ic in list((globals().get("_sell_state") or {}).values()):
+        _busy.update({_ic.get("ce_short"), _ic.get("pe_short"), _ic.get("ce_long"), _ic.get("pe_long")})
+    if sp["short_sym"] in _busy or sp["long_sym"] in _busy:
+        return False, "a leg is already used by an open iron condor"
     lots, lot, max_loss_lot, capital = _cs_lots_allowed(instrument, sp)
     if lots < 1:
         return False, (f"capital ₹{capital:,.0f} too small: 1 lot risks ₹{max_loss_lot:,.0f} "
@@ -13815,6 +13514,7 @@ def _cs_exit(instrument, reason, spread_val=None):
         f"📌 {reason}\n"
         f"💰 Credit ₹{sp['credit']:.1f} → closed at ₹{exit_val:.1f}\n"
         f"📊 P&L ₹{pnl:+,.0f} (≈ ₹{pnl - est_charges:+,.0f} after ~₹{est_charges:.0f} charges)"
+        + (f"\n{kite.summary()}" if PAPER_TRADE and hasattr(kite, "summary") else "")
     )
 
 
@@ -13933,6 +13633,545 @@ def credit_spread_loop(instrument):
         except Exception as e:
             print(f"❌ CS loop error [{instrument}]: {e}", flush=True)
             time.sleep(30)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🟥 OPTION SELLING MODULE — INTRADAY IRON CONDOR (hedged short strangle)
+# ═══════════════════════════════════════════════════════════════════════════
+# Non-directional premium selling on expiry week (works in PAPER_TRADE mode).
+#   SELL an OTM call + an OTM put at ~SELL_SHORT_DELTA   (collect premium)
+#   BUY  a call SELL_WING points higher + a put SELL_WING points lower (hedges)
+# Hedges are bought FIRST, so the position is never naked and margin is
+# ~₹40–60k instead of ~₹1.5–2L for a naked strangle. Worst case is capped at
+# (wing − credit) × qty.
+#
+# Entry : SELL_ENTRY_START–SELL_ENTRY_END, nearest weekly expiry with
+#         SELL_MIN_DTE..SELL_MAX_DTE days left (default 0–2 → expiry week only,
+#         when time decay is fastest), VIX in SELL_VIX_MIN..SELL_VIX_MAX,
+#         total credit ≥ SELL_MIN_CREDIT_PCT of the wing, max loss ≤
+#         SELL_MAX_RISK_PCT of capital, monthly loss stop not hit.
+#         One condor per instrument per day.
+# Exit  : kept SELL_TARGET_PCT of credit │ loss reached SELL_STOP_MULT × credit
+#         │ SELL_EXIT_TIME (always flat same day). Shorts are bought back FIRST.
+# Products: NRML (never MIS) — keeps the option-buying side from touching legs.
+# Costs : 8 orders per condor ≈ ₹208 — included in alerts and the scorecard.
+# ═══════════════════════════════════════════════════════════════════════════
+ENABLE_OPTIONS_SELLING = os.environ.get("ENABLE_OPTIONS_SELLING", "false").lower() == "true"
+
+
+def _sell_instruments_from_env():
+    raw = os.environ.get("SELL_INSTRUMENTS")
+    if raw is None:   # backward compat with old SELL_NIFTY / SELL_SENSEX flags
+        raw = ",".join(n for n in ("NIFTY", "SENSEX")
+                       if os.environ.get(f"SELL_{n}", "").lower() == "true") or "NIFTY"
+    return [x.strip().upper() for x in raw.split(",") if x.strip().upper() in _CS_SPEC]
+
+
+SELL_INSTRUMENTS    = _sell_instruments_from_env()
+SELL_LOTS           = int(os.environ.get("SELL_LOTS", "1"))
+SELL_SHORT_DELTA    = float(os.environ.get("SELL_SHORT_DELTA", "0.20"))
+SELL_WING           = {"NIFTY":  int(os.environ.get("SELL_WING_NIFTY",  "150")),
+                       "SENSEX": int(os.environ.get("SELL_WING_SENSEX", "500"))}
+SELL_MIN_DTE        = int(os.environ.get("SELL_MIN_DTE", "0"))
+SELL_MAX_DTE        = int(os.environ.get("SELL_MAX_DTE", "2"))
+SELL_MIN_CREDIT_PCT = float(os.environ.get("SELL_MIN_CREDIT_PCT", "0.10"))   # total credit / wing
+SELL_TARGET_PCT     = float(os.environ.get("SELL_TARGET_PCT", "0.50"))
+SELL_STOP_MULT      = float(os.environ.get("SELL_STOP_MULT", "1.0"))         # 0 = no stop (hedge caps)
+SELL_ENTRY_START    = os.environ.get("SELL_ENTRY_START", "09:30")
+SELL_ENTRY_END      = os.environ.get("SELL_ENTRY_END", "11:00")
+SELL_EXIT_TIME      = os.environ.get("SELL_EXIT_TIME", "15:10")
+SELL_VIX_MIN        = float(os.environ.get("SELL_VIX_MIN", "11"))
+SELL_VIX_MAX        = float(os.environ.get("SELL_VIX_MAX", "22"))
+SELL_MAX_RISK_PCT   = float(os.environ.get("SELL_MAX_RISK_PCT", "0.06"))
+SELL_STATE_FILE     = os.environ.get("SELL_STATE_FILE", "") or _data_path("iron_condor_state.json")
+SELL_ORDERS_PER_TRIP = 8
+
+_sell_lock  = threading.RLock()
+_sell_state = {}     # instrument -> open condor
+_sell_meta  = {}     # instrument -> {"last_entry_day": "YYYY-MM-DD"}
+
+
+def _sell_load():
+    global _sell_state, _sell_meta
+    try:
+        if os.path.exists(SELL_STATE_FILE):
+            with open(SELL_STATE_FILE) as f:
+                d = _cs_json.load(f)
+            _sell_state, _sell_meta = d.get("open", {}), d.get("meta", {})
+            print(f"🟥 Iron-condor state loaded: {list(_sell_state)}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Iron-condor state load failed: {e}", flush=True)
+
+
+def _sell_save():
+    try:
+        with _sell_lock:
+            tmp = SELL_STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                _cs_json.dump({"open": _sell_state, "meta": _sell_meta}, f, indent=1, default=str)
+            os.replace(tmp, SELL_STATE_FILE)
+    except Exception as e:
+        print(f"⚠️ Iron-condor state save failed: {e}", flush=True)
+
+
+def _sell_symbols(ic):
+    return [ic["ce_short"], ic["pe_short"], ic["ce_long"], ic["pe_long"]]
+
+
+def _sell_busy_symbols():
+    """Symbols held by any open credit spread or condor (they must never share a leg)."""
+    out = set()
+    for sp in list(_cs_state.values()):
+        out.update({sp.get("short_sym"), sp.get("long_sym")})
+    for ic in list(_sell_state.values()):
+        out.update(_sell_symbols(ic))
+    out.discard(None)
+    return out
+
+
+def _sell_pick_expiry(instrument, today):
+    spec = _CS_SPEC[instrument]
+    exps = sorted({i["expiry"] for i in get_instruments_cached(spec["exchange"])
+                   if i["name"] == spec["name"] and i["instrument_type"] in ("CE", "PE")
+                   and i["expiry"] >= today})
+    for e in exps:
+        if SELL_MIN_DTE <= (e - today).days <= SELL_MAX_DTE:
+            return e
+    return None
+
+
+def _sell_pick_short(chain, ltps, S, T, is_call):
+    """Strike whose |delta| is closest to SELL_SHORT_DELTA (never above it by > 0.07)."""
+    best = None
+    for k, ins in chain.items():
+        if (k <= S) if is_call else (k >= S):
+            continue
+        p = ltps.get(ins["tradingsymbol"])
+        iv = _cs_iv(p, S, k, T, CS_RISK_FREE, is_call)
+        if not iv:
+            continue
+        d = abs(_cs_delta(S, k, T, CS_RISK_FREE, iv, is_call))
+        if d > SELL_SHORT_DELTA + 0.07:
+            continue
+        score = abs(d - SELL_SHORT_DELTA)
+        if best is None or score < best[0]:
+            best = (score, k, p, d, iv)
+    return best
+
+
+def _sell_build(instrument, now):
+    """Pick the four strikes. Returns (condor_dict, None) or (None, reason)."""
+    spec  = _CS_SPEC[instrument]
+    expiry = _sell_pick_expiry(instrument, now.date())
+    if not expiry:
+        return None, f"no expiry {SELL_MIN_DTE}–{SELL_MAX_DTE} days out (not expiry week)"
+    S = safe_ltp(spec["spot"])
+    if not S:
+        return None, "no spot price"
+    T = _cs_years_to_expiry(expiry, now)
+    wing = SELL_WING[instrument]
+    legs = {}
+    for otype in ("CE", "PE"):
+        is_call = otype == "CE"
+        chain = {int(i["strike"]): i for i in get_instruments_cached(spec["exchange"])
+                 if i["name"] == spec["name"] and i["instrument_type"] == otype
+                 and i["expiry"] == expiry and abs(i["strike"] - S) <= S * 0.05}
+        if not chain:
+            return None, f"empty {otype} chain"
+        ltps = _cs_ltps(spec["exchange"], [c["tradingsymbol"] for c in chain.values()])
+        best = _sell_pick_short(chain, ltps, S, T, is_call)
+        if not best:
+            return None, f"no {otype} strike near delta {SELL_SHORT_DELTA}"
+        _, ks, ps, d, iv = best
+        kl = ks + wing if is_call else ks - wing
+        if kl not in chain:
+            return None, f"{otype} hedge strike {kl} not listed"
+        lsym = chain[kl]["tradingsymbol"]
+        pl = ltps.get(lsym) or _cs_ltps(spec["exchange"], [lsym]).get(lsym)
+        if not pl:
+            return None, f"no {otype} hedge price"
+        legs[otype] = {"short_sym": chain[ks]["tradingsymbol"], "long_sym": lsym,
+                       "short_strike": ks, "long_strike": kl, "short_ref": ps, "long_ref": pl,
+                       "delta": round(d, 3), "iv": round(iv, 3)}
+    ce, pe = legs["CE"], legs["PE"]
+    credit = (ce["short_ref"] - ce["long_ref"]) + (pe["short_ref"] - pe["long_ref"])
+    if credit < SELL_MIN_CREDIT_PCT * wing:
+        return None, (f"credit ₹{credit:.1f} < {SELL_MIN_CREDIT_PCT:.0%} of {wing}-pt wing — "
+                      f"not worth the risk")
+    busy = _sell_busy_symbols()
+    clash = [s for s in (ce["short_sym"], ce["long_sym"], pe["short_sym"], pe["long_sym"]) if s in busy]
+    if clash:
+        return None, f"leg {clash[0]} already used by an open credit spread"
+    for sym, tol in ((ce["short_sym"], 0.10), (pe["short_sym"], 0.10),
+                     (ce["long_sym"], 0.40), (pe["long_sym"], 0.40)):
+        ok, why = _cs_liquid(spec["exchange"], sym, tol)
+        if not ok:
+            return None, why
+    return {"instrument": instrument, "exchange": spec["exchange"], "expiry": str(expiry),
+            "dte": (expiry - now.date()).days, "wing": wing, "spot": S,
+            "ce_short": ce["short_sym"], "ce_long": ce["long_sym"],
+            "pe_short": pe["short_sym"], "pe_long": pe["long_sym"],
+            "ce_short_strike": ce["short_strike"], "ce_long_strike": ce["long_strike"],
+            "pe_short_strike": pe["short_strike"], "pe_long_strike": pe["long_strike"],
+            "ref": {ce["short_sym"]: ce["short_ref"], ce["long_sym"]: ce["long_ref"],
+                    pe["short_sym"]: pe["short_ref"], pe["long_sym"]: pe["long_ref"]},
+            "ce_delta": ce["delta"], "pe_delta": pe["delta"], "credit_ref": round(credit, 2)}, None
+
+
+def _sell_lots_allowed(instrument, ic):
+    lot = _get_lot_size(instrument)
+    max_loss_lot = max(ic["wing"] - ic["credit_ref"], 0) * lot
+    capital = get_balance(instrument) or 0
+    budget = capital * SELL_MAX_RISK_PCT
+    cap = int(budget // max_loss_lot) if max_loss_lot > 0 else 0
+    lots = min(SELL_LOTS, cap) if SELL_LOTS > 0 else cap
+    return lots, lot, max_loss_lot, capital
+
+
+def _sell_enter(instrument, ic):
+    lots, lot, max_loss_lot, capital = _sell_lots_allowed(instrument, ic)
+    if lots < 1:
+        return False, (f"capital ₹{capital:,.0f} too small: 1 lot risks ₹{max_loss_lot:,.0f} "
+                       f"> {SELL_MAX_RISK_PCT:.0%} of capital")
+    qty = lots * lot
+    ex = ic["exchange"]
+    try:
+        basket = [{"exchange": ex, "tradingsymbol": s, "transaction_type": side, "variety": "regular",
+                   "product": CS_PRODUCT, "order_type": "MARKET", "quantity": qty, "price": 0}
+                  for s, side in ((ic["ce_long"], "BUY"), (ic["pe_long"], "BUY"),
+                                  (ic["ce_short"], "SELL"), (ic["pe_short"], "SELL"))]
+        m = kite.basket_order_margins(basket, consider_positions=True, mode="compact")
+        need = float((m.get("final") or m.get("initial") or {}).get("total", 0))
+        if need and need > capital:
+            return False, f"margin ₹{need:,.0f} > available ₹{capital:,.0f}"
+        ic["margin"] = round(need, 0)
+    except Exception as e:
+        print(f"ℹ️ Iron-condor margin check skipped: {e}", flush=True)
+
+    fills, done = {}, []      # done = [(symbol, side)] for unwinding
+    plan = [(ic["ce_long"], "BUY"), (ic["pe_long"], "BUY"),
+            (ic["ce_short"], "SELL"), (ic["pe_short"], "SELL")]
+    for sym, side in plan:
+        px = _cs_order(ex, sym, side, qty, ic["ref"][sym])
+        if px is None:
+            stuck = []
+            for usym, uside in reversed(done):      # shorts first, then hedges
+                back = "BUY" if uside == "SELL" else "SELL"
+                if _cs_order(ex, usym, back, qty, fills[usym]) is None:
+                    stuck.append(f"{back} {usym} ×{qty}")
+            send_message(f"⚠️ IRON CONDOR ABORTED — {instrument}\n{side} {sym} did not fill.\n"
+                         + ("Filled legs closed again." if not stuck else
+                            "🚨 CLOSE MANUALLY: " + ", ".join(stuck)))
+            return False, f"{side} {sym} did not fill"
+        fills[sym] = px
+        done.append((sym, side))
+    credit = (fills[ic["ce_short"]] - fills[ic["ce_long"]]) + (fills[ic["pe_short"]] - fills[ic["pe_long"]])
+    ic.update({"qty": qty, "lots": lots, "fills": fills, "credit": round(credit, 2),
+               "entry_time": datetime.now(IST).isoformat(),
+               "max_loss": round((ic["wing"] - credit) * qty, 0)})
+    with _sell_lock:
+        _sell_state[instrument] = ic
+        _sell_meta.setdefault(instrument, {})["last_entry_day"] = datetime.now(IST).strftime("%Y-%m-%d")
+    _sell_save()
+    cr_rs = credit * qty
+    stop_txt = (f"Stop −₹{cr_rs * SELL_STOP_MULT:,.0f}" if SELL_STOP_MULT > 0 else "No stop")
+    send_message(
+        f"🟥 IRON CONDOR OPENED — {instrument} ({ic['dte']} day(s) to expiry)\n"
+        f"📈 SELL {ic['ce_short']} @ ₹{fills[ic['ce_short']]:.1f} (Δ {ic['ce_delta']:.2f}) "
+        f"│ hedge {ic['ce_long']} @ ₹{fills[ic['ce_long']]:.1f}\n"
+        f"📉 SELL {ic['pe_short']} @ ₹{fills[ic['pe_short']]:.1f} (Δ {ic['pe_delta']:.2f}) "
+        f"│ hedge {ic['pe_long']} @ ₹{fills[ic['pe_long']]:.1f}\n"
+        f"🎯 Profit zone {ic['pe_short_strike']}–{ic['ce_short_strike']} │ Spot {ic['spot']:.0f}\n"
+        f"💰 Credit ₹{credit:.1f} × {qty} = ₹{cr_rs:,.0f}\n"
+        f"🎯 Target +₹{cr_rs * SELL_TARGET_PCT:,.0f} │ 🛑 {stop_txt} │ Max loss −₹{ic['max_loss']:,.0f}\n"
+        f"⏰ Closes by {SELL_EXIT_TIME} today │ charges ≈ ₹{SELL_ORDERS_PER_TRIP * 26}"
+    )
+    return True, ""
+
+
+def _sell_value(ic):
+    """Current cost to close the condor (per unit). None if prices missing."""
+    px = _cs_ltps(ic["exchange"], _sell_symbols(ic))
+    if any(px.get(s) is None for s in _sell_symbols(ic)):
+        return None, px
+    return (px[ic["ce_short"]] + px[ic["pe_short"]] - px[ic["ce_long"]] - px[ic["pe_long"]]), px
+
+
+def _sell_exit(instrument, reason):
+    with _sell_lock:
+        ic = _sell_state.get(instrument)
+    if not ic:
+        return
+    qty, ex, f = ic["qty"], ic["exchange"], ic["fills"]
+    _, px = _sell_value(ic)
+    out, failed = {}, []
+    for sym in (ic["ce_short"], ic["pe_short"]):               # shorts first
+        if sym in ic.get("closed_shorts", {}):
+            continue
+        r = _cs_order(ex, sym, "BUY", qty, px.get(sym) or f[sym])
+        if r is None:
+            failed.append(sym)
+        else:
+            out[sym] = r
+    if failed:
+        # keep the hedges on — they still protect the unclosed short(s)
+        with _sell_lock:
+            ic["closed_shorts"] = {**ic.get("closed_shorts", {}), **out}
+        _sell_save()
+        send_message(f"🚨 IRON CONDOR EXIT FAILED — {instrument}\nBUY BACK {', '.join(failed)} ×{qty} "
+                     f"MANUALLY NOW (hedges kept on so you stay protected). Will retry.")
+        return
+    out.update(ic.get("closed_shorts", {}))
+    for sym in (ic["ce_long"], ic["pe_long"]):
+        r = _cs_order(ex, sym, "SELL", qty, px.get(sym) or f[sym])
+        if r is None:
+            send_message(f"⚠️ Hedge {sym} ×{qty} did not sell — sell it manually (no risk, "
+                         f"only leftover premium)")
+            r = 0.0
+        out[sym] = r
+    exit_val = out[ic["ce_short"]] + out[ic["pe_short"]] - out[ic["ce_long"]] - out[ic["pe_long"]]
+    pnl = (ic["credit"] - exit_val) * qty
+    est = SELL_ORDERS_PER_TRIP * (PAPER_CHARGES_PER_ORDER if PAPER_TRADE else 26)
+    try:
+        log_trade_full(f"{ic['pe_short']}/{ic['ce_short']}", ic["credit"], round(exit_val, 2),
+                       round(pnl, 2), f"{instrument}_IC", "IRON_CONDOR", 0)
+    except Exception as e:
+        print(f"⚠️ Iron-condor log failed: {e}", flush=True)
+    with _sell_lock:
+        _sell_state.pop(instrument, None)
+    _sell_save()
+    _month_pnl_cache["t"] = 0
+    send_message(
+        f"{'✅' if pnl > 0 else '❌'} IRON CONDOR CLOSED — {instrument}\n"
+        f"📌 {reason}\n"
+        f"💰 Credit ₹{ic['credit']:.1f} → closed at ₹{exit_val:.1f}\n"
+        f"📊 P&L ₹{pnl:+,.0f} (≈ ₹{pnl - est:+,.0f} after ~₹{est:.0f} charges)"
+        + (f"\n{kite.summary()}" if PAPER_TRADE and hasattr(kite, "summary") else "")
+    )
+
+
+def _sell_manage(instrument, now):
+    with _sell_lock:
+        ic = dict(_sell_state.get(instrument) or {})
+    if not ic:
+        return
+    reason = None
+    entry_day = str(ic.get("entry_time", ""))[:10]
+    if entry_day and entry_day != now.strftime("%Y-%m-%d"):
+        reason = "CARRIED OVER — closing a condor left open from a previous day"
+    elif _past_hm(now, _hhmm(SELL_EXIT_TIME, (15, 10))):
+        reason = f"TIME — {SELL_EXIT_TIME} intraday close"
+    elif ic.get("closed_shorts"):
+        reason = "RETRY — finishing a partly closed condor"
+    val, px = _sell_value(ic)
+    if val is None and not reason:
+        return
+    if val is not None:
+        pnl = (ic["credit"] - val) * ic["qty"]
+        if not reason and val <= ic["credit"] * (1 - SELL_TARGET_PCT):
+            reason = f"TARGET — kept {SELL_TARGET_PCT:.0%} of credit"
+        elif not reason and SELL_STOP_MULT > 0 and val >= ic["credit"] * (1 + SELL_STOP_MULT):
+            reason = f"STOP — loss reached {SELL_STOP_MULT:g}× credit"
+        hb = getattr(_sell_manage, f"_hb_{instrument}", 0)
+        if time.time() - hb > 900:
+            setattr(_sell_manage, f"_hb_{instrument}", time.time())
+            print(f"🟥 {instrument} condor val ₹{val:.1f} (credit ₹{ic['credit']:.1f}) "
+                  f"P&L ₹{pnl:+,.0f}", flush=True)
+    if reason:
+        print(f"🟥 {instrument} condor exit: {reason}", flush=True)
+        _sell_exit(instrument, reason)
+
+
+def _sell_reconcile(instrument):
+    """After a restart: drop saved state whose short legs are no longer open."""
+    with _sell_lock:
+        ic = _sell_state.get(instrument)
+    if not ic:
+        return
+    try:
+        net = {p["tradingsymbol"]: p["quantity"] for p in kite.positions().get("net", [])}
+    except Exception as e:
+        print(f"⚠️ Iron-condor reconcile skipped: {e}", flush=True)
+        return
+    open_shorts = [s for s in (ic["ce_short"], ic["pe_short"])
+                   if s not in ic.get("closed_shorts", {}) and net.get(s, 0) < 0]
+    if not open_shorts:
+        send_message(f"ℹ️ {instrument} iron condor in saved state but its short legs are not open "
+                     f"in Kite — clearing state. Check Kite.")
+        with _sell_lock:
+            _sell_state.pop(instrument, None)
+        _sell_save()
+
+
+def options_selling_loop(instrument):
+    print(f"🟥 Iron-condor loop started — {instrument}", flush=True)
+    _sell_reconcile(instrument)
+    last_reason = None
+    while True:
+        try:
+            now = datetime.now(IST)
+            hb = getattr(options_selling_loop, f"_alive_{instrument}", 0)
+            if time.time() - hb > 300:
+                setattr(options_selling_loop, f"_alive_{instrument}", time.time())
+                print(f"💓 IC {instrument} loop alive — {now.strftime('%H:%M')}", flush=True)
+            if not (now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 29)):
+                time.sleep(60)
+                continue
+            if _sell_state.get(instrument):
+                _sell_manage(instrument, now)
+                time.sleep(10)
+                continue
+            if not (_past_hm(now, _hhmm(SELL_ENTRY_START, (9, 30)))
+                    and not _past_hm(now, _hhmm(SELL_ENTRY_END, (11, 0)))):
+                time.sleep(60)
+                continue
+            if _sell_meta.get(instrument, {}).get("last_entry_day") == now.strftime("%Y-%m-%d"):
+                time.sleep(300)                       # one condor per day
+                continue
+            reason = None
+            if MONTHLY_MAX_LOSS > 0 and _month_pnl_net()[0] <= -MONTHLY_MAX_LOSS:
+                reason = "monthly loss stop active"
+            if not reason:
+                vix = get_india_vix()
+                if vix and not (SELL_VIX_MIN <= vix <= SELL_VIX_MAX):
+                    reason = f"VIX {vix:.1f} outside {SELL_VIX_MIN:g}–{SELL_VIX_MAX:g}"
+            ic = None
+            if not reason:
+                ic, reason = _sell_build(instrument, now)
+            if ic:
+                ok, reason = _sell_enter(instrument, ic)
+                if ok:
+                    last_reason = None
+                    continue
+            if reason and reason != last_reason:
+                print(f"🟥 {instrument} condor no entry: {reason}", flush=True)
+                last_reason = reason
+            time.sleep(120)
+        except Exception as e:
+            print(f"❌ Iron-condor loop error [{instrument}]: {e}", flush=True)
+            time.sleep(30)
+
+
+_sell_load()
+
+
+# ── Weekly scorecard (Telegram) ───────────────────────────────────────────────
+# Every SCORECARD_WEEKDAY (default Friday) after SCORECARD_TIME, sends the
+# running credit-spread scorecard + a one-line option-buying summary, checked
+# against the targets that decide profitability for this strategy shape.
+SCORECARD_WEEKDAY      = int(os.environ.get("SCORECARD_WEEKDAY", "4"))      # 0=Mon … 4=Fri
+SCORECARD_TIME         = os.environ.get("SCORECARD_TIME", "15:45")
+SC_TARGET_WIN_RATE     = float(os.environ.get("SC_TARGET_WIN_RATE", "86"))  # %
+SC_TARGET_MAX_AVG_LOSS = float(os.environ.get("SC_TARGET_MAX_AVG_LOSS", "3000"))
+SC_SPREAD_CHARGES      = 4 * 26.0     # 4 orders per spread round trip
+SC_BUY_CHARGES         = 52.0         # 2 orders per option-buying round trip
+SC_CONDOR_CHARGES      = 8 * 26.0     # 8 orders per iron-condor round trip
+SC_IC_TARGET_WIN_RATE  = float(os.environ.get("SC_IC_TARGET_WIN_RATE", "72"))  # %
+
+
+def _scorecard_text(now=None):
+    """Build the scorecard from the trade log. Returns a Telegram-ready string."""
+    import csv as _csv
+    now = now or datetime.now(IST)
+    log = globals().get("TRADE_LOG_FILE", "trade_log.csv")
+    rows = []
+    try:
+        if os.path.exists(log):
+            with open(log) as f:
+                rows = list(_csv.DictReader(f))
+    except Exception as e:
+        return f"⚠️ Scorecard: could not read {log}: {e}"
+
+    def _pnl(r):
+        try:
+            return float(r.get("pnl") or 0)
+        except ValueError:
+            return 0.0
+
+    cs  = [r for r in rows if str(r.get("instrument", "")).endswith("_CS")]
+    ic  = [r for r in rows if str(r.get("instrument", "")).endswith("_IC")]
+    buy = [r for r in rows if r.get("instrument")
+           and not str(r.get("instrument")).endswith(("_CS", "_IC"))]
+    week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+    mode = "PAPER" if globals().get("PAPER_TRADE") else "LIVE"
+    lines = [f"📊 WEEKLY SCORECARD ({mode}) — {now.strftime('%d %b %Y')}"]
+
+    def _block(rows_, title, suffix, charges, wr_target, min_n, judge_txt):
+        nets = [_pnl(r) - charges for r in rows_]
+        if not nets:
+            return [f"{title}: none closed yet"]
+        wins   = [x for x in nets if x > 0]
+        losses = [x for x in nets if x <= 0]
+        n, wr  = len(nets), len(wins) / len(nets) * 100
+        avg_w  = sum(wins) / len(wins) if wins else 0.0
+        avg_l  = -sum(losses) / len(losses) if losses else 0.0
+        total  = sum(nets)
+        eq, peak, dd = 0.0, 0.0, 0.0
+        for x in nets:
+            eq += x; peak = max(peak, eq); dd = min(dd, eq - peak)
+        be_wr  = (avg_l / (avg_w + avg_l) * 100) if (avg_w + avg_l) > 0 and losses else 0.0
+        wk     = [_pnl(r) - charges for r in rows_ if str(r.get("time", "")) >= week_start]
+        by_inst = {}
+        for r, x in zip(rows_, nets):
+            k = r["instrument"].replace(suffix, "")
+            v = by_inst.setdefault(k, [0, 0, 0.0]); v[0] += 1; v[1] += x > 0; v[2] += x
+        ok = lambda c: "✅" if c else "❌"
+        out = [
+            f"{title} — {n} closed ({len(wk)} this week, ₹{sum(wk):+,.0f})",
+            f"   Win rate: {wr:.0f}%  ({len(wins)}W / {len(losses)}L)",
+            f"   Avg win ₹{avg_w:,.0f} │ Avg loss {('₹' + format(-avg_l, ',.0f')) if losses else '—'} │ Worst ₹{min(nets):+,.0f}",
+            f"   Net P&L ₹{total:+,.0f} │ per trade ₹{total / n:+,.0f} │ Max drawdown ₹{dd:,.0f}",
+            "   " + " │ ".join(f"{k}: {v[0]} ({v[1]}W) ₹{v[2]:+,.0f}" for k, v in by_inst.items()),
+            "   🎯 Targets",
+            f"   {ok(wr >= wr_target)} Win rate ≥ {wr_target:.0f}%  (now {wr:.0f}%)",
+            f"   {ok(not losses or avg_l <= SC_TARGET_MAX_AVG_LOSS)} Avg loss ≤ ₹{SC_TARGET_MAX_AVG_LOSS:,.0f}"
+            f"  (now {'none yet' if not losses else f'₹{avg_l:,.0f}'})",
+            f"   {ok(total > 0)} Net P&L > 0 after charges  (now ₹{total:+,.0f})",
+        ]
+        if losses:
+            out.append(f"   ℹ️ Break-even win rate at these sizes: {be_wr:.0f}%")
+        if n < min_n:
+            out.append(f"   ⏳ Only {n} — judge after ~{min_n} ({judge_txt})")
+        elif total > 0 and wr >= wr_target:
+            out.append("   ✅ On track")
+        else:
+            out.append("   ⚠️ Below target — review before trading real money")
+        return out
+
+    if cs or globals().get("ENABLE_CREDIT_SPREAD"):
+        lines += _block(cs, "🟦 CREDIT SPREADS", "_CS", SC_SPREAD_CHARGES,
+                        SC_TARGET_WIN_RATE, 20, "≈3 months")
+    if ic or globals().get("ENABLE_OPTIONS_SELLING"):
+        lines += _block(ic, "🟥 IRON CONDORS (option selling)", "_IC", SC_CONDOR_CHARGES,
+                        SC_IC_TARGET_WIN_RATE, 30, "≈6–8 weeks")
+
+    # ── Option buying (one line) ──────────────────────────────────────────
+    if buy:
+        bn = [_pnl(r) - SC_BUY_CHARGES for r in buy]
+        lines.append(f"📉 Option buying — {len(bn)} trades │ win {sum(x > 0 for x in bn) / len(bn) * 100:.0f}% "
+                     f"│ net ₹{sum(bn):+,.0f}")
+    if globals().get("PAPER_TRADE") and hasattr(kite, "summary"):
+        lines.append(kite.summary())
+    lines.append("(charges estimated: ₹104/spread, ₹208/condor, ₹52/buy trade)")
+    return "\n".join(lines)
+
+
+def scorecard_loop():
+    """Sends the scorecard once a week on SCORECARD_WEEKDAY after SCORECARD_TIME."""
+    print(f"📊 Scorecard loop started — weekday {SCORECARD_WEEKDAY} after {SCORECARD_TIME} IST", flush=True)
+    while True:
+        try:
+            now = datetime.now(IST)
+            week_key = now.strftime("%G-W%V")
+            if (now.weekday() == SCORECARD_WEEKDAY
+                    and _past_hm(now, _hhmm(SCORECARD_TIME, (15, 45)))
+                    and _cs_meta.get("_scorecard_week") != week_key):
+                send_message(_scorecard_text(now))
+                _cs_meta["_scorecard_week"] = week_key
+                _cs_save()
+        except Exception as e:
+            print(f"⚠️ Scorecard error: {e}", flush=True)
+        time.sleep(60)
 
 
 _cs_load()
@@ -14193,14 +14432,22 @@ if __name__ == "__main__":
     else:
         print("⚠️ Delta loop disabled (ENABLE_DELTA=false)", flush=True)
 
-    if ENABLE_OPTIONS_SELLING:
-        if SELLING_INSTRUMENT in ("SENSEX", "NIFTY", "BANKNIFTY"):
-            threading.Thread(target=options_selling_loop, daemon=True, name="SellingLoop").start()
-            print(f"🔴 Options Selling loop started — {SELLING_INSTRUMENT} {SELLING_STRATEGY}", flush=True)
-        else:
-            print(f"⚠️ Options selling skipped — invalid instrument: {SELLING_INSTRUMENT}", flush=True)
+    if ENABLE_OPTIONS_SELLING and SELL_INSTRUMENTS:
+        for _sli in SELL_INSTRUMENTS:
+            threading.Thread(target=options_selling_loop, args=(_sli,), daemon=True,
+                             name=f"IronCondor_{_sli}").start()
+        send_message(f"🟥 Option selling ON — iron condor {', '.join(SELL_INSTRUMENTS)} │ "
+                     f"Δ{SELL_SHORT_DELTA} shorts │ wings "
+                     + ", ".join(f"{i} {SELL_WING[i]}" for i in SELL_INSTRUMENTS)
+                     + f" │ expiry week ({SELL_MIN_DTE}–{SELL_MAX_DTE} DTE) │ "
+                     f"target {SELL_TARGET_PCT:.0%} │ "
+                     f"{'stop ' + format(SELL_STOP_MULT, 'g') + '× credit' if SELL_STOP_MULT > 0 else 'no stop'}"
+                     f" │ flat by {SELL_EXIT_TIME}")
     else:
         print("⚠️ Options selling disabled (ENABLE_OPTIONS_SELLING=false)", flush=True)
+
+    if ENABLE_CREDIT_SPREAD or ENABLE_OPTIONS_SELLING:
+        threading.Thread(target=scorecard_loop, daemon=True, name="Scorecard").start()
 
     if ENABLE_CREDIT_SPREAD:
         for _csi in CS_INSTRUMENTS:
